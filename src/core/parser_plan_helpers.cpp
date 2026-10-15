@@ -7,7 +7,11 @@
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/optimizer/cte_inlining.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
@@ -194,13 +198,71 @@ PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, uni
 	return needs;
 }
 
-string QualifyCreateSourceTable(const string &table_name, const string &current_catalog, const string &current_schema,
-                                const string &default_db) {
-	if (current_catalog.empty() || current_catalog == default_db || table_name.find('.') != string::npos ||
-	    table_name.find('(') != string::npos) {
+string QualifyCreateSourceTable(ClientContext &context, const string &table_name, const CreateMVPlanFacts &facts,
+                                const string &current_catalog, const string &current_schema, const string &default_db,
+                                const string &default_schema) {
+	// The staged executor builds auxiliary state with the metadata schema selected. Name the
+	// relation the view actually bound, which can come from any schema on the search path.
+	vector<string> parts;
+	try {
+		parts = SqlUtils::ParseQualifiedIdentifier(table_name);
+	} catch (const ParserException &) {
+		// Table functions are SQL expressions rather than relation identifiers.
 		return table_name;
 	}
-	return current_catalog + "." + current_schema + "." + table_name;
+	if (parts.size() > 3) {
+		return table_name;
+	}
+	const auto &source_name = parts.back();
+	const string source_schema = parts.size() >= 2 ? parts[parts.size() - 2] : INVALID_SCHEMA;
+	const string source_catalog = parts.size() == 3 ? parts[0] : INVALID_CATALOG;
+	// Resolve public views before consulting physical scan facts: an MV binds to its
+	// publication table, whose name differs from the caller's quoted SQL identifier.
+	QueryErrorContext error_context;
+	for (auto type : {CatalogType::TABLE_ENTRY, CatalogType::VIEW_ENTRY}) {
+		auto entry = Catalog::GetEntry(context, source_catalog, source_schema,
+		                               EntryLookupInfo(type, source_name, error_context), OnEntryNotFound::RETURN_NULL);
+		if (entry) {
+			auto qualified =
+			    SqlUtils::FullName(entry->ParentCatalog().GetName(), entry->ParentSchema().name, entry->name);
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Auxiliary source '%s' resolves to %s\n", table_name.c_str(),
+			                    qualified.c_str());
+			return qualified;
+		}
+	}
+	const SourceTableInfo *bound = nullptr;
+	bool bound_in_current_schema = false;
+	for (auto &entry : facts.source_table_info) {
+		auto &source = entry.second;
+		if (!StringUtil::CIEquals(source.table_name, source_name) ||
+		    (parts.size() >= 2 && !StringUtil::CIEquals(source.schema_name, source_schema)) ||
+		    (parts.size() == 3 && !StringUtil::CIEquals(source.catalog_name, source_catalog))) {
+			continue;
+		}
+		bool in_current_schema = StringUtil::CIEquals(source.catalog_name, current_catalog) &&
+		                         StringUtil::CIEquals(source.schema_name, current_schema);
+		// Same-named sources prefer the caller's schema, then a deterministic order.
+		if (!bound || (in_current_schema && !bound_in_current_schema) ||
+		    (in_current_schema == bound_in_current_schema &&
+		     SqlUtils::FullName(source.catalog_name, source.schema_name, source.table_name) <
+		         SqlUtils::FullName(bound->catalog_name, bound->schema_name, bound->table_name))) {
+			bound = &source;
+			bound_in_current_schema = in_current_schema;
+		}
+	}
+	if (bound) {
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Auxiliary source '%s' bound to %s\n", table_name.c_str(),
+		                    SqlUtils::FullName(bound->catalog_name, bound->schema_name, bound->table_name).c_str());
+		return SqlUtils::FullName(bound->catalog_name, bound->schema_name, bound->table_name);
+	}
+	if (parts.size() > 1) {
+		return table_name;
+	}
+	if (current_catalog.empty() || (current_catalog == default_db && current_schema == default_schema)) {
+		return table_name;
+	}
+	return KeywordHelper::WriteOptionallyQuoted(current_catalog) + "." +
+	       KeywordHelper::WriteOptionallyQuoted(current_schema) + "." + table_name;
 }
 
 static string StripTrailingSemicolon(string sql) {
@@ -2511,7 +2573,10 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 		return "";
 	}
 	string pres_table = pres_get->GetTable().get()->name;
-	if (pres_get->table_index == inner_tidx || StringUtil::CIEquals(pres_table, inner_table)) {
+	auto pres_identity = SqlUtils::FullName(pres_get->GetTable()->ParentCatalog().GetName(),
+	                                        pres_get->GetTable()->schema.name, pres_table);
+	auto inner_identity = SqlUtils::FullName(cat, sch, inner_table);
+	if (pres_get->table_index == inner_tidx || StringUtil::CIEquals(pres_identity, inner_identity)) {
 		// Self-referencing deepest join (preserved and inner sides are the same base table): the
 		// old_pres_count/old_count arithmetic below assumes two distinct tables with independent
 		// delta tracking. Bail rather than risk generating ambiguous or incorrect SQL for this rare
@@ -2663,9 +2728,9 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	col_list += "openivm_multiplicity";
 	sel += "CASE WHEN (__newc - __t.dsum) > 0 AND __newc = 0 THEN 1 ELSE -1 END";
 
-	out_inner_table = inner_table;
+	out_inner_table = inner_identity;
 	out_inner_key = inner_col;
-	out_pres_table = pres_table;
+	out_pres_table = pres_identity;
 	out_pres_key = pres_col;
 
 	// Must carry the same catalog prefix the delta table was created with. Unqualified works only when

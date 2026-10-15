@@ -1,0 +1,362 @@
+# name: test/sql/metadata_schema_ducklake.test
+# description: DuckLake MVs keep control metadata in the native frontend's openivm_metadata_schema and their backing, delta and publication tables in the lake schema
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+SET openivm_metadata_schema = 'openivm';
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_metadata_schema_ducklake.db' AS dl (TYPE ducklake);
+
+statement ok
+CREATE SCHEMA dl.obs;
+
+statement ok
+CREATE TABLE dl.obs.readings (sensor INTEGER, val INTEGER);
+
+statement ok
+INSERT INTO dl.obs.readings VALUES (1, 10), (1, 20), (2, 5), (3, NULL);
+
+# First-MV discovery has only lake sources, but still reads native catalogs.
+# Shared metadata initialization must not leave the caller on that old snapshot.
+statement ok
+SET openivm_internal_schema = 'Bootstrap Internal';
+
+statement ok
+CREATE MATERIALIZED VIEW main.lake_bootstrap AS SELECT * FROM dl.obs.readings;
+
+query I
+SELECT count(*) FROM memory.openivm.openivm_views
+WHERE view_sql_name='lake_bootstrap' AND view_catalog='memory' AND internal_schema='Bootstrap Internal';
+----
+1
+
+statement ok
+INSERT INTO dl.obs.readings VALUES (4, 7),(4, 7),(5, 9);
+DELETE FROM dl.obs.readings WHERE sensor=5;
+UPDATE dl.obs.readings SET val=8 WHERE sensor=4;
+
+statement ok
+PRAGMA refresh('main.lake_bootstrap');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.lake_bootstrap EXCEPT ALL SELECT * FROM dl.obs.readings)
+UNION ALL (SELECT * FROM dl.obs.readings EXCEPT ALL SELECT * FROM main.lake_bootstrap));
+----
+0
+
+statement ok
+DROP VIEW main.lake_bootstrap;
+DELETE FROM dl.obs.readings WHERE sensor=4;
+SET openivm_internal_schema = '';
+
+# An unrelated active native catalog has its own registry. Staged DuckLake
+# CREATE must profile beside the frontend-owned MV metadata, including retention.
+statement ok
+ATTACH ':memory:' AS "Other Native";
+
+statement ok
+CREATE TABLE "Other Native".main.source (id INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW "Other Native".main.native_mv AS SELECT * FROM "Other Native".main.source;
+
+statement ok
+INSERT INTO "Other Native".openivm.openivm_refresh_profile
+    (refresh_id, view_name, profile_timestamp, step_order, step_name, duration_ms, detail)
+VALUES ('keep_other_catalog', 'native_mv', TIMESTAMP '2000-01-01', 0, 'sentinel', 0, '');
+
+statement ok
+USE "Other Native".main;
+
+statement ok
+SET openivm_profile_refresh = true;
+
+# Upgrade the frontend registry while another native catalog is active. These
+# ALTERs execute during shared initialization, before staged lake DDL profiling.
+statement ok
+ALTER TABLE memory.openivm.openivm_views DROP COLUMN pending_after_hook;
+ALTER TABLE memory.openivm.openivm_delta_tables DROP COLUMN pending_estimate_ts;
+ALTER TABLE memory.openivm.openivm_refresh_history DROP COLUMN strategy;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.obs.sensor_totals AS
+SELECT sensor, SUM(val) AS total, COUNT(*) AS cnt FROM dl.obs.readings GROUP BY sensor;
+
+statement ok
+SET openivm_profile_refresh = false;
+
+query III
+SELECT
+    (SELECT count(*) > 0 FROM memory.openivm.openivm_refresh_profile p
+     JOIN memory.openivm.openivm_views v USING (view_name)
+     WHERE v.view_sql_name = 'sensor_totals' AND v.view_catalog = 'dl'
+       AND p.step_name = 'create_mv_total'),
+    (SELECT count(*) FROM "Other Native".openivm.openivm_views WHERE view_catalog = 'dl'),
+    (SELECT count(*) FROM "Other Native".openivm.openivm_refresh_profile);
+----
+1	0	1
+
+query IIII
+SELECT count(*),
+    count(*) FILTER (WHERE contains(p.detail, 'sql=alter table openivm_views add column if not exists pending_after_hook') AND p.duration_ms >= 0),
+    count(*) FILTER (WHERE contains(p.detail, 'sql=alter table openivm_delta_tables add column if not exists pending_estimate_ts') AND p.duration_ms >= 0),
+    count(*) FILTER (WHERE contains(p.detail, 'sql=alter table openivm_refresh_history add column if not exists strategy') AND p.duration_ms >= 0)
+FROM memory.openivm.openivm_refresh_profile p
+JOIN memory.openivm.openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'sensor_totals' AND v.view_catalog = 'dl'
+  AND p.step_name = 'create_mv_sql_stmt' AND contains(p.detail, 'sql=alter table openivm_');
+----
+3	1	1	1
+
+query I
+SELECT count(*) FROM "Other Native".openivm.openivm_refresh_profile
+WHERE refresh_id = 'keep_other_catalog' AND profile_timestamp = TIMESTAMP '2000-01-01';
+----
+1
+
+statement ok
+USE memory.main;
+
+# Control metadata lives in the native frontend, in the configured schema only.
+query IIII
+SELECT
+    (SELECT count(*) FROM memory.openivm.openivm_views
+     WHERE view_sql_name = 'sensor_totals' AND view_catalog = 'dl' AND view_schema = 'obs'),
+    (SELECT count(*) FROM memory.openivm.openivm_delta_tables d JOIN memory.openivm.openivm_views v USING (view_name)
+     WHERE v.view_sql_name = 'sensor_totals' AND d.catalog_type = 'ducklake' AND d.source_catalog = 'dl'
+       AND d.source_schema = 'obs'),
+    (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'memory' AND schema_name = 'main'
+       AND table_name IN ('openivm_views', 'openivm_delta_tables')),
+    (SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'dl' AND schema_name = 'openivm');
+----
+1	1	0	0
+
+# The MV, its backing table, MV delta and publication table stay in the lake schema.
+query II
+SELECT
+    (SELECT count(*) FROM duckdb_views() WHERE database_name = 'dl' AND schema_name = 'obs' AND view_name = 'sensor_totals'),
+    (SELECT count(*) FROM duckdb_tables() t JOIN memory.openivm.openivm_views v
+        ON t.table_name IN ('openivm_data_' || v.view_name, 'openivm_delta_' || v.view_name, 'openivm_visible_' || v.view_name)
+     WHERE v.view_sql_name = 'sensor_totals' AND t.database_name = 'dl' AND t.schema_name = 'obs');
+----
+1	3
+
+statement ok
+INSERT INTO dl.obs.readings VALUES (2, 7), (4, 1), (4, 1);
+
+statement ok
+DELETE FROM dl.obs.readings WHERE val = 10;
+
+statement ok
+UPDATE dl.obs.readings SET val = val + 100 WHERE sensor = 2;
+
+statement ok
+PRAGMA refresh('dl.obs.sensor_totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.obs.sensor_totals EXCEPT ALL SELECT sensor, SUM(val), COUNT(*) FROM dl.obs.readings GROUP BY sensor) UNION ALL (SELECT sensor, SUM(val), COUNT(*) FROM dl.obs.readings GROUP BY sensor EXCEPT ALL SELECT * FROM dl.obs.sensor_totals));
+----
+0
+
+# The refresh watermark advanced in the configured schema.
+query I
+SELECT count(*) FROM memory.openivm.openivm_delta_tables d JOIN memory.openivm.openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'sensor_totals' AND d.last_snapshot_id IS NOT NULL;
+----
+1
+
+# Reads after the setting is cleared still discover the metadata.
+statement ok
+SET openivm_metadata_schema = '';
+
+statement ok
+INSERT INTO dl.obs.readings VALUES (5, 50);
+
+statement ok
+PRAGMA refresh('dl.obs.sensor_totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.obs.sensor_totals EXCEPT ALL SELECT sensor, SUM(val), COUNT(*) FROM dl.obs.readings GROUP BY sensor) UNION ALL (SELECT sensor, SUM(val), COUNT(*) FROM dl.obs.readings GROUP BY sensor EXCEPT ALL SELECT * FROM dl.obs.sensor_totals));
+----
+0
+
+# DROP cleans up the native metadata and the lake objects across the catalog boundary.
+statement ok
+DROP VIEW dl.obs.sensor_totals;
+
+query II
+SELECT
+    (SELECT count(*) FROM memory.openivm.openivm_views WHERE view_sql_name = 'sensor_totals'),
+    (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dl' AND schema_name = 'obs'
+       AND starts_with(table_name, 'openivm_'));
+----
+0	0
+
+# Dollar literals and CTEs with metadata names are user SQL, including on the
+# staged DuckLake path with separate metadata and internal schemas.
+statement ok
+SET openivm_internal_schema = 'Literal Internal';
+CREATE TABLE dl.obs.literal_source(i INTEGER);
+INSERT INTO dl.obs.literal_source VALUES (1),(1),(2);
+USE dl.obs;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.obs."Literal;MV" AS
+WITH openivm_views AS (SELECT i FROM dl.obs.literal_source),
+openivm_delta_tables AS (SELECT i FROM openivm_views)
+SELECT i, $$FROM openivm_views WHERE true$$ AS label,
+    $metadata$FROM openivm_delta_tables; JOIN openivm_views$metadata$ AS tagged
+FROM openivm_delta_tables EXCEPT SELECT -1, 'never', 'never';
+
+statement ok
+CREATE VIEW memory.main.metadata_literal_expected AS
+WITH openivm_views AS (SELECT i FROM dl.obs.literal_source),
+openivm_delta_tables AS (SELECT i FROM openivm_views)
+SELECT i, $$FROM openivm_views WHERE true$$ AS label,
+    $metadata$FROM openivm_delta_tables; JOIN openivm_views$metadata$ AS tagged
+FROM openivm_delta_tables EXCEPT SELECT -1, 'never', 'never';
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM dl.obs."Literal;MV" EXCEPT ALL SELECT * FROM memory.main.metadata_literal_expected)
+    UNION ALL
+    (SELECT * FROM memory.main.metadata_literal_expected EXCEPT ALL SELECT * FROM dl.obs."Literal;MV"));
+----
+0
+
+statement ok
+INSERT INTO dl.obs.literal_source VALUES (1),(2),(3),(3),(8);
+DELETE FROM dl.obs.literal_source WHERE i=1;
+UPDATE dl.obs.literal_source SET i=4 WHERE i=2;
+DELETE FROM dl.obs.literal_source WHERE i=8;
+
+statement ok
+PRAGMA refresh('dl.obs."Literal;MV"');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM dl.obs."Literal;MV" EXCEPT ALL SELECT * FROM memory.main.metadata_literal_expected)
+    UNION ALL
+    (SELECT * FROM memory.main.metadata_literal_expected EXCEPT ALL SELECT * FROM dl.obs."Literal;MV"));
+----
+0
+
+statement ok
+DROP VIEW dl.obs."Literal;MV";
+DROP VIEW memory.main.metadata_literal_expected;
+USE memory.main;
+
+# Parent-first view CASCADE crosses both the native/lake execution boundary and
+# metadata registries. An unrelated same-named peer and shared source consumer
+# retain their qualified ownership and source delta.
+statement ok
+SET openivm_metadata_schema='openivm';
+SET openivm_internal_schema='Cascade Internal';
+SET openivm_cascade_refresh='off';
+USE memory.main;
+ATTACH ':memory:' AS "Cascade.Peer";
+CREATE TABLE main.cascade_source(i INTEGER);
+INSERT INTO main.cascade_source VALUES (1),(1),(2);
+CREATE TABLE "Cascade.Peer".main.cascade_source(i INTEGER);
+INSERT INTO "Cascade.Peer".main.cascade_source VALUES (1),(1),(2);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.obs."Parent;MV" AS SELECT * FROM memory.main.cascade_source;
+CREATE MATERIALIZED VIEW memory.main.cascade_sibling AS SELECT * FROM memory.main.cascade_source;
+CREATE MATERIALIZED VIEW "Cascade.Peer".main."Child;MV" AS
+SELECT p.i FROM dl.obs."Parent;MV" p JOIN "Cascade.Peer".main.cascade_source s USING(i);
+CREATE MATERIALIZED VIEW "Cascade.Peer".main."Parent;MV" AS SELECT * FROM "Cascade.Peer".main.cascade_source;
+
+statement ok
+CREATE TEMP TABLE cascade_removed_keys AS
+SELECT view_name, view_catalog FROM memory.openivm.openivm_views WHERE view_sql_name='Parent;MV' AND view_catalog='dl'
+UNION ALL
+SELECT view_name, view_catalog FROM "Cascade.Peer".openivm.openivm_views WHERE view_sql_name='Child;MV';
+
+query I
+SELECT count(*) FROM cascade_removed_keys;
+----
+2
+
+statement ok
+USE "Cascade.Peer".openivm;
+SELECT 'before;parent'; /* retain; SQL boundaries */ DROP VIEW dl.obs."Parent;MV" CASCADE; SELECT 1;
+
+query IIIII
+SELECT
+(SELECT count(*) FROM memory.openivm.openivm_views v JOIN cascade_removed_keys k USING(view_name)),
+(SELECT count(*) FROM "Cascade.Peer".openivm.openivm_views v JOIN cascade_removed_keys k USING(view_name)),
+(SELECT count(*) FROM memory.openivm.openivm_delta_tables d JOIN cascade_removed_keys k USING(view_name)),
+(SELECT count(*) FROM "Cascade.Peer".openivm.openivm_delta_tables d JOIN cascade_removed_keys k USING(view_name)),
+(SELECT count(*) FROM duckdb_tables() t JOIN cascade_removed_keys k ON t.database_name=k.view_catalog
+ AND t.table_name IN ('openivm_data_' || k.view_name, 'openivm_visible_' || k.view_name,
+                     'openivm_delta_' || k.view_name, 'openivm_delta_openivm_visible_' || k.view_name)
+ WHERE t.schema_name='Cascade Internal');
+----
+0	0	0	0	0
+
+query II
+SELECT
+(SELECT count(*) FROM duckdb_views() WHERE (database_name='dl' AND schema_name='obs' AND view_name='Parent;MV')
+ OR (database_name='Cascade.Peer' AND schema_name='main' AND view_name='Child;MV')),
+(SELECT count(*) FROM duckdb_views() v JOIN cascade_removed_keys k ON v.database_name=k.view_catalog
+ AND v.view_name='openivm_visible_' || k.view_name WHERE v.schema_name='Cascade Internal');
+----
+0	0
+
+# Batch conflicting writes on both retained sources before either refresh.
+statement ok
+INSERT INTO memory.main.cascade_source VALUES (1),(2),(3),(3),(5);
+DELETE FROM memory.main.cascade_source WHERE i IN (1,5);
+UPDATE memory.main.cascade_source SET i=4 WHERE i=2;
+INSERT INTO "Cascade.Peer".main.cascade_source VALUES (1),(2),(3),(3),(5);
+DELETE FROM "Cascade.Peer".main.cascade_source WHERE i IN (1,5);
+UPDATE "Cascade.Peer".main.cascade_source SET i=4 WHERE i=2;
+
+statement ok
+PRAGMA refresh('memory.main.cascade_sibling');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM memory.main.cascade_sibling EXCEPT ALL SELECT * FROM memory.main.cascade_source)
+UNION ALL (SELECT * FROM memory.main.cascade_source EXCEPT ALL SELECT * FROM memory.main.cascade_sibling));
+----
+0
+
+statement ok
+PRAGMA refresh('"Cascade.Peer".main."Parent;MV"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "Cascade.Peer".main."Parent;MV" EXCEPT ALL SELECT * FROM "Cascade.Peer".main.cascade_source)
+UNION ALL (SELECT * FROM "Cascade.Peer".main.cascade_source EXCEPT ALL SELECT * FROM "Cascade.Peer".main."Parent;MV"));
+----
+0
+
+statement ok
+DROP VIEW memory.main.cascade_sibling;
+DROP VIEW "Cascade.Peer".main."Parent;MV";
+
+query III
+SELECT
+(SELECT count(*) FROM duckdb_tables() WHERE schema_name='Cascade Internal' AND starts_with(table_name,'openivm_')),
+(SELECT count(*) FROM "Cascade.Peer".openivm.openivm_views),
+(SELECT count(*) FROM "Cascade.Peer".openivm.openivm_delta_tables);
+----
+0	0	0
+
+statement ok
+DROP TABLE cascade_removed_keys;
+DROP TABLE memory.main.cascade_source;
+DROP TABLE "Cascade.Peer".main.cascade_source;
+USE memory.main;
+DETACH "Cascade.Peer";

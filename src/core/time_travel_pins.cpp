@@ -1,6 +1,7 @@
 #include "core/time_travel_pins.hpp"
 
 #include "core/openivm_debug.hpp"
+#include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -25,6 +26,7 @@
 #include "lpts_sql_scanner.hpp"
 
 #include <cctype>
+#include <map>
 
 namespace duckdb {
 namespace openivm {
@@ -421,6 +423,60 @@ static idx_t SkipIgnorableSpan(const string &sql, idx_t pos) {
 		pos = end;
 	}
 	return pos;
+}
+
+string TimeTravelPins::QualifySources(ClientContext &context, const string &sql) {
+	Parser parser(context.GetParserOptions());
+	parser.ParseQuery(sql);
+	if (parser.statements.size() != 1) {
+		throw InternalException("Expected one view query while qualifying sources");
+	}
+	// Parsed locations identify individual references, including repeated names and public MVs
+	// whose bound scans name an internal publication table. Keep raw SQL rather than serializing
+	// the query node: original-SQL fallback must also work for unsupported plan shapes.
+	std::map<idx_t, std::pair<idx_t, string>> replacements;
+	BaseTableRefCallback callback = [&](BaseTableRef &ref) {
+		auto relation = LookupPinRelation(context, ref);
+		if (!relation) {
+			return; // Let normal binding report unresolved relations and handle replacement scans.
+		}
+		if (!ref.query_location.IsValid()) {
+			throw InternalException("Missing source location while qualifying '%s'", ref.table_name);
+		}
+		auto start = ref.query_location.GetIndex();
+		auto end = start;
+		idx_t components = 1 + !ref.schema_name.empty() + !ref.catalog_name.empty();
+		for (idx_t i = 0; i < components; i++) {
+			end = SkipIgnorableSpan(sql, end);
+			if (end < sql.size() && sql[end] == '"') {
+				string ignored;
+				end = CopyQuotedRun(sql, end, ignored);
+			} else {
+				while (end < sql.size() && !std::isspace(static_cast<unsigned char>(sql[end])) && sql[end] != '.' &&
+				       sql[end] != ',' && sql[end] != ')' && sql[end] != ';' && sql[end] != '/' && sql[end] != '-') {
+					end++;
+				}
+			}
+			if (i + 1 < components) {
+				end = SkipIgnorableSpan(sql, end);
+				if (end >= sql.size() || sql[end] != '.') {
+					throw InternalException("Invalid source span while qualifying '%s'", ref.table_name);
+				}
+				end++;
+			}
+		}
+		auto qualified =
+		    SqlUtils::FullName(relation->ParentCatalog().GetName(), relation->ParentSchema().name, relation->name);
+		replacements[start] = {end, qualified};
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Original SQL source '%s' resolves to %s\n", ref.table_name.c_str(),
+		                    qualified.c_str());
+	};
+	VisitStatement(*parser.statements[0], RefVisitor {callback, {}});
+	string result = sql;
+	for (auto it = replacements.rbegin(); it != replacements.rend(); ++it) {
+		result.replace(it->first, it->second.first - it->first, it->second.second);
+	}
+	return result;
 }
 
 // Words that close a FROM list, so a comma past them separates something other than relations.

@@ -8,6 +8,9 @@
 
 namespace duckdb {
 
+class TableCatalogEntry;
+class TransactionalMVMetadataState;
+
 // Centralized access to IVM metadata stored in system tables.
 // Wraps all raw SQL queries to openivm_views and openivm_delta_tables
 // behind typed methods. Takes a Connection reference — does NOT create its own.
@@ -21,8 +24,36 @@ public:
 	explicit RefreshMetadata(Connection &con) : con(con) {
 	}
 
+	struct MetadataLocation {
+		string catalog_name;
+		string schema_name;
+	};
+
 	// Native view metadata belongs to the view catalog; external catalogs use the native default.
+	// Within that catalog, metadata stays in the schema that already holds it. New metadata uses
+	// openivm_metadata_schema, or main when it is unset. Explicit transactions retain their
+	// recorded or caller-visible registry even if the setting changes before commit/rollback.
 	static void UseCatalog(ClientContext &context, Connection &con, const string &view_catalog = "");
+	// Select the location already resolved for a helper context; resolve it for any other context.
+	static void UseSameLocation(ClientContext &context, Connection &con);
+	// Select an already resolved catalog/schema identity without rediscovering it.
+	static void UseLocation(Connection &con, const MetadataLocation &location);
+	// The metadata location selected for a helper connection.
+	static MetadataLocation CurrentLocation(Connection &con);
+	static string MetadataTable(Connection &con, const string &table);
+	// The explicitly configured metadata schema; empty means keep existing metadata where it is.
+	static string ConfiguredMetadataSchema(ClientContext &context);
+	// Schemas of a native catalog that contain `table`, in name order.
+	static vector<string> FindMetadataSchemas(Connection &con, const string &catalog, const string &table);
+	static string ResolveMetadataSchema(Connection &con, const string &catalog, const string &preferred);
+	// In autocommit mode, move a catalog's metadata into the configured schema and, for a new
+	// materialized view, create that schema. Other metadata objects keep their placement.
+	static void PrepareMetadataSchema(ClientContext &context, const string &view_catalog, bool create_schema);
+	// Every native metadata location containing `table`, and the qualified table names.
+	static vector<MetadataLocation> MetadataLocations(Connection &con, const string &table);
+	// Caller-snapshot discovery includes uncommitted schemas and registries.
+	static vector<MetadataLocation> MetadataLocations(ClientContext &context, const string &table);
+	static vector<string> MetadataTables(Connection &con, const string &table);
 
 	void SnapshotTransaction(ClientContext &context);
 	string ResolveViewName(const string &view_name, const string &catalog = "", const string &schema = "");
@@ -67,10 +98,14 @@ public:
 	static string SourceTableName(const string &key, const string &catalog, const string &schema);
 	static string SourcePredicate(const string &table, const string &catalog, const string &schema);
 
+	// A source's delta table lives beside the source unless openivm_internal_schema placed it in
+	// an internal schema of the same catalog; there its name encodes the source schema.
 	struct SourceLocation {
 		string catalog_name;
 		string schema_name;
 		string table_name;
+		string delta_schema_name;
+		string delta_table_name;
 	};
 	struct StoredViewLocation {
 		string catalog_name;
@@ -81,13 +116,45 @@ public:
 		string catalog_type;
 		string catalog_name;
 		string schema_name;
+		string delta_schema_name;
+		string delta_table_name;
 	};
+	// Call under the mutation gate. Replay every location for caller-transaction cleanup;
+	// after commit, omit transaction_state and inspect durable ownership. Exclusions are
+	// keyed by the fully qualified metadata table because view keys are location-local.
+	static bool HasSourceDeltaConsumers(Connection &con, const DeltaSource &source,
+	                                    optional_ptr<TransactionalMVMetadataState> transaction_state = nullptr,
+	                                    const unordered_map<string, string> &excluded_consumers = {});
+
+	// Physical source-delta naming. Internal-schema deltas encode the source schema so that
+	// same-named sources of different schemas have different preferred names. CREATE allocates
+	// a free name if a legacy colocated delta occupies that name and persists the result.
+	static string InternalSourceDeltaName(const string &source_schema, const string &table);
+	static string SourceDeltaTableName(const string &source_schema, const string &table, const string &delta_schema);
+	// The source's delta table, resolved through ownership metadata (including legacy rows).
+	// Requires an active transaction on `context`.
+	static optional_ptr<TableCatalogEntry> FindSourceDelta(ClientContext &context, const string &catalog,
+	                                                       const string &schema, const string &table);
+	// Allocation and native DML admission must also see ownership committed after
+	// the caller's snapshot began; an invisible/replaced delta requires a retry.
+	// Allocation/ALTER and the final DML lookup require the database mutation gate.
+	// The initial DML probe instead holds source admission, which excludes first
+	// publication; tracked writers must recheck after acquiring the mutation gate.
+	static optional_ptr<TableCatalogEntry> FindSourceDeltaForMutation(ClientContext &context, const string &catalog,
+	                                                                  const string &schema, const string &table);
 
 	SourceLocation GetSourceLocation(const string &view_name, const string &table_name,
 	                                 const string &fallback_catalog = "", const string &fallback_schema = "");
 	StoredViewLocation GetStoredViewLocation(const string &view_name, const string &fallback_catalog = "",
 	                                         const string &fallback_schema = "");
-	bool IsMaterializedViewDelta(const DeltaSource &source);
+	// Schema of a view's backing, publication, auxiliary-state and MV delta tables when
+	// openivm_internal_schema placed them apart from the view; empty means the view's schema.
+	string GetInternalSchema(const string &view_name);
+	StoredViewLocation GetInternalLocation(const string &view_name, const string &fallback_catalog = "",
+	                                       const string &fallback_schema = "");
+	// MV companions remain owned without consumers, across metadata locations and replay.
+	bool IsMaterializedViewDelta(const DeltaSource &source,
+	                             optional_ptr<TransactionalMVMetadataState> transaction_state = nullptr);
 	vector<DeltaSource> GetDeltaSources(const string &view_name, const string &fallback_catalog = "",
 	                                    const string &fallback_schema = "");
 	string ResolveDeltaQualifiedName(const string &view_name, const string &delta_table_name,
@@ -113,7 +180,8 @@ public:
 	// For table→mv1→mv2→mv3, GetDownstreamViews("mv1") returns ["mv2", "mv3"].
 	vector<string> GetDownstreamViews(const string &view_name);
 	vector<string> GetDownstreamViewsStrict(const string &view_name);
-	bool HasDownstreamViews(const string &view_name, bool include_published = true);
+	bool HasDownstreamViews(const string &view_name, bool include_published = true,
+	                        optional_ptr<TransactionalMVMetadataState> transaction_state = nullptr);
 
 	// Select a multi-target pipeline and topologically order its induced dependency graph.
 	vector<string> GetPipelineRefreshOrder(const vector<string> &targets, const string &cascade_mode);
@@ -136,13 +204,26 @@ public:
 	// Set/clear the refresh_in_progress flag for crash safety.
 	void SetRefreshInProgress(const string &view_name, bool in_progress);
 
+	// Watermarks of every consumer of this physical delta, across metadata locations.
+	// Publication and cleanup must use the same qualified source identity and inventory.
+	static string BuildDeltaConsumersSQL(const string &target, const string &metadata_key,
+	                                     const string &delta_metadata_table = "",
+	                                     const vector<string> &delta_metadata_tables = {},
+	                                     const string &source_catalog = "", const string &source_schema = "");
+
 	// Build SQL to delete old delta rows that all dependent views have already consumed.
+	// Execute after advancing the refreshing consumer's watermark, or defer until commit
+	// when cleanup writes a different native catalog.
 	// target: the (possibly schema-qualified) table to delete from.
 	// metadata_key: the name used in openivm_delta_tables (unqualified delta name).
+	// delta_metadata_tables: qualified openivm_delta_tables of every native metadata location.
+	// source_catalog/source_schema identify the source when the target is an internal-schema
+	// delta whose physical location differs from its source.
 	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
 	                                   const string &delta_metadata_table = "",
 	                                   vector<string> *deferred_cleanup = nullptr,
-	                                   const vector<string> &metadata_catalogs = {});
+	                                   const vector<string> &delta_metadata_tables = {},
+	                                   const string &source_catalog = "", const string &source_schema = "");
 
 	// Get GROUP BY column names for a view. Returns empty vector if not stored.
 	vector<string> GetGroupColumns(const string &view_name);
@@ -361,9 +442,9 @@ public:
 		vector<string> preserved_cols;
 		// Identities of the two sides whose pending changes the placeholders stand for. Refresh needs
 		// them to build the right row source per storage backend (delta table vs DuckLake snapshots).
-		vector<string> inner_tables; // bare base-table names of the inner (null-supplying) sides
+		vector<string> inner_tables; // qualified base-table names of the inner (null-supplying) sides
 		vector<string> inner_keys;   // join key columns on the inner sides
-		vector<string> pres_tables;  // bare base-table names of the preserved sides
+		vector<string> pres_tables;  // qualified base-table names of the preserved sides
 		vector<string> pres_keys;    // join key columns on the preserved sides
 	};
 
@@ -375,6 +456,7 @@ public:
 	static vector<string> ExpectedFilteredGroupCountAuxColumns(const FilteredGroupCountAuxMeta &meta);
 	static vector<string> ExpectedSemiAntiAuxColumns(const SemiAntiAuxMeta &meta);
 	bool AuxStateNeedsRepair(const string &view_name, const string &catalog_name, const string &schema_name);
+	vector<string> GetAuxiliaryTables(const string &view_name);
 };
 
 } // namespace duckdb

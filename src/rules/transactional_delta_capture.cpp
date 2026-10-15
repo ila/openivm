@@ -3,6 +3,7 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/refresh_locks.hpp"
+#include "core/sql_utils.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -27,6 +28,44 @@
 namespace duckdb {
 
 namespace {
+
+class PhysicalSourceWriteExecution : public PhysicalOperator {
+public:
+	PhysicalSourceWriteExecution(PhysicalPlan &physical_plan, PhysicalOperator &child, TableCatalogEntry &base_table,
+	                             optional_ptr<TableCatalogEntry> delta_table, idx_t estimated_cardinality)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, child.GetTypes(), estimated_cardinality),
+	      catalog(base_table.catalog.GetName()), schema(base_table.schema.name), table(base_table.name),
+	      planned_delta(delta_table ? SqlUtils::FullName(delta_table->catalog.GetName(), delta_table->schema.name,
+	                                                     delta_table->name)
+	                                : string()) {
+		children.push_back(child);
+	}
+
+	unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) const override {
+		TransactionalMVLockState::Get(context).MarkSourceWriteExecuted(catalog, schema, table, planned_delta);
+		return make_uniq<GlobalOperatorState>();
+	}
+
+	OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
+	                           GlobalOperatorState &global_state, OperatorState &state) const override {
+		chunk.Reference(input);
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+
+	bool ParallelOperator() const override {
+		return true;
+	}
+
+	string GetName() const override {
+		return "OPENIVM_SOURCE_WRITE_EXECUTION";
+	}
+
+private:
+	const string catalog;
+	const string schema;
+	const string table;
+	const string planned_delta;
+};
 
 static void EnterDeltaWritePhase(ClientContext &context) {
 	TransactionalMVLockState::Get(context).AcquireMutationLock();
@@ -867,6 +906,36 @@ static vector<unique_ptr<Expression>> BindGeneratedExpressions(ClientContext &co
 }
 
 } // namespace
+
+LogicalSourceWriteExecution::LogicalSourceWriteExecution(TableCatalogEntry &base_table_p,
+                                                         optional_ptr<TableCatalogEntry> delta_table_p)
+    : base_table(base_table_p), delta_table(delta_table_p) {
+}
+
+PhysicalOperator &LogicalSourceWriteExecution::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
+	D_ASSERT(children.size() == 1);
+	auto &child = planner.CreatePlan(*children[0]);
+	planner.dependencies.AddDependency(base_table);
+	return planner.Make<PhysicalSourceWriteExecution>(child, base_table, delta_table, estimated_cardinality);
+}
+
+vector<ColumnBinding> LogicalSourceWriteExecution::GetColumnBindings() {
+	D_ASSERT(children.size() == 1);
+	return children[0]->GetColumnBindings();
+}
+
+string LogicalSourceWriteExecution::GetName() const {
+	return "OPENIVM_SOURCE_WRITE_EXECUTION";
+}
+
+string LogicalSourceWriteExecution::GetExtensionName() const {
+	return "openivm_source_write_execution";
+}
+
+void LogicalSourceWriteExecution::ResolveTypes() {
+	D_ASSERT(children.size() == 1);
+	types = children[0]->types;
+}
 
 LogicalTransactionalDeltaCapture::LogicalTransactionalDeltaCapture(TableCatalogEntry &base_table_p,
                                                                    TableCatalogEntry &delta_table_p,

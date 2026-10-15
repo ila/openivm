@@ -33,7 +33,6 @@ namespace duckdb {
 
 namespace {
 
-constexpr const char *DUCKLAKE_SYNTHETIC_DELTA_TS = "1970-01-02 00:00:00";
 constexpr const char *DUCKLAKE_SYNTHETIC_LAST_UPDATE = "1970-01-01 00:00:00";
 
 static string SparkPortableRefreshSQL(string sql) {
@@ -77,7 +76,7 @@ static string RenderStoredViewQueryForDialect(Connection &con, const string &vie
 	return rendered;
 }
 
-struct SemiAntiSourceInput {
+struct TrackedSourceInput {
 	string table_sql;
 	string delta_sql;
 	string last_update;
@@ -143,48 +142,6 @@ ApplyGroupRecomputeSourceOccurrences(vector<GroupRecomputeDeltaSpec> &delta_spec
 	}
 }
 
-static string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &view_name, const string &table_name,
-                                      const vector<string> &delta_table_names) {
-	vector<string> candidates;
-	candidates.push_back(PublishedViewName(SqlUtils::LastIdentifierPart(table_name)));
-	candidates.push_back(SqlUtils::DeltaName(PublishedViewName(SqlUtils::LastIdentifierPart(table_name))));
-	candidates.push_back(table_name);
-	candidates.push_back(SqlUtils::LastIdentifierPart(table_name));
-	// DuckLake records a chained MV source under its physical backing table.
-	candidates.push_back(IncrementalTableNames::DataTableName(SqlUtils::LastIdentifierPart(table_name)));
-	candidates.push_back(SqlUtils::DeltaName(table_name));
-	candidates.push_back(SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name)));
-	auto parts = SqlUtils::ParseQualifiedIdentifier(table_name);
-	for (auto &dt : delta_table_names) {
-		auto loc = metadata.GetSourceLocation(view_name, dt);
-		bool matches = false;
-		for (const auto &candidate : candidates) {
-			matches = matches || StringUtil::CIEquals(loc.table_name, candidate);
-		}
-		if (!matches) {
-			// Auxiliary definitions retain public SQL names; chained sources store
-			// the parent's internal key in their physical delta/visible-table name.
-			matches = StringUtil::CIEquals(metadata.GetViewSQLName(PublishedSourceViewName(dt)), parts.back());
-		}
-		if (!matches) {
-			continue;
-		}
-		if (parts.size() > 1) {
-			if (parts.size() == 3 && (!StringUtil::CIEquals(loc.catalog_name, parts[0]) ||
-			                          !StringUtil::CIEquals(loc.schema_name, parts[1]))) {
-				continue;
-			}
-			if (parts.size() == 2 && !StringUtil::CIEquals(loc.schema_name, parts[0]) &&
-			    !(StringUtil::CIEquals(loc.catalog_name, parts[0]) && loc.schema_name == DEFAULT_SCHEMA)) {
-				continue;
-			}
-		}
-		OPENIVM_DEBUG_PRINT("[UPSERT] Source '%s' resolves to delta metadata '%s'\n", table_name.c_str(), dt.c_str());
-		return dt;
-	}
-	return SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name));
-}
-
 static string ResolveSourceTableSQL(RefreshMetadata &metadata, const string &view_name, const string &metadata_key,
                                     const string &table_name, const string &view_catalog_name,
                                     const string &view_schema_name, const string &attached_db_catalog_name,
@@ -198,43 +155,32 @@ static string ResolveSourceTableSQL(RefreshMetadata &metadata, const string &vie
 	if (loc.schema_name.empty()) {
 		loc.schema_name = "main";
 	}
-	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, SqlUtils::LastIdentifierPart(table_name));
+	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, BaseTableNameFromDeltaKey(loc.table_name));
 }
 
-static string BuildDuckLakeSignedDeltaRelation(const DuckLakeSourceLocation &loc, int64_t last_snapshot_id,
-                                               int64_t current_snapshot_id) {
-	string insertions = "SELECT *, 1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) + ", TIMESTAMP '" +
-	                    DUCKLAKE_SYNTHETIC_DELTA_TS + "' AS " + string(openivm::TIMESTAMP_COL) + " FROM " +
-	                    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
-	                                                    loc.table_name, last_snapshot_id, current_snapshot_id);
-	string deletions = "SELECT *, -1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) + ", TIMESTAMP '" +
-	                   DUCKLAKE_SYNTHETIC_DELTA_TS + "' AS " + string(openivm::TIMESTAMP_COL) + " FROM " +
-	                   SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
-	                                                   loc.table_name, last_snapshot_id, current_snapshot_id);
-	return "(" + insertions + "\nUNION ALL\n" + deletions + ")";
-}
-
-static SemiAntiSourceInput ResolveSemiAntiSourceInput(RefreshMetadata &metadata, Connection &con,
-                                                      const string &view_name, const string &table_name,
-                                                      const vector<string> &delta_table_names,
-                                                      const string &view_catalog_name, const string &view_schema_name,
-                                                      const string &attached_db_catalog_name,
-                                                      const string &attached_db_schema_name) {
-	SemiAntiSourceInput input;
+static TrackedSourceInput ResolveTrackedSourceInput(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                                    const string &table_name, const vector<string> &delta_table_names,
+                                                    const string &view_catalog_name, const string &view_schema_name,
+                                                    const string &attached_db_catalog_name,
+                                                    const string &attached_db_schema_name) {
+	TrackedSourceInput input;
 	string metadata_key = ResolveDeltaMetadataKey(metadata, view_name, table_name, delta_table_names);
 	if (metadata.IsDuckLakeTable(view_name, metadata_key)) {
 		auto loc = ResolveDuckLakeSourceLocation(con, view_name, metadata_key, view_catalog_name, view_schema_name,
 		                                         attached_db_catalog_name, attached_db_schema_name);
 		int64_t last_snapshot_id = metadata.GetLastSnapshotId(view_name, metadata_key);
 		int64_t current_snapshot_id = metadata.GetCurrentDuckLakeSnapshot(loc.catalog_name);
-		if (last_snapshot_id < 0 || current_snapshot_id < 0) {
-			throw Exception(ExceptionType::CATALOG, "IVM: missing DuckLake snapshot metadata for semi/anti "
+		if (last_snapshot_id < 0 || current_snapshot_id < last_snapshot_id) {
+			throw Exception(ExceptionType::CATALOG, "IVM: missing DuckLake snapshot metadata for "
 			                                        "refresh of view '" +
 			                                            view_name + "', table '" + metadata_key + "'");
 		}
 		input.table_sql = SqlUtils::FullName(loc.catalog_name, loc.schema_name, loc.table_name);
 		input.delta_sql = BuildDuckLakeSignedDeltaRelation(loc, last_snapshot_id, current_snapshot_id);
 		input.last_update = DUCKLAKE_SYNTHETIC_LAST_UPDATE;
+		OPENIVM_DEBUG_PRINT("[UPSERT] Snapshot-backed source %s for '%s': %lld -> %lld\n", input.table_sql.c_str(),
+		                    view_name.c_str(), static_cast<long long>(last_snapshot_id),
+		                    static_cast<long long>(current_snapshot_id));
 		return input;
 	}
 
@@ -273,8 +219,21 @@ static void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext 
 	}
 }
 
-static bool HasPendingDeltaRows(RefreshMetadata &metadata, const string &view_name, const string &delta_table,
-                                const string &view_catalog_name, const string &view_schema_name) {
+static bool HasPendingDeltaRows(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                const string &delta_table, const string &view_catalog_name,
+                                const string &view_schema_name) {
+	if (metadata.IsDuckLakeTable(view_name, delta_table)) {
+		auto loc =
+		    ResolveDuckLakeSourceLocation(con, view_name, delta_table, view_catalog_name, view_schema_name, "", "");
+		auto last_snapshot = metadata.GetLastSnapshotId(view_name, delta_table);
+		auto current_snapshot = metadata.GetCurrentDuckLakeSnapshot(loc.catalog_name);
+		if (last_snapshot < 0 || current_snapshot < last_snapshot) {
+			return true;
+		}
+		auto stats = metadata.GetStandardDeltaChangeStats(
+		    BuildDuckLakeSignedDeltaRelation(loc, last_snapshot, current_snapshot), DUCKLAKE_SYNTHETIC_LAST_UPDATE);
+		return !stats.ok || stats.total > 0;
+	}
 	string last_update = metadata.GetLastUpdate(view_name, delta_table);
 	if (last_update.empty()) {
 		return false;
@@ -285,11 +244,11 @@ static bool HasPendingDeltaRows(RefreshMetadata &metadata, const string &view_na
 	return !stats.ok || stats.total > 0;
 }
 
-static void RequireNoPendingAuxRepairDeltas(RefreshMetadata &metadata, const string &view_name,
+static void RequireNoPendingAuxRepairDeltas(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                             const vector<string> &delta_tables, const string &aux_table,
                                             const string &view_catalog_name, const string &view_schema_name) {
 	for (auto &delta_table : delta_tables) {
-		if (HasPendingDeltaRows(metadata, view_name, delta_table, view_catalog_name, view_schema_name)) {
+		if (HasPendingDeltaRows(metadata, con, view_name, delta_table, view_catalog_name, view_schema_name)) {
 			throw CatalogException("Cannot repair auxiliary state table '" + aux_table + "' for materialized view '" +
 			                       view_name +
 			                       "' while source deltas are pending. Recreate the "
@@ -306,7 +265,7 @@ static void EnsureAuxState(RefreshMetadata &metadata, Connection &con, const str
 	if (metadata.TableColumnsMatch(internal_catalog_name, internal_schema_name, aux_table, expected_columns)) {
 		return;
 	}
-	RequireNoPendingAuxRepairDeltas(metadata, view_name, pending_delta_tables, aux_table, view_catalog_name,
+	RequireNoPendingAuxRepairDeltas(metadata, con, view_name, pending_delta_tables, aux_table, view_catalog_name,
 	                                view_schema_name);
 	auto result = con.Query(build_sql());
 	if (result->HasError()) {
@@ -456,23 +415,14 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	openivm::CompileFactsContextSlot inner_facts_slot(planning_context, inner_facts_slot_facts);
 	con.Query("SET max_expression_depth = 10000");
 	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
-	string default_db;
-	string default_schema = "main";
-	{
-		auto db_res = con.Query("SELECT current_database()");
-		if (!db_res->HasError() && db_res->RowCount() > 0 && !db_res->GetValue(0, 0).IsNull()) {
-			default_db = db_res->GetValue(0, 0).ToString();
-		}
-		auto schema_res = con.Query("SELECT current_schema()");
-		if (!schema_res->HasError() && schema_res->RowCount() > 0 && !schema_res->GetValue(0, 0).IsNull()) {
-			default_schema = schema_res->GetValue(0, 0).ToString();
-		}
-	}
+	// Control metadata has its own schema; internal objects never follow it.
+	auto metadata_location = RefreshMetadata::CurrentLocation(con);
+	string default_db = metadata_location.catalog_name;
 	add_profile_step("generate_refresh_sql.context", context_start,
 	                 "cross_system=" + string(cross_system ? "true" : "false"));
 	string metadata_prefix;
 	if (!default_db.empty()) {
-		metadata_prefix = SqlUtils::QuoteIdentifier(default_db) + "." + SqlUtils::QuoteIdentifier(DEFAULT_SCHEMA) + ".";
+		metadata_prefix = SqlUtils::QualifiedPrefix(default_db, metadata_location.schema_name);
 	}
 	auto views_metadata_table = metadata_prefix + SqlUtils::QuoteIdentifier(openivm::VIEWS_TABLE);
 	auto delta_metadata_table = metadata_prefix + SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE);
@@ -486,15 +436,22 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	string internal_catalog_prefix = catalog_prefix;
 	auto metadata_start = profile_now();
 	RefreshMetadata metadata(con);
-	auto metadata_catalogs =
-	    active_facts.target_dialect == SqlDialect::DUCKDB ? RefreshMetadata::MetadataCatalogs(con) : vector<string>();
+	auto delta_metadata_tables = active_facts.target_dialect == SqlDialect::DUCKDB
+	                                 ? RefreshMetadata::MetadataTables(con, openivm::DELTA_TABLES_TABLE)
+	                                 : vector<string>();
 	bool target_is_ducklake = metadata.IsDuckLakeCatalog(view_catalog_name);
 	if (!target_is_ducklake && cross_system && !default_db.empty() && default_db != "memory" &&
 	    view_catalog_name != default_db) {
 		internal_catalog_name = default_db;
-		internal_schema_name = default_schema;
-		internal_catalog_prefix =
-		    SqlUtils::QuoteIdentifier(default_db) + "." + SqlUtils::QuoteIdentifier(default_schema) + ".";
+		internal_schema_name = DEFAULT_SCHEMA;
+		internal_catalog_prefix = SqlUtils::QualifiedPrefix(default_db, DEFAULT_SCHEMA);
+	} else if (!view_catalog_name.empty()) {
+		// openivm_internal_schema may have placed the MV's tables in its catalog's internal schema.
+		auto internal_schema = metadata.GetInternalSchema(view_name);
+		if (!internal_schema.empty()) {
+			internal_schema_name = internal_schema;
+			internal_catalog_prefix = SqlUtils::QualifiedPrefix(internal_catalog_name, internal_schema_name);
+		}
 	}
 	string data_table_bare = IncrementalTableNames::DataTableName(view_name);
 	string data_table = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table_bare);
@@ -586,7 +543,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		}
 		publication_sql = BuildPublishViewSQL(view_name, publication_prefix, publication_source_query,
 		                                      publication_columns, target_is_ducklake, delta_metadata_table, {}, "",
-		                                      active_facts.target_dialect, "", "", metadata_catalogs);
+		                                      active_facts.target_dialect, "", "", delta_metadata_tables);
 	}
 	auto finalize_refresh_sql = [&](string refresh_sql, bool publish = true) {
 		if (publish) {
@@ -631,7 +588,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto recovery_query =
 			    BuildRecomputeQuery(metadata, view_name, recovery_source_sql, cross_system, attached_db_catalog_name,
 			                        attached_db_schema_name, internal_catalog_prefix, metadata_prefix, out_post_meta,
-			                        deferred_cleanup, metadata_catalogs);
+			                        deferred_cleanup, delta_metadata_tables);
 			recovery_query += rebuild_distinct_aux();
 			if (cross_system) {
 				metadata.SetRefreshInProgress(view_name, false);
@@ -742,7 +699,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		}
 		auto recompute_query = BuildRecomputeQuery(
 		    metadata, view_name, recompute_source_sql, cross_system, attached_db_catalog_name, attached_db_schema_name,
-		    internal_catalog_prefix, metadata_prefix, out_post_meta, deferred_cleanup, metadata_catalogs);
+		    internal_catalog_prefix, metadata_prefix, out_post_meta, deferred_cleanup, delta_metadata_tables);
 		recompute_query += rebuild_distinct_aux();
 		add_profile_step("generate_refresh_sql.dispatch", full_refresh_start,
 		                 "full_recompute=true; metadata_requires_full_refresh=" +
@@ -987,9 +944,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 					}
 					string qkey = SqlUtils::QuoteIdentifier(key_col);
 					optional_ptr<RefreshMetadata::DeltaSource> source;
+					auto metadata_key = ResolveDeltaMetadataKey(metadata, view_name, base_table, delta_table_names);
 					for (auto &candidate : lj_sources) {
-						if (StringUtil::CIEquals(candidate.table_name, base_table) ||
-						    StringUtil::CIEquals(candidate.table_name, SqlUtils::DeltaName(base_table))) {
+						if (StringUtil::CIEquals(candidate.table_name, metadata_key)) {
 							source = &candidate;
 							break;
 						}
@@ -1017,12 +974,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 						}
 						// Matches CreateDeltaGetNode's convention: the stored snapshot was already
 						// consumed, so start one past it. Insertions are +1, deletions -1.
-						string ins =
-						    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", source->catalog_name,
-						                                    source->schema_name, base_table, last_snap + 1, cur_snap);
-						string del =
-						    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", source->catalog_name,
-						                                    source->schema_name, base_table, last_snap + 1, cur_snap);
+						auto source_location = metadata.GetSourceLocation(view_name, delta_name);
+						string ins = SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", source->catalog_name,
+						                                             source->schema_name, source_location.table_name,
+						                                             last_snap + 1, cur_snap);
+						string del = SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", source->catalog_name,
+						                                             source->schema_name, source_location.table_name,
+						                                             last_snap + 1, cur_snap);
 						result = "(SELECT " + qkey + " AS __k, 1 AS __m FROM " + ins + " UNION ALL SELECT " + qkey +
 						         " AS __k, -1 AS __m FROM " + del + ")";
 					} else {
@@ -1120,14 +1078,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                                 view_catalog_name, view_schema_name, attached_db_catalog_name,
 				                                 attached_db_schema_name);
 			}
-			string delta_source = ResolveDeltaMetadataKey(metadata, view_name, aux_meta.source, delta_table_names);
-			string delta_source_sql =
-			    metadata.ResolveDeltaQualifiedName(view_name, delta_source, view_catalog_name, view_schema_name);
-			string ts = metadata.GetLastUpdate(view_name, delta_source);
+			auto source_input = ResolveTrackedSourceInput(metadata, con, view_name, aux_meta.source, delta_table_names,
+			                                              view_catalog_name, view_schema_name, attached_db_catalog_name,
+			                                              attached_db_schema_name);
 			upsert_query = CompileFilteredGroupCount(
-			    view_name, aux_meta.aux_table, delta_source_sql, ts, aux_meta.group_col, aux_meta.sum_col,
-			    aux_meta.source_group_expr, aux_meta.source_sum_expr, aux_meta.output_col, aux_meta.comparison_op,
-			    aux_meta.threshold_sql, internal_catalog_prefix);
+			    view_name, aux_meta.aux_table, source_input.delta_sql, source_input.last_update, aux_meta.group_col,
+			    aux_meta.sum_col, aux_meta.source_group_expr, aux_meta.source_sum_expr, aux_meta.output_col,
+			    aux_meta.comparison_op, aux_meta.threshold_sql, internal_catalog_prefix);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling SIMPLE_AGGREGATE "
 			                    "filtered-group-count aux (%s, sum=%s %s %s)\n",
 			                    aux_meta.group_col.c_str(), aux_meta.sum_col.c_str(), aux_meta.comparison_op.c_str(),
@@ -1163,19 +1120,18 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                            view_catalog_name, view_schema_name, attached_db_catalog_name,
 				                            attached_db_schema_name);
 			}
-			string delta_source = ResolveDeltaMetadataKey(metadata, view_name, aux_meta.source, delta_table_names);
-			string delta_source_sql =
-			    metadata.ResolveDeltaQualifiedName(view_name, delta_source, view_catalog_name, view_schema_name);
-			string ts = metadata.GetLastUpdate(view_name, delta_source);
+			auto source_input = ResolveTrackedSourceInput(metadata, con, view_name, aux_meta.source, delta_table_names,
+			                                              view_catalog_name, view_schema_name, attached_db_catalog_name,
+			                                              attached_db_schema_name);
 			string count_star_col;
 			if (std::find(column_names.begin(), column_names.end(), string(openivm::COUNT_STAR_COL)) !=
 			    column_names.end()) {
 				count_star_col = string(openivm::COUNT_STAR_COL);
 			}
 			upsert_query = CompileCountDistinctIncremental(
-			    view_name, aux_meta.aux_table, delta_source_sql, ts, aux_meta.group_cols, aux_meta.group_source_exprs,
-			    aux_meta.distinct_col, aux_meta.distinct_expr, aux_meta.output_col, count_star_col, aux_meta.filter,
-			    internal_catalog_prefix);
+			    view_name, aux_meta.aux_table, source_input.delta_sql, source_input.last_update, aux_meta.group_cols,
+			    aux_meta.group_source_exprs, aux_meta.distinct_col, aux_meta.distinct_expr, aux_meta.output_col,
+			    count_star_col, aux_meta.filter, internal_catalog_prefix);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: COUNT_DISTINCT_INCREMENTAL (%zu group cols, "
 			                    "distinct=%s, out=%s)\n",
 			                    aux_meta.group_cols.size(), aux_meta.distinct_expr.c_str(),
@@ -1192,14 +1148,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                       view_schema_name, attached_db_catalog_name, attached_db_schema_name);
 			}
 			auto group_columns = metadata.GetGroupColumns(view_name);
-			string delta_source = ResolveDeltaMetadataKey(metadata, view_name, aux_meta.source, delta_table_names);
-			string delta_source_sql =
-			    metadata.ResolveDeltaQualifiedName(view_name, delta_source, view_catalog_name, view_schema_name);
-			string ts = metadata.GetLastUpdate(view_name, delta_source);
-			upsert_query =
-			    CompileDistinctIncremental(view_name, aux_meta.aux_table, aux_meta.cols, aux_meta.source_exprs,
-			                               delta_source_sql, ts, aux_meta.filter, group_columns, aux_meta.sum_arg,
-			                               aux_meta.sum_out, string(openivm::COUNT_STAR_COL), internal_catalog_prefix);
+			auto source_input = ResolveTrackedSourceInput(metadata, con, view_name, aux_meta.source, delta_table_names,
+			                                              view_catalog_name, view_schema_name, attached_db_catalog_name,
+			                                              attached_db_schema_name);
+			upsert_query = CompileDistinctIncremental(
+			    view_name, aux_meta.aux_table, aux_meta.cols, aux_meta.source_exprs, source_input.delta_sql,
+			    source_input.last_update, aux_meta.filter, group_columns, aux_meta.sum_arg, aux_meta.sum_out,
+			    string(openivm::COUNT_STAR_COL), internal_catalog_prefix);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: "
 			                    "DISTINCT_INCREMENTAL (%zu distinct cols, "
 			                    "%zu group cols, sum_arg=%s, sum_out=%s)\n",
@@ -1220,12 +1175,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                       internal_schema_name, internal_catalog_prefix, view_catalog_name,
 				                       view_schema_name, attached_db_catalog_name, attached_db_schema_name);
 			}
-			auto left_input = ResolveSemiAntiSourceInput(metadata, con, view_name, aux_meta.left_table,
+			auto left_input = ResolveTrackedSourceInput(metadata, con, view_name, aux_meta.left_table,
+			                                            delta_table_names, view_catalog_name, view_schema_name,
+			                                            attached_db_catalog_name, attached_db_schema_name);
+			auto right_input = ResolveTrackedSourceInput(metadata, con, view_name, aux_meta.right_table,
 			                                             delta_table_names, view_catalog_name, view_schema_name,
 			                                             attached_db_catalog_name, attached_db_schema_name);
-			auto right_input = ResolveSemiAntiSourceInput(metadata, con, view_name, aux_meta.right_table,
-			                                              delta_table_names, view_catalog_name, view_schema_name,
-			                                              attached_db_catalog_name, attached_db_schema_name);
 			string left_delta = left_input.delta_sql;
 			string left_ts = left_input.last_update;
 			if (left_ts.empty()) {
@@ -1284,7 +1239,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		string unmatched_groups;
 		if (source_has_full_outer) {
 			unmatched_groups = BuildFullOuterUnmatchedGroups(metadata, view_name, delta_table_names, group_columns,
-			                                                 view_query_sql, delta_specs, lpts_table_prefix);
+			                                                 view_query_sql, delta_specs);
 		}
 		upsert_query =
 		    CompileGroupRecompute(view_name, view_query_sql, group_columns, delta_specs, internal_catalog_prefix,
@@ -1730,7 +1685,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compact delta-view query:\n%s\n", compact_delta_view_query.c_str());
 		}
 		delete_from_view_query = RefreshMetadata::BuildDeltaCleanupSQL(
-		    delta_view_name, delta_view_name_bare, delta_metadata_table, nullptr, metadata_catalogs);
+		    delta_view_name, delta_view_name_bare, delta_metadata_table, nullptr, delta_metadata_tables);
 	} else {
 		delete_from_view_query = inline_mv_delta          ? ""
 		                         : use_transient_mv_delta ? "DROP TABLE IF EXISTS " + transient_delta_name + ";"
@@ -1767,9 +1722,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		if (schema_name.empty()) {
 			schema_name = DEFAULT_SCHEMA;
 		}
-		string physical_name = RefreshMetadata::SourceTableName(dt, source.catalog_name, source.schema_name);
+		// The physical delta may sit in an internal schema under a schema-qualified name.
+		string physical_name = source.delta_table_name.empty()
+		                           ? RefreshMetadata::SourceTableName(dt, source.catalog_name, source.schema_name)
+		                           : source.delta_table_name;
+		string delta_schema_name = source.delta_schema_name.empty() ? schema_name : source.delta_schema_name;
 		string resolved = catalog_name.empty() ? SqlUtils::QuoteIdentifier(physical_name)
-		                                       : SqlUtils::FullName(catalog_name, schema_name, physical_name);
+		                                       : SqlUtils::FullName(catalog_name, delta_schema_name, physical_name);
 		update_timestamp_query += "UPDATE " + delta_metadata_table +
 		                          " SET last_update = COALESCE("
 		                          "(SELECT MAX(" +
@@ -1779,8 +1738,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                          SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
 		                          SqlUtils::EscapeValue(dt) + "';\n";
 		if (!cross_system) {
-			delete_from_delta_table_query += RefreshMetadata::BuildDeltaCleanupSQL(resolved, dt, delta_metadata_table,
-			                                                                       deferred_cleanup, metadata_catalogs);
+			delete_from_delta_table_query += RefreshMetadata::BuildDeltaCleanupSQL(
+			    resolved, dt, delta_metadata_table, deferred_cleanup, delta_metadata_tables, catalog_name, schema_name);
 		}
 	}
 	string set_in_progress = "UPDATE " + views_metadata_table + " SET refresh_in_progress = true WHERE view_name = '" +
@@ -1856,15 +1815,22 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			publication_sql = BuildPublishViewSQL(
 			    view_name, publication_prefix, publication_source_query, publication_columns, target_is_ducklake,
 			    delta_metadata_table, scope_columns, "", active_facts.target_dialect, appended_projection_rows,
-			    retained_publication_scope.rows, metadata_catalogs);
+			    retained_publication_scope.rows, delta_metadata_tables);
 		}
 		publication_sql += retained_publication_scope.cleanup_sql;
 	}
 	string data_sql = transient_delta_preamble + pre_companion + delta_query + "\n" + companion_query + "\n" +
 	                  upsert_query + "\n" + post_companion + publication_sql + compact_delta_view_query +
-	                  delete_from_view_query + "\n" + delete_from_delta_table_query;
+	                  delete_from_view_query + "\n";
 	const string &meta_pre_sql = set_in_progress;
-	string meta_post_sql = update_timestamp_query + snapshot_update_query + "\n" + clear_in_progress;
+	// Source cleanup reads the minimum watermark of every consumer. Advance this
+	// consumer first, while its source rows still exist for MAX(timestamp), then
+	// remove only rows consumed by all views. Cross-catalog cleanup remains deferred
+	// until commit by BuildDeltaCleanupSQL.
+	string meta_post_sql =
+	    update_timestamp_query + snapshot_update_query + "\n" + delete_from_delta_table_query + clear_in_progress;
+	OPENIVM_DEBUG_PRINT("[UPSERT] Source delta cleanup follows consumer watermark updates for '%s'\n",
+	                    view_name.c_str());
 	if (active_facts.target_dialect == SqlDialect::SPARK) {
 		data_sql = SparkPortableRefreshSQL(data_sql);
 		meta_post_sql = SparkPortableRefreshSQL(meta_post_sql);

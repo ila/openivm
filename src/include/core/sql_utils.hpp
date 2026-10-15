@@ -33,6 +33,8 @@ public:
 	static vector<string> ParseQualifiedIdentifier(const string &name);
 	static string FullName(const string &catalog, const string &schema, const string &table);
 	static string FullDeltaName(const string &catalog, const string &schema, const string &table);
+	/// Compare SQL expressions holding catalog identifiers using DuckDB's ASCII-only case folding.
+	static string IdentifierEqualsSQL(const string &left, const string &right);
 	static string QualifiedPrefix(const string &catalog, const string &schema);
 	static string QuoteQualifiedPrefix(const string &prefix);
 	static string JsonQuote(const string &value);
@@ -65,6 +67,8 @@ public:
 	static string ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement);
 	static vector<string> ReplaceEachPlainOccurrence(const string &haystack, const string &needle,
 	                                                 const string &replacement);
+	// Table-reference helpers accept SQL identifier spellings. Use QuoteIdentifier for
+	// raw table names from the catalog so embedded dots and quotes retain their meaning.
 	static string ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement);
 	static string ReplaceTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence,
 	                                              const string &replacement, bool &replaced);

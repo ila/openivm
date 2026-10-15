@@ -1,0 +1,2759 @@
+# name: test/sql/internal_schema.test
+# description: openivm_internal_schema places internal maintenance tables in a dedicated schema of each data catalog; user-facing MVs stay where requested
+# group: [sql]
+
+require openivm
+
+load __TEST_DIR__/openivm_internal_schema.db
+
+# Replacement must retire removed-source deltas, preserve shared ownership even
+# in another metadata catalog, and roll back both ownership and physical cleanup.
+statement ok
+SET openivm_internal_schema = 'Replacement Internal';
+
+statement ok
+CREATE SCHEMA "Replacement Sources";
+CREATE TABLE "Replacement Sources".a(i INTEGER);
+CREATE TABLE "Replacement Sources".b(i INTEGER);
+INSERT INTO "Replacement Sources".a VALUES (1),(1),(2);
+INSERT INTO "Replacement Sources".b VALUES (3),(3),(4);
+
+statement ok
+CREATE MATERIALIZED VIEW replaced_source AS SELECT * FROM "Replacement Sources".a;
+
+statement ok
+BEGIN;
+CREATE OR REPLACE MATERIALIZED VIEW replaced_source AS SELECT * FROM "Replacement Sources".b;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Replacement Internal' AND table_name LIKE '%_a';
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Replacement Internal' AND table_name LIKE '%_a';
+----
+1
+
+query I
+SELECT count(*) FROM ((SELECT * FROM replaced_source EXCEPT ALL SELECT * FROM "Replacement Sources".a)
+UNION ALL (SELECT * FROM "Replacement Sources".a EXCEPT ALL SELECT * FROM replaced_source));
+----
+0
+
+# Repeated replacement and DROP -> CREATE must distinguish the caller's own
+# physical cleanup from invisible committed deltas. Exercise both colocated and
+# dedicated placement, retaining and changing physical identities, and both
+# transaction outcomes. Each case starts with a committed sole consumer.
+statement ok
+CREATE SCHEMA namespace_lifecycle;
+CREATE TABLE namespace_lifecycle.a(i INTEGER);
+CREATE TABLE namespace_lifecycle.b(i INTEGER);
+INSERT INTO namespace_lifecycle.a VALUES (1),(1),(2);
+INSERT INTO namespace_lifecycle.b VALUES (3),(3),(4);
+
+foreach placement namespace_lifecycle NamespaceInternal
+
+foreach recreated namespace_lifecycle NamespaceInternal
+
+foreach outcome COMMIT ROLLBACK
+
+statement ok
+SET openivm_internal_schema = '${placement}';
+CREATE MATERIALIZED VIEW "Lifecycle View" AS SELECT * FROM namespace_lifecycle.a;
+
+statement ok
+BEGIN;
+CREATE OR REPLACE MATERIALIZED VIEW "Lifecycle View" AS SELECT * FROM namespace_lifecycle.b;
+SET openivm_internal_schema = '${recreated}';
+CREATE OR REPLACE MATERIALIZED VIEW "Lifecycle View" AS SELECT * FROM namespace_lifecycle.a;
+CREATE MATERIALIZED VIEW lifecycle_sibling AS SELECT * FROM namespace_lifecycle.a;
+DROP VIEW lifecycle_sibling;
+${outcome};
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "Lifecycle View" EXCEPT ALL SELECT * FROM namespace_lifecycle.a)
+UNION ALL (SELECT * FROM namespace_lifecycle.a EXCEPT ALL SELECT * FROM "Lifecycle View"));
+----
+0
+
+query I
+SELECT count(DISTINCT coalesce(delta_schema, source_schema) || '.' || delta_table_name)
+FROM main.openivm_delta_tables WHERE source_schema = 'namespace_lifecycle' AND table_name = 'openivm_delta_a';
+----
+1
+
+# Batched conflicting writes must be captured by the surviving/recreated delta.
+statement ok
+INSERT INTO namespace_lifecycle.a VALUES (1),(1),(2),(8);
+DELETE FROM namespace_lifecycle.a WHERE i=1;
+UPDATE namespace_lifecycle.a SET i=9 WHERE i=2;
+INSERT INTO namespace_lifecycle.a VALUES (9),(9);
+DELETE FROM namespace_lifecycle.a WHERE i=8;
+
+statement ok
+PRAGMA refresh('"Lifecycle View"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "Lifecycle View" EXCEPT ALL SELECT * FROM namespace_lifecycle.a)
+UNION ALL (SELECT * FROM namespace_lifecycle.a EXCEPT ALL SELECT * FROM "Lifecycle View"));
+----
+0
+
+statement ok
+DROP VIEW "Lifecycle View";
+
+# No delta from a removed source or an earlier placement may leak.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name IN ('namespace_lifecycle', 'NamespaceInternal')
+AND starts_with(table_name, 'openivm_');
+----
+0
+
+statement ok
+DELETE FROM namespace_lifecycle.a;
+INSERT INTO namespace_lifecycle.a VALUES (1),(1),(2);
+
+statement ok
+SET openivm_internal_schema = '${placement}';
+CREATE MATERIALIZED VIEW "Lifecycle View" AS SELECT * FROM namespace_lifecycle.a;
+
+statement ok
+BEGIN;
+DROP VIEW "Lifecycle View";
+SET openivm_internal_schema = '${recreated}';
+CREATE MATERIALIZED VIEW "Lifecycle View" AS SELECT * FROM namespace_lifecycle.a;
+CREATE MATERIALIZED VIEW lifecycle_sibling AS SELECT * FROM namespace_lifecycle.a;
+DROP VIEW lifecycle_sibling;
+${outcome};
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "Lifecycle View" EXCEPT ALL SELECT * FROM namespace_lifecycle.a)
+UNION ALL (SELECT * FROM namespace_lifecycle.a EXCEPT ALL SELECT * FROM "Lifecycle View"));
+----
+0
+
+query I
+SELECT count(DISTINCT coalesce(delta_schema, source_schema) || '.' || delta_table_name)
+FROM main.openivm_delta_tables WHERE source_schema = 'namespace_lifecycle' AND table_name = 'openivm_delta_a';
+----
+1
+
+# Batched conflicting writes must be captured by the surviving/recreated delta.
+statement ok
+INSERT INTO namespace_lifecycle.a VALUES (1),(1),(2),(8);
+DELETE FROM namespace_lifecycle.a WHERE i=1;
+UPDATE namespace_lifecycle.a SET i=9 WHERE i=2;
+INSERT INTO namespace_lifecycle.a VALUES (9),(9);
+DELETE FROM namespace_lifecycle.a WHERE i=8;
+
+statement ok
+PRAGMA refresh('"Lifecycle View"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "Lifecycle View" EXCEPT ALL SELECT * FROM namespace_lifecycle.a)
+UNION ALL (SELECT * FROM namespace_lifecycle.a EXCEPT ALL SELECT * FROM "Lifecycle View"));
+----
+0
+
+statement ok
+DROP VIEW "Lifecycle View";
+
+# No delta from a removed source or an earlier placement may leak.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name IN ('namespace_lifecycle', 'NamespaceInternal')
+AND starts_with(table_name, 'openivm_');
+----
+0
+
+statement ok
+DELETE FROM namespace_lifecycle.a;
+INSERT INTO namespace_lifecycle.a VALUES (1),(1),(2);
+
+endloop
+
+endloop
+
+endloop
+
+statement ok
+DROP TABLE namespace_lifecycle.a;
+DROP TABLE namespace_lifecycle.b;
+DROP SCHEMA namespace_lifecycle;
+DROP SCHEMA NamespaceInternal;
+SET openivm_internal_schema = 'Replacement Internal';
+
+# Ownership added earlier in this transaction must be visible to cleanup checks.
+statement ok
+BEGIN;
+CREATE MATERIALIZED VIEW replacement_sibling AS SELECT * FROM "Replacement Sources".a;
+CREATE OR REPLACE MATERIALIZED VIEW replaced_source AS SELECT * FROM "Replacement Sources".b;
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Replacement Internal' AND table_name LIKE '%_a';
+----
+1
+
+statement ok
+DROP VIEW replacement_sibling;
+CREATE OR REPLACE MATERIALIZED VIEW replaced_source AS SELECT * FROM "Replacement Sources".a;
+
+statement ok
+ATTACH ':memory:' AS replacement_consumer;
+CREATE MATERIALIZED VIEW replacement_consumer.main.shared_source AS SELECT * FROM "Replacement Sources".a;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW replaced_source AS SELECT * FROM "Replacement Sources".b;
+
+# Another catalog still consumes a's existing physical delta.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='openivm_internal_schema'
+AND schema_name='Replacement Internal' AND table_name LIKE '%_a';
+----
+1
+
+statement ok
+INSERT INTO "Replacement Sources".a VALUES (5),(5);
+DELETE FROM "Replacement Sources".a WHERE i=1;
+UPDATE "Replacement Sources".a SET i=6 WHERE i=2;
+INSERT INTO "Replacement Sources".b VALUES (5),(5);
+DELETE FROM "Replacement Sources".b WHERE i=3;
+UPDATE "Replacement Sources".b SET i=6 WHERE i=4;
+
+statement ok
+PRAGMA refresh('replacement_consumer.main.shared_source');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM replacement_consumer.main.shared_source EXCEPT ALL SELECT * FROM "Replacement Sources".a)
+UNION ALL (SELECT * FROM "Replacement Sources".a EXCEPT ALL SELECT * FROM replacement_consumer.main.shared_source));
+----
+0
+
+statement ok
+PRAGMA refresh('replaced_source');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM replaced_source EXCEPT ALL SELECT * FROM "Replacement Sources".b)
+UNION ALL (SELECT * FROM "Replacement Sources".b EXCEPT ALL SELECT * FROM replaced_source));
+----
+0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW replacement_consumer.main.shared_source AS SELECT * FROM "Replacement Sources".b;
+
+# Last consumer of a was replaced. Its external delta is cleaned after commit.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='openivm_internal_schema'
+AND schema_name='Replacement Internal' AND table_name LIKE '%_a';
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW replacement_sentinel AS SELECT * FROM "Replacement Sources".a;
+DROP VIEW replaced_source;
+
+statement ok
+BEGIN;
+CREATE OR REPLACE MATERIALIZED VIEW replacement_consumer.main.shared_source AS SELECT * FROM "Replacement Sources".a;
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM replacement_consumer.main.shared_source EXCEPT ALL SELECT * FROM "Replacement Sources".b)
+UNION ALL (SELECT * FROM "Replacement Sources".b EXCEPT ALL SELECT * FROM replacement_consumer.main.shared_source));
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='openivm_internal_schema'
+AND schema_name='Replacement Internal' AND table_name LIKE '%_b';
+----
+1
+
+# A later CREATE can reuse a delta scheduled for external cleanup in the same
+# transaction. Commit must re-check actual ownership before deleting that delta.
+statement ok
+BEGIN;
+CREATE OR REPLACE MATERIALIZED VIEW replacement_consumer.main.shared_source AS SELECT * FROM "Replacement Sources".a;
+CREATE MATERIALIZED VIEW replacement_consumer.main.reused_delta AS SELECT * FROM "Replacement Sources".b;
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='openivm_internal_schema'
+AND schema_name='Replacement Internal' AND table_name LIKE '%_b';
+----
+1
+
+statement ok
+INSERT INTO "Replacement Sources".b VALUES (8),(8),(9);
+DELETE FROM "Replacement Sources".b WHERE i=5;
+UPDATE "Replacement Sources".b SET i=10 WHERE i=6;
+
+statement ok
+PRAGMA refresh('replacement_consumer.main.reused_delta');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM replacement_consumer.main.reused_delta EXCEPT ALL SELECT * FROM "Replacement Sources".b)
+UNION ALL (SELECT * FROM "Replacement Sources".b EXCEPT ALL SELECT * FROM replacement_consumer.main.reused_delta));
+----
+0
+
+statement ok
+DROP VIEW replacement_consumer.main.reused_delta;
+DROP VIEW replacement_consumer.main.shared_source;
+DETACH replacement_consumer;
+DROP VIEW replacement_sentinel;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Replacement Internal';
+----
+0
+
+statement ok
+DROP TABLE "Replacement Sources".a;
+DROP TABLE "Replacement Sources".b;
+DROP SCHEMA "Replacement Sources";
+DROP SCHEMA "Replacement Internal";
+SET openivm_internal_schema = '';
+
+# A view created before the setting keeps its tables beside it and its source.
+statement ok
+CREATE TABLE legacy_items (id INTEGER, grp VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO legacy_items VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 5);
+
+statement ok
+CREATE MATERIALIZED VIEW legacy_totals AS SELECT grp, SUM(amount) AS total, COUNT(*) AS cnt FROM legacy_items GROUP BY grp;
+
+statement ok
+SET openivm_internal_schema = 'OpenIVM Internal';
+
+# Same-named sources and views in two schemas, a quoted schema, and a non-default search path.
+statement ok
+CREATE SCHEMA s1;
+
+statement ok
+CREATE SCHEMA "Other Schema";
+
+statement ok
+CREATE TABLE s1.items (id INTEGER, grp VARCHAR, amount INTEGER);
+
+statement ok
+CREATE TABLE "Other Schema".items (id INTEGER, grp VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO s1.items VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 5);
+
+statement ok
+INSERT INTO "Other Schema".items VALUES (1, 'x', 100), (2, 'y', 200);
+
+statement ok
+SET search_path = 's1,main';
+
+statement ok
+CREATE MATERIALIZED VIEW totals AS SELECT grp, SUM(amount) AS total, COUNT(*) AS cnt FROM items GROUP BY grp;
+
+statement ok
+USE openivm_internal_schema."Other Schema";
+
+statement ok
+CREATE MATERIALIZED VIEW totals AS SELECT grp, SUM(amount) AS total, COUNT(*) AS cnt FROM items GROUP BY grp;
+
+statement ok
+USE openivm_internal_schema.main;
+
+# A view over a source that already has a delta reuses it; its own tables move.
+statement ok
+CREATE MATERIALIZED VIEW main_totals AS SELECT grp, SUM(amount) AS total FROM legacy_items GROUP BY grp;
+
+# User-facing views stay in their requested schemas.
+query II
+SELECT schema_name, view_name FROM duckdb_views() WHERE view_name IN ('totals', 'main_totals', 'legacy_totals') ORDER BY ALL;
+----
+Other Schema	totals
+main	legacy_totals
+main	main_totals
+s1	totals
+
+# Backing, MV-delta and publication tables of the new views live in the internal schema only.
+query II
+SELECT
+    (SELECT count(*) FROM duckdb_tables() t JOIN main.openivm_views v
+        ON t.table_name IN ('openivm_data_' || v.view_name, 'openivm_delta_' || v.view_name, 'openivm_visible_' || v.view_name)
+     WHERE v.view_sql_name IN ('totals', 'main_totals') AND t.schema_name = 'OpenIVM Internal'),
+    (SELECT count(*) FROM duckdb_tables() WHERE schema_name IN ('s1', 'Other Schema') AND starts_with(table_name, 'openivm_'));
+----
+9	0
+
+query II
+SELECT coalesce(view_schema, ''), coalesce(internal_schema, '') FROM main.openivm_views
+WHERE view_sql_name IN ('totals', 'main_totals', 'legacy_totals') ORDER BY ALL;
+----
+Other Schema	OpenIVM Internal
+main	(empty)
+main	OpenIVM Internal
+s1	OpenIVM Internal
+
+# Same-named sources get schema-qualified deltas in the internal schema and never collide.
+query I
+SELECT string_agg(table_name, ',' ORDER BY table_name) FROM duckdb_tables()
+WHERE schema_name = 'OpenIVM Internal' AND table_name LIKE 'openivm\_delta\_%\_items' ESCAPE '\';
+----
+openivm_delta_6f7468657220736368656d61_items,openivm_delta_7331_items
+
+query III
+SELECT v.view_schema, d.source_schema, d.delta_schema FROM main.openivm_delta_tables d JOIN main.openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'totals' ORDER BY ALL;
+----
+Other Schema	Other Schema	OpenIVM Internal
+s1	s1	OpenIVM Internal
+
+# The existing delta beside legacy_items is shared, not duplicated.
+query III
+SELECT
+    (SELECT count(*) FROM main.openivm_delta_tables d JOIN main.openivm_views v USING (view_name)
+     WHERE v.view_sql_name = 'main_totals' AND d.delta_schema IS NULL),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_legacy_items' AND schema_name = 'main'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name LIKE 'openivm\_delta\_%\_legacy\_items' ESCAPE '\');
+----
+1	1	0
+
+# The grouped view in main keeps its unique index on the moved backing table.
+query I
+SELECT count(*) FROM duckdb_indexes() i JOIN main.openivm_views v ON i.table_name = 'openivm_data_' || v.view_name
+WHERE v.view_sql_name = 'main_totals' AND i.schema_name = 'OpenIVM Internal';
+----
+1
+
+# Changes are captured into the moved deltas and refreshed incrementally.
+statement ok
+INSERT INTO s1.items VALUES (4, 'b', 7), (5, 'c', 1);
+
+statement ok
+DELETE FROM s1.items WHERE id = 1;
+
+statement ok
+UPDATE s1.items SET amount = amount * 2 WHERE grp = 'b';
+
+statement ok
+INSERT INTO "Other Schema".items VALUES (3, 'x', 1);
+
+statement ok
+DELETE FROM "Other Schema".items WHERE id = 2;
+
+statement ok
+UPDATE "Other Schema".items SET grp = 'z' WHERE id = 1;
+
+statement ok
+INSERT INTO legacy_items VALUES (4, 'c', 3), (5, 'a', 1);
+
+statement ok
+DELETE FROM legacy_items WHERE id = 2;
+
+statement ok
+UPDATE legacy_items SET amount = 50 WHERE id = 3;
+
+query I
+SELECT count(*) > 0 FROM "OpenIVM Internal".openivm_delta_7331_items;
+----
+true
+
+statement ok
+PRAGMA refresh('s1.totals');
+
+statement ok
+PRAGMA refresh('"Other Schema".totals');
+
+statement ok
+PRAGMA refresh('main_totals');
+
+statement ok
+PRAGMA refresh('legacy_totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.totals EXCEPT ALL SELECT grp, SUM(amount), COUNT(*) FROM s1.items GROUP BY grp) UNION ALL (SELECT grp, SUM(amount), COUNT(*) FROM s1.items GROUP BY grp EXCEPT ALL SELECT * FROM s1.totals));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "Other Schema".totals EXCEPT ALL SELECT grp, SUM(amount), COUNT(*) FROM "Other Schema".items GROUP BY grp) UNION ALL (SELECT grp, SUM(amount), COUNT(*) FROM "Other Schema".items GROUP BY grp EXCEPT ALL SELECT * FROM "Other Schema".totals));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main_totals EXCEPT ALL SELECT grp, SUM(amount) FROM legacy_items GROUP BY grp) UNION ALL (SELECT grp, SUM(amount) FROM legacy_items GROUP BY grp EXCEPT ALL SELECT * FROM main_totals));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM legacy_totals EXCEPT ALL SELECT grp, SUM(amount), COUNT(*) FROM legacy_items GROUP BY grp) UNION ALL (SELECT grp, SUM(amount), COUNT(*) FROM legacy_items GROUP BY grp EXCEPT ALL SELECT * FROM legacy_totals));
+----
+0
+
+# Refresh consumed the moved delta rows.
+query I
+SELECT count(*) FROM "OpenIVM Internal".openivm_delta_7331_items;
+----
+0
+
+# Schema changes of a source follow its moved delta.
+statement ok
+ALTER TABLE s1.items ADD COLUMN note VARCHAR;
+
+query I
+SELECT count(*) FROM duckdb_columns()
+WHERE schema_name = 'OpenIVM Internal' AND table_name = 'openivm_delta_7331_items' AND column_name = 'note';
+----
+1
+
+statement ok
+INSERT INTO s1.items VALUES (6, 'a', 4, 'n'), (7, 'd', 2, NULL);
+
+statement ok
+DELETE FROM s1.items WHERE id = 5;
+
+statement ok
+PRAGMA refresh('s1.totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.totals EXCEPT ALL SELECT grp, SUM(amount), COUNT(*) FROM s1.items GROUP BY grp) UNION ALL (SELECT grp, SUM(amount), COUNT(*) FROM s1.items GROUP BY grp EXCEPT ALL SELECT * FROM s1.totals));
+----
+0
+
+# Replacement keeps the view's internal location even after the setting changes.
+statement ok
+SET openivm_internal_schema = '';
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW s1.totals AS
+SELECT grp, SUM(amount) AS total, COUNT(*) AS cnt FROM s1.items WHERE amount > 1 GROUP BY grp;
+
+query II
+SELECT
+    (SELECT internal_schema FROM main.openivm_views WHERE view_sql_name = 'totals' AND view_schema = 's1'),
+    (SELECT count(*) FROM duckdb_tables() WHERE schema_name = 's1' AND starts_with(table_name, 'openivm_'));
+----
+OpenIVM Internal	0
+
+statement ok
+INSERT INTO s1.items VALUES (8, 'b', 9, NULL), (9, 'a', 1, NULL);
+
+statement ok
+UPDATE s1.items SET amount = 0 WHERE id = 6;
+
+statement ok
+PRAGMA refresh('s1.totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.totals EXCEPT ALL SELECT grp, SUM(amount), COUNT(*) FROM s1.items WHERE amount > 1 GROUP BY grp) UNION ALL (SELECT grp, SUM(amount), COUNT(*) FROM s1.items WHERE amount > 1 GROUP BY grp EXCEPT ALL SELECT * FROM s1.totals));
+----
+0
+
+statement ok
+SET openivm_internal_schema = 'OpenIVM Internal';
+
+# A rolled-back CREATE removes its internal tables and metadata.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE MATERIALIZED VIEW s1.rolled_back AS SELECT id, amount FROM s1.items;
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN main.openivm_views v ON t.table_name = 'openivm_data_' || v.view_name
+WHERE v.view_sql_name = 'rolled_back' AND t.schema_name = 'OpenIVM Internal';
+----
+1
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT
+    (SELECT count(*) FROM main.openivm_views WHERE view_sql_name = 'rolled_back'),
+    (SELECT count(*) FROM duckdb_views() WHERE view_name = 'rolled_back');
+----
+0	0
+
+# In a catalog without the internal schema, an explicit transaction creates it and
+# ROLLBACK removes it with the view's tables and the source delta.
+statement ok
+ATTACH '__TEST_DIR__/openivm_internal_schema_fresh.db' AS fresh_cat;
+
+statement ok
+CREATE TABLE fresh_cat.main.fresh_src (id INTEGER);
+
+statement ok
+INSERT INTO fresh_cat.main.fresh_src VALUES (1), (1), (2);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE MATERIALIZED VIEW fresh_cat.main.fresh_mv AS SELECT id FROM fresh_cat.main.fresh_src;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'fresh_cat' AND schema_name = 'OpenIVM Internal'
+  AND table_name = 'openivm_delta_6d61696e_fresh_src';
+----
+1
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'fresh_cat' AND schema_name = 'OpenIVM Internal';
+----
+0
+
+statement ok
+DETACH fresh_cat;
+
+# DROP removes the view's internal tables and the source delta it alone used.
+statement ok
+DROP VIEW "Other Schema".totals;
+
+query II
+SELECT
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_6f7468657220736368656d61_items'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_7331_items');
+----
+0	1
+
+query I
+SELECT count(*) FROM main.openivm_views WHERE view_sql_name = 'totals' AND view_schema = 'Other Schema';
+----
+0
+
+# SQLLogicTest restart copies DBConfig and ClientConfig, including extension
+# settings. Clear placement explicitly to exercise discovery without a setting;
+# the native lifecycle fixture also closes/reopens with a fresh configuration.
+statement ok
+SET openivm_internal_schema = '';
+
+restart
+
+statement ok
+INSERT INTO s1.items VALUES (10, 'c', 6, NULL);
+
+statement ok
+DELETE FROM s1.items WHERE id = 8;
+
+statement ok
+PRAGMA refresh('s1.totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.totals EXCEPT ALL SELECT grp, SUM(amount), COUNT(*) FROM s1.items WHERE amount > 1 GROUP BY grp) UNION ALL (SELECT grp, SUM(amount), COUNT(*) FROM s1.items WHERE amount > 1 GROUP BY grp EXCEPT ALL SELECT * FROM s1.totals));
+----
+0
+
+# A view created without the setting keeps its own tables beside it, but reuses the
+# source's existing delta in the internal schema.
+statement ok
+CREATE MATERIALIZED VIEW s1.after_reopen AS SELECT id, amount FROM s1.items;
+
+query III
+SELECT
+    (SELECT coalesce(internal_schema, '') FROM main.openivm_views WHERE view_sql_name = 'after_reopen'),
+    (SELECT d.delta_schema FROM main.openivm_delta_tables d JOIN main.openivm_views v USING (view_name)
+     WHERE v.view_sql_name = 'after_reopen'),
+    (SELECT count(*) FROM duckdb_tables() t JOIN main.openivm_views v ON t.table_name = 'openivm_data_' || v.view_name
+     WHERE v.view_sql_name = 'after_reopen' AND t.schema_name = 's1');
+----
+(empty)	OpenIVM Internal	1
+
+statement ok
+INSERT INTO s1.items VALUES (11, 'e', 3, NULL), (11, 'e', 3, NULL);
+
+statement ok
+UPDATE s1.items SET amount = amount + 1 WHERE id = 10;
+
+statement ok
+PRAGMA refresh('s1.after_reopen');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.after_reopen EXCEPT ALL SELECT id, amount FROM s1.items) UNION ALL (SELECT id, amount FROM s1.items EXCEPT ALL SELECT * FROM s1.after_reopen));
+----
+0
+
+statement ok
+PRAGMA refresh('s1.totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.totals EXCEPT ALL SELECT grp, SUM(amount), COUNT(*) FROM s1.items WHERE amount > 1 GROUP BY grp) UNION ALL (SELECT grp, SUM(amount), COUNT(*) FROM s1.items WHERE amount > 1 GROUP BY grp EXCEPT ALL SELECT * FROM s1.totals));
+----
+0
+
+# Control and internal schemas are independent, including auxiliary-state lifecycle.
+statement ok
+SET openivm_metadata_schema = 'Control Space';
+
+statement ok
+SET openivm_internal_schema = 'OpenIVM Internal';
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+SET openivm_stateful_auxstate = true;
+
+statement ok
+SET openivm_distinct_aux_state = true;
+
+statement ok
+CREATE TABLE s1.aux_source (g INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO s1.aux_source VALUES (1,10),(1,10),(1,20),(2,30),(3,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW s1.counted AS SELECT g, COUNT(DISTINCT x) AS n FROM s1.aux_source GROUP BY g;
+
+statement ok
+CREATE MATERIALIZED VIEW s1.deduplicated AS SELECT g, SUM(x) AS n FROM (SELECT DISTINCT g, x FROM s1.aux_source) d GROUP BY g;
+
+query TIT
+SELECT v.view_sql_name, v.type, t.schema_name FROM "Control Space".openivm_views v JOIN duckdb_tables() t ON t.table_name = CASE v.view_sql_name WHEN 'counted' THEN 'openivm_aux_' ELSE 'openivm_distinct_count_' END || v.view_name WHERE v.view_sql_name IN ('counted','deduplicated') ORDER BY v.view_sql_name;
+----
+counted	11	OpenIVM Internal
+deduplicated	8	OpenIVM Internal
+
+statement ok
+INSERT INTO s1.aux_source VALUES (1,40),(2,30),(4,5);
+
+statement ok
+DELETE FROM s1.aux_source WHERE x = 20;
+
+statement ok
+UPDATE s1.aux_source SET x = 40 WHERE x = 10;
+
+statement ok
+PRAGMA refresh('s1.counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) AS n FROM s1.aux_source GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) AS n FROM s1.aux_source GROUP BY g EXCEPT ALL SELECT * FROM s1.counted));
+----
+0
+
+statement ok
+PRAGMA refresh('s1.deduplicated');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.deduplicated EXCEPT ALL SELECT g, SUM(x) AS n FROM (SELECT DISTINCT g, x FROM s1.aux_source) d GROUP BY g) UNION ALL (SELECT g, SUM(x) AS n FROM (SELECT DISTINCT g, x FROM s1.aux_source) d GROUP BY g EXCEPT ALL SELECT * FROM s1.deduplicated));
+----
+0
+
+# Missing auxiliary state is rebuilt in the stored internal schema.
+statement ok
+DROP TABLE "OpenIVM Internal".openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_636f756e746564_;
+
+statement ok
+SET openivm_internal_schema = '';
+
+statement ok
+PRAGMA refresh('s1.counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) AS n FROM s1.aux_source GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) AS n FROM s1.aux_source GROUP BY g EXCEPT ALL SELECT * FROM s1.counted));
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN "Control Space".openivm_views v ON t.table_name = 'openivm_aux_' || v.view_name WHERE v.view_sql_name = 'counted' AND t.schema_name = 'OpenIVM Internal';
+----
+1
+
+# Replacement removes state no longer required by the query; rollback restores it.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW s1.counted AS SELECT g, COUNT(*) AS n FROM s1.aux_source GROUP BY g;
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN "Control Space".openivm_views v ON t.table_name = 'openivm_aux_' || v.view_name WHERE v.view_sql_name = 'counted';
+----
+0
+
+statement ok
+ROLLBACK;
+
+statement ok
+INSERT INTO s1.aux_source VALUES (1,50),(1,50);
+
+statement ok
+PRAGMA refresh('s1.counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) AS n FROM s1.aux_source GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) AS n FROM s1.aux_source GROUP BY g EXCEPT ALL SELECT * FROM s1.counted));
+----
+0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW s1.counted AS SELECT g, COUNT(*) AS n FROM s1.aux_source GROUP BY g;
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN "Control Space".openivm_views v ON t.table_name = 'openivm_aux_' || v.view_name WHERE v.view_sql_name = 'counted';
+----
+0
+
+# DROP cleans auxiliary state and preserves a source delta shared by other views.
+statement ok
+DROP VIEW s1.deduplicated;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE starts_with(table_name, 'openivm_distinct_count_');
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_7331_aux_source' AND schema_name = 'OpenIVM Internal';
+----
+1
+
+statement ok
+DROP VIEW s1.counted;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_7331_aux_source';
+----
+0
+
+
+# Join probes must distinguish repeated source names in a shared internal schema.
+statement ok
+SET openivm_internal_schema = 'OpenIVM Internal';
+
+statement ok
+CREATE MATERIALIZED VIEW s1.joined AS SELECT a.id, a.amount AS left_amount, b.amount AS right_amount FROM s1.items a JOIN "Other Schema".items b USING (id);
+
+statement ok
+INSERT INTO s1.items VALUES (12,'j',12,NULL),(13,'j',13,NULL);
+
+statement ok
+INSERT INTO "Other Schema".items VALUES (12,'j',120),(13,'j',130);
+
+statement ok
+DELETE FROM s1.items WHERE id = 12;
+
+statement ok
+UPDATE "Other Schema".items SET amount = amount + 1 WHERE id IN (1,13);
+
+statement ok
+PRAGMA refresh('s1.joined');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.joined EXCEPT ALL SELECT a.id, a.amount AS left_amount, b.amount AS right_amount FROM s1.items a JOIN "Other Schema".items b USING (id)) UNION ALL (SELECT a.id, a.amount AS left_amount, b.amount AS right_amount FROM s1.items a JOIN "Other Schema".items b USING (id) EXCEPT ALL SELECT * FROM s1.joined));
+----
+0
+
+# Full refresh uses the same physical identities and source cleanup.
+statement ok
+SET openivm_refresh_mode = 'full';
+
+statement ok
+INSERT INTO "Other Schema".items VALUES (10,'c',7);
+
+statement ok
+UPDATE s1.items SET amount = amount + 1 WHERE id = 10;
+
+statement ok
+PRAGMA refresh('s1.joined');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.joined EXCEPT ALL SELECT a.id, a.amount AS left_amount, b.amount AS right_amount FROM s1.items a JOIN "Other Schema".items b USING (id)) UNION ALL (SELECT a.id, a.amount AS left_amount, b.amount AS right_amount FROM s1.items a JOIN "Other Schema".items b USING (id) EXCEPT ALL SELECT * FROM s1.joined));
+----
+0
+
+statement ok
+SET openivm_refresh_mode = 'incremental';
+
+# A parent publication and its child can have different internal placements.
+statement ok
+CREATE MATERIALIZED VIEW s1.parent AS SELECT grp, SUM(amount) AS total FROM s1.items GROUP BY grp;
+
+statement ok
+SET openivm_internal_schema = 'Child Internal';
+
+statement ok
+CREATE MATERIALIZED VIEW s1.child AS SELECT SUM(total) AS total FROM s1.parent;
+
+statement ok
+SET openivm_cascade_refresh = 'downstream';
+
+statement ok
+INSERT INTO s1.items VALUES (14,'j',9,NULL),(15,'j',1,NULL);
+
+statement ok
+DELETE FROM s1.items WHERE id = 13;
+
+statement ok
+UPDATE s1.items SET amount = amount * 2 WHERE id = 14;
+
+statement ok
+PRAGMA refresh('s1.parent');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.parent EXCEPT ALL SELECT grp, SUM(amount) AS total FROM s1.items GROUP BY grp) UNION ALL (SELECT grp, SUM(amount) AS total FROM s1.items GROUP BY grp EXCEPT ALL SELECT * FROM s1.parent));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.child EXCEPT ALL SELECT SUM(amount) FROM s1.items) UNION ALL (SELECT SUM(amount) FROM s1.items EXCEPT ALL SELECT * FROM s1.child));
+----
+0
+
+statement ok
+DROP VIEW s1.parent CASCADE;
+
+query I
+SELECT count(*) FROM "Control Space".openivm_views WHERE view_sql_name IN ('parent','child');
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'Child Internal';
+----
+0
+
+# Same SQL names in two native catalogs keep both metadata and internals local.
+statement ok
+SET openivm_internal_schema = 'OpenIVM Internal';
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_internal_schema_peer.db' AS peer;
+
+statement ok
+CREATE SCHEMA peer.s1;
+
+statement ok
+CREATE TABLE peer.s1.items (id INTEGER, grp VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO peer.s1.items VALUES (1,'p',10),(1,'p',10),(2,'q',20);
+
+statement ok
+CREATE MATERIALIZED VIEW peer.s1.totals AS SELECT grp, SUM(amount) AS total, COUNT(*) AS cnt FROM peer.s1.items GROUP BY grp;
+
+query I
+SELECT count(*) FROM peer."Control Space".openivm_views WHERE view_sql_name = 'totals' AND view_catalog = 'peer' AND internal_schema = 'OpenIVM Internal';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'peer' AND schema_name = 'OpenIVM Internal' AND table_name = 'openivm_delta_7331_items';
+----
+1
+
+statement ok
+INSERT INTO peer.s1.items VALUES (3,'r',30),(4,'p',1);
+
+statement ok
+DELETE FROM peer.s1.items WHERE id = 2;
+
+statement ok
+UPDATE peer.s1.items SET amount = amount + 2 WHERE id = 1;
+
+statement ok
+PRAGMA refresh('peer.s1.totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM peer.s1.totals EXCEPT ALL SELECT grp, SUM(amount) AS total, COUNT(*) AS cnt FROM peer.s1.items GROUP BY grp) UNION ALL (SELECT grp, SUM(amount) AS total, COUNT(*) AS cnt FROM peer.s1.items GROUP BY grp EXCEPT ALL SELECT * FROM peer.s1.totals));
+----
+0
+
+statement ok
+DROP VIEW peer.s1.totals;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'peer' AND schema_name = 'OpenIVM Internal';
+----
+0
+
+statement ok
+DETACH peer;
+
+
+# Quoted source and MV names must survive physical delta naming and DML capture.
+statement ok
+CREATE TABLE "Other Schema"."Mixed.Items" (id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO "Other Schema"."Mixed.Items" VALUES (1,10),(1,10),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW "Other Schema"."MV""Totals" AS SELECT id, SUM(amount) AS total FROM "Other Schema"."Mixed.Items" GROUP BY id;
+
+statement ok
+INSERT INTO "Other Schema"."Mixed.Items" VALUES (3,30),(4,4);
+
+statement ok
+DELETE FROM "Other Schema"."Mixed.Items" WHERE id = 2;
+
+statement ok
+UPDATE "Other Schema"."Mixed.Items" SET amount = 12 WHERE id = 1;
+
+statement ok
+PRAGMA refresh('"Other Schema"."MV""Totals"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "Other Schema"."MV""Totals" EXCEPT ALL SELECT id, SUM(amount) FROM "Other Schema"."Mixed.Items" GROUP BY id) UNION ALL (SELECT id, SUM(amount) FROM "Other Schema"."Mixed.Items" GROUP BY id EXCEPT ALL SELECT * FROM "Other Schema"."MV""Totals"));
+----
+0
+
+statement ok
+DROP VIEW "Other Schema"."MV""Totals";
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_6f7468657220736368656d61_Mixed.Items';
+----
+0
+
+# SEMI join state uses the internal schema for both maintenance and DROP.
+statement ok
+CREATE MATERIALIZED VIEW s1.matched AS SELECT a.id, a.amount FROM s1.items a SEMI JOIN "Other Schema".items b USING (id);
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN "Control Space".openivm_views v ON t.table_name = 'openivm_semi_anti_state_' || v.view_name WHERE v.view_sql_name = 'matched' AND t.schema_name = 'OpenIVM Internal';
+----
+1
+
+statement ok
+INSERT INTO s1.items VALUES (20,'m',20,NULL),(21,'m',21,NULL);
+
+statement ok
+INSERT INTO "Other Schema".items VALUES (20,'m',1),(21,'m',1);
+
+statement ok
+DELETE FROM "Other Schema".items WHERE id = 20;
+
+statement ok
+UPDATE s1.items SET amount = amount + 1 WHERE id = 21;
+
+statement ok
+PRAGMA refresh('s1.matched');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.matched EXCEPT ALL SELECT a.id, a.amount FROM s1.items a SEMI JOIN "Other Schema".items b USING (id)) UNION ALL (SELECT a.id, a.amount FROM s1.items a SEMI JOIN "Other Schema".items b USING (id) EXCEPT ALL SELECT * FROM s1.matched));
+----
+0
+
+statement ok
+DROP VIEW s1.matched;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE starts_with(table_name, 'openivm_semi_anti_state_');
+----
+0
+
+# Window partition lookup and running columns resolve the backing/delta schemas.
+statement ok
+CREATE TABLE s1.window_source (g INTEGER, id INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO s1.window_source VALUES (1,1,10),(1,2,20),(2,3,30);
+
+statement ok
+CREATE MATERIALIZED VIEW s1.running AS SELECT g, id, x, SUM(x) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running FROM s1.window_source;
+
+statement ok
+INSERT INTO s1.window_source VALUES (1,4,40),(2,5,50),(3,6,60);
+
+statement ok
+DELETE FROM s1.window_source WHERE id = 2;
+
+statement ok
+UPDATE s1.window_source SET x = x + 1 WHERE id = 4;
+
+statement ok
+PRAGMA refresh('s1.running');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.running EXCEPT ALL SELECT g, id, x, SUM(x) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running FROM s1.window_source) UNION ALL (SELECT g, id, x, SUM(x) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running FROM s1.window_source EXCEPT ALL SELECT * FROM s1.running));
+----
+0
+
+statement ok
+DROP VIEW s1.running;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_7331_window_source';
+----
+0
+
+
+# Window lineage keeps both source identities when their bare names match.
+statement ok
+CREATE TABLE s1.window_items (id INTEGER, g INTEGER, x INTEGER);
+
+statement ok
+CREATE TABLE "Other Schema".window_items (id INTEGER, g INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO s1.window_items VALUES (1,10,100),(2,10,200),(3,20,300);
+
+statement ok
+INSERT INTO "Other Schema".window_items VALUES (1,1,0),(2,1,0),(3,2,0);
+
+statement ok
+CREATE MATERIALIZED VIEW s1.joined_window AS
+SELECT a.id, a.x, b.g, ROW_NUMBER() OVER (PARTITION BY b.g ORDER BY a.id) AS rn
+FROM s1.window_items a JOIN "Other Schema".window_items b USING (id);
+
+query I
+SELECT type FROM "Control Space".openivm_views WHERE view_sql_name = 'joined_window';
+----
+5
+
+statement ok
+INSERT INTO s1.window_items VALUES (4,20,400),(5,20,500);
+
+statement ok
+INSERT INTO "Other Schema".window_items VALUES (4,2,0),(5,2,0);
+
+statement ok
+DELETE FROM s1.window_items WHERE id = 5;
+
+statement ok
+UPDATE s1.window_items SET x = x + 1 WHERE id IN (1,4);
+
+statement ok
+UPDATE "Other Schema".window_items SET g = 2 WHERE id = 2;
+
+statement ok
+PRAGMA refresh('s1.joined_window');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM s1.joined_window EXCEPT ALL
+     SELECT a.id, a.x, b.g, ROW_NUMBER() OVER (PARTITION BY b.g ORDER BY a.id)
+     FROM s1.window_items a JOIN "Other Schema".window_items b USING (id))
+    UNION ALL
+    (SELECT a.id, a.x, b.g, ROW_NUMBER() OVER (PARTITION BY b.g ORDER BY a.id)
+     FROM s1.window_items a JOIN "Other Schema".window_items b USING (id)
+     EXCEPT ALL SELECT * FROM s1.joined_window)
+);
+----
+0
+
+statement ok
+DROP VIEW s1.joined_window;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name IN ('openivm_delta_7331_window_items', 'openivm_delta_6f7468657220736368656d61_window_items');
+----
+0
+
+# LEFT JOIN aggregate secondary deltas use qualified source identities too.
+# Persisted type 0 is AGGREGATE_GROUP; type 1 is the ungrouped SIMPLE_AGGREGATE.
+statement ok
+CREATE MATERIALIZED VIEW s1.left_totals AS
+SELECT a.g, SUM(b.x) AS total, COUNT(b.id) AS matches
+FROM s1.window_items a LEFT JOIN "Other Schema".window_items b USING (id) GROUP BY a.g;
+
+query I
+SELECT type FROM "Control Space".openivm_views WHERE view_sql_name = 'left_totals';
+----
+0
+
+statement ok
+INSERT INTO s1.window_items VALUES (6,30,600),(7,30,700);
+
+statement ok
+INSERT INTO "Other Schema".window_items VALUES (6,3,0),(7,3,0);
+
+statement ok
+DELETE FROM "Other Schema".window_items WHERE id IN (2,7);
+
+statement ok
+UPDATE s1.window_items SET x = x + 5 WHERE id IN (1,6);
+
+statement ok
+DELETE FROM s1.window_items WHERE id = 3;
+
+statement ok
+PRAGMA refresh('s1.left_totals');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM s1.left_totals EXCEPT ALL
+     SELECT a.g, SUM(b.x), COUNT(b.id) FROM s1.window_items a LEFT JOIN "Other Schema".window_items b USING (id) GROUP BY a.g)
+    UNION ALL
+    (SELECT a.g, SUM(b.x), COUNT(b.id) FROM s1.window_items a LEFT JOIN "Other Schema".window_items b USING (id) GROUP BY a.g
+     EXCEPT ALL SELECT * FROM s1.left_totals)
+);
+----
+0
+
+statement ok
+DROP VIEW s1.left_totals;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name IN ('openivm_delta_7331_window_items', 'openivm_delta_6f7468657220736368656d61_window_items');
+----
+0
+
+# Keep preserved-side SUM coverage with its existing group-recompute path,
+# alongside a supported nullable-side SUM over the same qualified sources.
+# Conflicting DML changes both sources, including duplicate rows and NULLs.
+statement ok
+CREATE TABLE s1.preserved_items (id INTEGER, g INTEGER, x INTEGER);
+CREATE TABLE "Other Schema".preserved_items (id INTEGER, x INTEGER);
+INSERT INTO s1.preserved_items VALUES
+    (1,10,100),(1,10,100),(2,20,200),(2,20,200),
+    (3,30,NULL),(4,40,400),(5,NULL,500),(8,80,NULL);
+INSERT INTO "Other Schema".preserved_items VALUES (2,20),(2,NULL),(3,30),(4,40),(8,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW s1.preserved_totals AS
+SELECT a.g, SUM(a.x) AS "select", COUNT(a.x) AS "group", COUNT(b.id) AS matches
+FROM s1.preserved_items a LEFT JOIN "Other Schema".preserved_items b USING (id) GROUP BY a.g;
+
+query I
+SELECT type FROM "Control Space".openivm_views WHERE view_sql_name = 'preserved_totals';
+----
+6
+
+# Preserved-side SUM retains its pre-existing source-delta group recompute path.
+query I
+SELECT count(*) FROM "Control Space".openivm_views
+WHERE view_sql_name='preserved_totals' AND type=6
+AND group_recompute_affected_mode='source_delta' AND leftjoin_secondary_meta_json IS NULL;
+----
+1
+
+# Nullable-side SUM is supported by the incremental aggregate MERGE. Both
+# sources have the same bare name; their physical identities must stay distinct.
+statement ok
+CREATE MATERIALIZED VIEW s1.nullable_totals AS
+SELECT a.id, SUM(b.x) AS "select", COUNT(b.x) AS "group", COUNT(b.id) AS matches, COUNT(*) AS row_count
+FROM s1.preserved_items a LEFT JOIN "Other Schema".preserved_items b USING (id) GROUP BY a.id;
+
+query I
+SELECT type FROM "Control Space".openivm_views WHERE view_sql_name='nullable_totals';
+----
+0
+
+# Check the complete serialized arrays without requiring the JSON extension.
+query I
+SELECT count(*) FROM "Control Space".openivm_views WHERE view_sql_name='nullable_totals'
+AND contains(leftjoin_secondary_meta_json,
+             '"inner_tables":["' || current_database() || '.\"Other Schema\".preserved_items"]')
+AND contains(leftjoin_secondary_meta_json,
+             '"pres_tables":["' || current_database() || '.s1.preserved_items"]');
+----
+1
+
+foreach outcome ROLLBACK COMMIT
+
+statement ok
+BEGIN;
+INSERT INTO "Other Schema".preserved_items VALUES (1,10),(1,NULL),(5,50),(6,60),(7,70);
+DELETE FROM "Other Schema".preserved_items WHERE id IN (2,3,4,7);
+UPDATE "Other Schema".preserved_items SET id=6, x=x+1 WHERE id=5;
+UPDATE s1.preserved_items SET g=11, x=110 WHERE id=1;
+UPDATE s1.preserved_items SET g=21, x=NULL WHERE id=2;
+UPDATE s1.preserved_items SET g=31, x=300 WHERE id=3;
+UPDATE s1.preserved_items SET g=50, x=NULL WHERE id=5;
+DELETE FROM s1.preserved_items WHERE id=4;
+INSERT INTO s1.preserved_items VALUES (6,60,600),(7,70,700),(7,70,700);
+DELETE FROM s1.preserved_items WHERE id=7;
+UPDATE s1.preserved_items SET x=601 WHERE id=6;
+
+statement ok
+PRAGMA refresh('s1.preserved_totals');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM s1.preserved_totals EXCEPT ALL
+     SELECT a.g, SUM(a.x), COUNT(a.x), COUNT(b.id)
+     FROM s1.preserved_items a LEFT JOIN "Other Schema".preserved_items b USING (id) GROUP BY a.g)
+    UNION ALL
+    (SELECT a.g, SUM(a.x), COUNT(a.x), COUNT(b.id)
+     FROM s1.preserved_items a LEFT JOIN "Other Schema".preserved_items b USING (id) GROUP BY a.g
+     EXCEPT ALL SELECT * FROM s1.preserved_totals)
+);
+----
+0
+
+statement ok
+PRAGMA refresh('s1.nullable_totals');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM s1.nullable_totals EXCEPT ALL
+     SELECT a.id, SUM(b.x), COUNT(b.x), COUNT(b.id), COUNT(*)
+     FROM s1.preserved_items a LEFT JOIN "Other Schema".preserved_items b USING (id) GROUP BY a.id)
+    UNION ALL
+    (SELECT a.id, SUM(b.x), COUNT(b.x), COUNT(b.id), COUNT(*)
+     FROM s1.preserved_items a LEFT JOIN "Other Schema".preserved_items b USING (id) GROUP BY a.id
+     EXCEPT ALL SELECT * FROM s1.nullable_totals)
+);
+----
+0
+
+statement ok
+${outcome};
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM s1.preserved_totals EXCEPT ALL
+     SELECT a.g, SUM(a.x), COUNT(a.x), COUNT(b.id)
+     FROM s1.preserved_items a LEFT JOIN "Other Schema".preserved_items b USING (id) GROUP BY a.g)
+    UNION ALL
+    (SELECT a.g, SUM(a.x), COUNT(a.x), COUNT(b.id)
+     FROM s1.preserved_items a LEFT JOIN "Other Schema".preserved_items b USING (id) GROUP BY a.g
+     EXCEPT ALL SELECT * FROM s1.preserved_totals)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM s1.nullable_totals EXCEPT ALL
+     SELECT a.id, SUM(b.x), COUNT(b.x), COUNT(b.id), COUNT(*)
+     FROM s1.preserved_items a LEFT JOIN "Other Schema".preserved_items b USING (id) GROUP BY a.id)
+    UNION ALL
+    (SELECT a.id, SUM(b.x), COUNT(b.x), COUNT(b.id), COUNT(*)
+     FROM s1.preserved_items a LEFT JOIN "Other Schema".preserved_items b USING (id) GROUP BY a.id
+     EXCEPT ALL SELECT * FROM s1.nullable_totals)
+);
+----
+0
+
+endloop
+
+# Reverse both transitions, including an unmatched group whose SUM must be NULL.
+statement ok
+INSERT INTO "Other Schema".preserved_items VALUES (2,200),(8,NULL),(9,90);
+DELETE FROM "Other Schema".preserved_items WHERE id IN (1,6,8,9);
+UPDATE "Other Schema".preserved_items SET x=201 WHERE id=2;
+UPDATE s1.preserved_items SET g=12, x=NULL WHERE id=1;
+UPDATE s1.preserved_items SET g=22, x=220 WHERE id=2;
+INSERT INTO s1.preserved_items VALUES (9,90,900),(9,90,900);
+DELETE FROM s1.preserved_items WHERE id=9;
+UPDATE s1.preserved_items SET x=NULL WHERE id=6;
+
+statement ok
+PRAGMA refresh('s1.preserved_totals');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM s1.preserved_totals EXCEPT ALL
+     SELECT a.g, SUM(a.x), COUNT(a.x), COUNT(b.id)
+     FROM s1.preserved_items a LEFT JOIN "Other Schema".preserved_items b USING (id) GROUP BY a.g)
+    UNION ALL
+    (SELECT a.g, SUM(a.x), COUNT(a.x), COUNT(b.id)
+     FROM s1.preserved_items a LEFT JOIN "Other Schema".preserved_items b USING (id) GROUP BY a.g
+     EXCEPT ALL SELECT * FROM s1.preserved_totals)
+);
+----
+0
+
+statement ok
+PRAGMA refresh('s1.nullable_totals');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM s1.nullable_totals EXCEPT ALL
+     SELECT a.id, SUM(b.x), COUNT(b.x), COUNT(b.id), COUNT(*)
+     FROM s1.preserved_items a LEFT JOIN "Other Schema".preserved_items b USING (id) GROUP BY a.id)
+    UNION ALL
+    (SELECT a.id, SUM(b.x), COUNT(b.x), COUNT(b.id), COUNT(*)
+     FROM s1.preserved_items a LEFT JOIN "Other Schema".preserved_items b USING (id) GROUP BY a.id
+     EXCEPT ALL SELECT * FROM s1.nullable_totals)
+);
+----
+0
+
+statement ok
+DROP VIEW s1.preserved_totals;
+DROP VIEW s1.nullable_totals;
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE table_name IN ('openivm_delta_7331_preserved_items', 'openivm_delta_6f7468657220736368656d61_preserved_items');
+----
+0
+
+# Window lineage over a parent's publication resolves its stored internal schema.
+statement ok
+CREATE MATERIALIZED VIEW s1.window_parent AS SELECT g, id, x FROM s1.window_source;
+
+statement ok
+SET openivm_internal_schema = 'Child Internal';
+
+statement ok
+CREATE MATERIALIZED VIEW s1.window_child AS
+SELECT g, id, x, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS rn FROM s1.window_parent;
+
+query I
+SELECT type FROM "Control Space".openivm_views WHERE view_sql_name = 'window_child';
+----
+5
+
+statement ok
+INSERT INTO s1.window_source VALUES (1,7,70),(2,8,80),(3,9,90);
+
+statement ok
+DELETE FROM s1.window_source WHERE id = 9;
+
+statement ok
+UPDATE s1.window_source SET g = 2, x = x + 1 WHERE id = 7;
+
+statement ok
+PRAGMA refresh('s1.window_parent');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.window_parent EXCEPT ALL SELECT g, id, x FROM s1.window_source) UNION ALL (SELECT g, id, x FROM s1.window_source EXCEPT ALL SELECT * FROM s1.window_parent));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM s1.window_child EXCEPT ALL
+     SELECT g, id, x, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) FROM s1.window_source)
+    UNION ALL
+    (SELECT g, id, x, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) FROM s1.window_source
+     EXCEPT ALL SELECT * FROM s1.window_child)
+);
+----
+0
+
+statement ok
+DROP VIEW s1.window_child;
+
+statement ok
+DROP VIEW s1.window_parent;
+
+# Transaction-local refresh and DROP must resolve the stored placement even when
+# the session setting changes. Rolling back restores both data and maintenance objects.
+statement ok
+SET openivm_internal_schema = 'Transaction Internal';
+
+statement ok
+CREATE TABLE s1.transaction_source (id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO s1.transaction_source VALUES (1,10),(1,10),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW s1.transaction_totals AS SELECT id, SUM(amount) AS total FROM s1.transaction_source GROUP BY id;
+
+# One source delta and four per-view tables, including the publication delta.
+# Check identities as well as cardinality so an unrelated table cannot mask a
+# missing maintenance object. ROLLBACK below must restore this same inventory.
+query T rowsort
+SELECT replace(t.table_name, v.view_name, '<key>')
+FROM duckdb_tables() t CROSS JOIN "Control Space".openivm_views v
+WHERE t.database_name = current_database() AND t.schema_name = 'Transaction Internal'
+AND v.view_schema = 's1' AND v.view_sql_name = 'transaction_totals';
+----
+openivm_data_<key>
+openivm_delta_7331_transaction_source
+openivm_delta_<key>
+openivm_delta_openivm_visible_<key>
+openivm_visible_<key>
+
+statement ok
+SET openivm_internal_schema = '';
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO s1.transaction_source VALUES (3,30),(4,40),(4,40);
+
+statement ok
+DELETE FROM s1.transaction_source WHERE id IN (2,3);
+
+statement ok
+UPDATE s1.transaction_source SET amount = amount + 5 WHERE id IN (1,4);
+
+statement ok
+PRAGMA refresh('s1.transaction_totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.transaction_totals EXCEPT ALL SELECT id, SUM(amount) FROM s1.transaction_source GROUP BY id) UNION ALL (SELECT id, SUM(amount) FROM s1.transaction_source GROUP BY id EXCEPT ALL SELECT * FROM s1.transaction_totals));
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.transaction_totals EXCEPT ALL SELECT id, SUM(amount) FROM s1.transaction_source GROUP BY id) UNION ALL (SELECT id, SUM(amount) FROM s1.transaction_source GROUP BY id EXCEPT ALL SELECT * FROM s1.transaction_totals));
+----
+0
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DROP VIEW s1.transaction_totals;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'Transaction Internal';
+----
+0
+
+statement ok
+ROLLBACK;
+
+query T rowsort
+SELECT replace(t.table_name, v.view_name, '<key>')
+FROM duckdb_tables() t CROSS JOIN "Control Space".openivm_views v
+WHERE t.database_name = current_database() AND t.schema_name = 'Transaction Internal'
+AND v.view_schema = 's1' AND v.view_sql_name = 'transaction_totals';
+----
+openivm_data_<key>
+openivm_delta_7331_transaction_source
+openivm_delta_<key>
+openivm_delta_openivm_visible_<key>
+openivm_visible_<key>
+
+statement ok
+INSERT INTO s1.transaction_source VALUES (3,30),(4,40);
+
+statement ok
+DELETE FROM s1.transaction_source WHERE id = 2;
+
+statement ok
+UPDATE s1.transaction_source SET amount = 12 WHERE id = 1;
+
+statement ok
+PRAGMA refresh('s1.transaction_totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.transaction_totals EXCEPT ALL SELECT id, SUM(amount) FROM s1.transaction_source GROUP BY id) UNION ALL (SELECT id, SUM(amount) FROM s1.transaction_source GROUP BY id EXCEPT ALL SELECT * FROM s1.transaction_totals));
+----
+0
+
+statement ok
+DROP VIEW s1.transaction_totals;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'Transaction Internal';
+----
+0
+
+# Quoted auxiliary sources retain SQL identities through CREATE, repair and reopen.
+# Metadata, internal tables and public views use three separate schemas.
+statement ok
+SET openivm_metadata_schema = 'Control Space';
+
+statement ok
+SET openivm_internal_schema = 'Quoted Internal';
+
+statement ok
+SET openivm_stateful_auxstate = true;
+
+statement ok
+SET search_path = 's1,main';
+
+statement ok
+CREATE TABLE main."Mixed.Items" (g INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO main."Mixed.Items" VALUES (1,10),(1,10),(1,20),(2,30),(3,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW s1.quoted_counted AS SELECT g, COUNT(DISTINCT x) AS n FROM main."Mixed.Items" GROUP BY g;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+----
+0
+
+statement ok
+CREATE TABLE main."Items(""Archive"")" (g INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO main."Items(""Archive"")" VALUES (1,10),(1,10),(1,20),(2,30),(3,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW s1.paren_counted AS SELECT g, COUNT(DISTINCT x) AS n FROM "Items(""Archive"")" GROUP BY g;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+----
+0
+
+query TITT
+SELECT v.view_sql_name, v.type, v.internal_schema, t.schema_name FROM "Control Space".openivm_views v JOIN duckdb_tables() t ON t.table_name = 'openivm_aux_' || v.view_name WHERE v.view_sql_name IN ('quoted_counted', 'paren_counted') ORDER BY v.view_sql_name;
+----
+paren_counted	11	Quoted Internal	Quoted Internal
+quoted_counted	11	Quoted Internal	Quoted Internal
+
+statement ok
+INSERT INTO main."Mixed.Items" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Mixed.Items" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Mixed.Items" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.quoted_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+----
+0
+
+statement ok
+INSERT INTO main."Items(""Archive"")" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Items(""Archive"")" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Items(""Archive"")" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.paren_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+----
+0
+
+# With no pending changes, missing auxiliary tables are repaired from quoted sources.
+
+statement ok
+DROP TABLE "Quoted Internal".openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_71756f7465645f636f756e746564_;
+
+statement ok
+DROP TABLE "Quoted Internal".openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_706172656e5f636f756e746564_;
+
+statement ok
+SET openivm_internal_schema = '';
+
+statement ok
+PRAGMA refresh('s1.quoted_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+----
+0
+
+statement ok
+PRAGMA refresh('s1.paren_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+----
+0
+
+# Reopen discovers both stored locations without restoring either schema setting.
+restart
+
+statement ok
+INSERT INTO main."Mixed.Items" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Mixed.Items" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Mixed.Items" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.quoted_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+----
+0
+
+statement ok
+DROP TABLE "Quoted Internal".openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_71756f7465645f636f756e746564_;
+
+statement ok
+PRAGMA refresh('s1.quoted_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+----
+0
+
+statement ok
+INSERT INTO main."Items(""Archive"")" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Items(""Archive"")" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Items(""Archive"")" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.paren_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+----
+0
+
+statement ok
+DROP TABLE "Quoted Internal".openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_706172656e5f636f756e746564_;
+
+statement ok
+PRAGMA refresh('s1.paren_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+----
+0
+
+statement ok
+SET openivm_stateful_auxstate = true;
+
+# Replacement rollback restores auxiliary state and its qualified source metadata.
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW s1.quoted_counted AS SELECT g, COUNT(*) AS n FROM main."Mixed.Items" GROUP BY g;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_71756f7465645f636f756e746564_';
+----
+0
+
+statement ok
+ROLLBACK;
+
+statement ok
+INSERT INTO main."Mixed.Items" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Mixed.Items" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Mixed.Items" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.quoted_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+----
+0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW s1.quoted_counted AS SELECT g, COUNT(DISTINCT x) AS n FROM main."Mixed.Items" WHERE x >= 30 GROUP BY g;
+
+statement ok
+INSERT INTO main."Mixed.Items" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Mixed.Items" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Mixed.Items" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.quoted_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" WHERE x >= 30 GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" WHERE x >= 30 GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+----
+0
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DROP VIEW s1.quoted_counted;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_71756f7465645f636f756e746564_';
+----
+0
+
+statement ok
+ROLLBACK;
+
+statement ok
+INSERT INTO main."Mixed.Items" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Mixed.Items" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Mixed.Items" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.quoted_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" WHERE x >= 30 GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" WHERE x >= 30 GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+----
+0
+
+statement ok
+DROP VIEW s1.quoted_counted;
+
+query I
+SELECT count(*) FROM "Control Space".openivm_views WHERE view_sql_name = 'quoted_counted';
+----
+0
+
+# Replacement rollback restores auxiliary state and its qualified source metadata.
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW s1.paren_counted AS SELECT g, COUNT(*) AS n FROM main."Items(""Archive"")" GROUP BY g;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_706172656e5f636f756e746564_';
+----
+0
+
+statement ok
+ROLLBACK;
+
+statement ok
+INSERT INTO main."Items(""Archive"")" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Items(""Archive"")" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Items(""Archive"")" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.paren_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+----
+0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW s1.paren_counted AS SELECT g, COUNT(DISTINCT x) AS n FROM main."Items(""Archive"")" WHERE x >= 30 GROUP BY g;
+
+statement ok
+INSERT INTO main."Items(""Archive"")" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Items(""Archive"")" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Items(""Archive"")" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.paren_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" WHERE x >= 30 GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" WHERE x >= 30 GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+----
+0
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DROP VIEW s1.paren_counted;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_706172656e5f636f756e746564_';
+----
+0
+
+statement ok
+ROLLBACK;
+
+statement ok
+INSERT INTO main."Items(""Archive"")" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Items(""Archive"")" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Items(""Archive"")" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.paren_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" WHERE x >= 30 GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" WHERE x >= 30 GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+----
+0
+
+statement ok
+DROP VIEW s1.paren_counted;
+
+query I
+SELECT count(*) FROM "Control Space".openivm_views WHERE view_sql_name = 'paren_counted';
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'Quoted Internal';
+----
+0
+
+# Filtered-group auxiliary metadata must also preserve punctuation and quoting.
+statement ok
+SET openivm_internal_schema = 'Quoted Internal';
+
+statement ok
+CREATE TABLE main."Grouped.Items" (g INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO main."Grouped.Items" VALUES (1,10),(1,-5),(2,-10),(3,0);
+
+statement ok
+CREATE MATERIALIZED VIEW s1.quoted_filtered AS
+SELECT COUNT(*) AS n FROM (SELECT g, SUM(x) AS total FROM main."Grouped.Items" GROUP BY g) q WHERE total > 0;
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN "Control Space".openivm_views v
+ON t.table_name = 'openivm_filtered_group_count_' || v.view_name
+WHERE v.view_sql_name = 'quoted_filtered' AND t.schema_name = 'Quoted Internal';
+----
+1
+
+statement ok
+INSERT INTO main."Grouped.Items" VALUES (1,-20),(2,30),(4,10),(4,10);
+
+statement ok
+DELETE FROM main."Grouped.Items" WHERE g = 4 OR x = -5;
+
+statement ok
+UPDATE main."Grouped.Items" SET x = x + 1 WHERE g = 2;
+
+statement ok
+PRAGMA refresh('s1.quoted_filtered');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM s1.quoted_filtered EXCEPT ALL
+     SELECT COUNT(*) FROM (SELECT g, SUM(x) AS total FROM main."Grouped.Items" GROUP BY g) q WHERE total > 0)
+    UNION ALL
+    (SELECT COUNT(*) FROM (SELECT g, SUM(x) AS total FROM main."Grouped.Items" GROUP BY g) q WHERE total > 0
+     EXCEPT ALL SELECT * FROM s1.quoted_filtered)
+);
+----
+0
+
+statement ok
+DROP TABLE "Quoted Internal".openivm_filtered_group_count___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_71756f7465645f66696c7465726564_;
+
+statement ok
+PRAGMA refresh('s1.quoted_filtered');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM s1.quoted_filtered EXCEPT ALL
+     SELECT COUNT(*) FROM (SELECT g, SUM(x) AS total FROM main."Grouped.Items" GROUP BY g) q WHERE total > 0)
+    UNION ALL
+    (SELECT COUNT(*) FROM (SELECT g, SUM(x) AS total FROM main."Grouped.Items" GROUP BY g) q WHERE total > 0
+     EXCEPT ALL SELECT * FROM s1.quoted_filtered)
+);
+----
+0
+
+statement ok
+DROP VIEW s1.quoted_filtered;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'Quoted Internal';
+----
+0
+
+# A transaction-local replacement makes DROP use replayed metadata. A committed
+# sibling sharing the source is independent of the replaced view's dependency
+# closure, but still owns its physical delta. Check retained and removed sources,
+# commit and rollback, with control metadata and maintenance in separate schemas.
+statement ok
+SET openivm_metadata_schema = 'Control Space';
+SET openivm_internal_schema = 'Ownership Internal';
+CREATE SCHEMA "Ownership Sources";
+CREATE TABLE "Ownership Sources".a(i INTEGER);
+CREATE TABLE "Ownership Sources".b(i INTEGER);
+INSERT INTO "Ownership Sources".a VALUES (1),(1),(2);
+INSERT INTO "Ownership Sources".b VALUES (3),(3),(4);
+
+foreach replacement a b
+
+foreach outcome COMMIT ROLLBACK
+
+statement ok
+CREATE MATERIALIZED VIEW s1.ownership_mv1 AS SELECT * FROM "Ownership Sources".a;
+CREATE MATERIALIZED VIEW s1.ownership_mv2 AS SELECT * FROM "Ownership Sources".a;
+
+statement ok
+BEGIN;
+CREATE OR REPLACE MATERIALIZED VIEW s1.ownership_mv1 AS SELECT * FROM "Ownership Sources".${replacement};
+DROP VIEW s1.ownership_mv1;
+
+# The shared delta must survive even before the transaction ends.
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN "Control Space".openivm_delta_tables d
+ON t.database_name = d.source_catalog AND t.schema_name = d.delta_schema AND t.table_name = d.delta_table_name
+JOIN "Control Space".openivm_views v ON v.view_name = d.view_name
+WHERE v.view_sql_name = 'ownership_mv2' AND d.source_schema = 'Ownership Sources';
+----
+1
+
+statement ok
+${outcome};
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN "Control Space".openivm_delta_tables d
+ON t.database_name = d.source_catalog AND t.schema_name = d.delta_schema AND t.table_name = d.delta_table_name
+JOIN "Control Space".openivm_views v ON v.view_name = d.view_name
+WHERE v.view_sql_name = 'ownership_mv2' AND d.source_schema = 'Ownership Sources';
+----
+1
+
+statement ok
+INSERT INTO "Ownership Sources".a VALUES (1),(1),(2),(8),(8);
+DELETE FROM "Ownership Sources".a WHERE i = 1;
+UPDATE "Ownership Sources".a SET i = 9 WHERE i = 2;
+INSERT INTO "Ownership Sources".a VALUES (1),(9),(9);
+DELETE FROM "Ownership Sources".a WHERE i = 8;
+UPDATE "Ownership Sources".a SET i = 2 WHERE i = 9;
+
+statement ok
+PRAGMA refresh('s1.ownership_mv2');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.ownership_mv2 EXCEPT ALL SELECT * FROM "Ownership Sources".a)
+UNION ALL (SELECT * FROM "Ownership Sources".a EXCEPT ALL SELECT * FROM s1.ownership_mv2));
+----
+0
+
+statement ok
+BEGIN;
+DROP VIEW IF EXISTS s1.ownership_mv1;
+DROP VIEW s1.ownership_mv2;
+COMMIT;
+
+# After the final owner is removed, no source or MV maintenance tables may leak.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'Ownership Internal';
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+DROP TABLE "Ownership Sources".a;
+DROP TABLE "Ownership Sources".b;
+DROP SCHEMA "Ownership Sources";
+DROP SCHEMA "Ownership Internal";
+SET openivm_internal_schema = 'Quoted Internal';
+
+# Qualified CASCADE deletions must participate in later helper replay. Metadata
+# and maintenance use different quoted schemas; the source and MV names include
+# quotes and a statement separator to exercise SQL-aware registration.
+statement ok
+SET openivm_disable_daemon=true;
+SET openivm_cascade_refresh='off';
+SET openivm_metadata_schema='Control Space';
+SET openivm_internal_schema='Cascade Internal';
+CREATE SCHEMA "Cascade Sources";
+CREATE TABLE "Cascade Sources"."a;quoted"(i INTEGER);
+CREATE TABLE "Cascade Sources"."b.with""quote"(i INTEGER);
+CREATE TABLE "Cascade Sources".c(i INTEGER);
+INSERT INTO "Cascade Sources"."a;quoted" VALUES (1),(1),(2);
+INSERT INTO "Cascade Sources"."b.with""quote" VALUES (1),(1),(2);
+INSERT INTO "Cascade Sources".c VALUES (3),(3),(4);
+
+# Direct DROP after CASCADE must roll back ownership and physical cleanup.
+statement ok
+CREATE MATERIALIZED VIEW s1."cascade;mv1" AS SELECT a.i FROM "Cascade Sources"."a;quoted" a JOIN "Cascade Sources"."b.with""quote" b USING(i);
+CREATE MATERIALIZED VIEW s1."cascade""mv2" AS SELECT * FROM "Cascade Sources"."b.with""quote";
+
+statement ok
+BEGIN;
+DROP TABLE "Cascade Sources"."a;quoted" CASCADE;
+DROP VIEW s1."cascade""mv2";
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Cascade Internal';
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN "Control Space".openivm_delta_tables d
+ON t.database_name=d.source_catalog AND t.schema_name=d.delta_schema AND t.table_name=d.delta_table_name
+WHERE d.source_schema='Cascade Sources';
+----
+3
+
+statement ok
+INSERT INTO "Cascade Sources"."a;quoted" VALUES (1),(1),(2),(8),(8);
+DELETE FROM "Cascade Sources"."a;quoted" WHERE i=1;
+UPDATE "Cascade Sources"."a;quoted" SET i=9 WHERE i=2;
+INSERT INTO "Cascade Sources"."a;quoted" VALUES (1),(9),(9);
+DELETE FROM "Cascade Sources"."a;quoted" WHERE i=8;
+UPDATE "Cascade Sources"."a;quoted" SET i=2 WHERE i=9;
+
+statement ok
+INSERT INTO "Cascade Sources"."b.with""quote" VALUES (1),(1),(2),(8),(8);
+DELETE FROM "Cascade Sources"."b.with""quote" WHERE i=1;
+UPDATE "Cascade Sources"."b.with""quote" SET i=9 WHERE i=2;
+INSERT INTO "Cascade Sources"."b.with""quote" VALUES (1),(9),(9);
+DELETE FROM "Cascade Sources"."b.with""quote" WHERE i=8;
+UPDATE "Cascade Sources"."b.with""quote" SET i=2 WHERE i=9;
+
+statement ok
+PRAGMA refresh('s1."cascade;mv1"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1."cascade;mv1" EXCEPT ALL SELECT a.i FROM "Cascade Sources"."a;quoted" a JOIN "Cascade Sources"."b.with""quote" b USING(i))
+UNION ALL (SELECT a.i FROM "Cascade Sources"."a;quoted" a JOIN "Cascade Sources"."b.with""quote" b USING(i) EXCEPT ALL SELECT * FROM s1."cascade;mv1"));
+----
+0
+
+statement ok
+PRAGMA refresh('s1."cascade""mv2"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1."cascade""mv2" EXCEPT ALL SELECT * FROM "Cascade Sources"."b.with""quote")
+UNION ALL (SELECT * FROM "Cascade Sources"."b.with""quote" EXCEPT ALL SELECT * FROM s1."cascade""mv2"));
+----
+0
+
+# Commit removes the final consumer and both physical source deltas.
+statement ok
+BEGIN;
+DROP TABLE "Cascade Sources"."a;quoted" CASCADE;
+DROP VIEW s1."cascade""mv2";
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Cascade Internal';
+----
+0
+
+query I
+SELECT count(*) FROM "Control Space".openivm_delta_tables WHERE source_schema='Cascade Sources';
+----
+0
+
+statement ok
+CREATE TABLE "Cascade Sources"."a;quoted"(i INTEGER);
+INSERT INTO "Cascade Sources"."a;quoted" VALUES (1),(1),(2);
+
+# Replacement after CASCADE must roll back ownership and physical cleanup.
+statement ok
+CREATE MATERIALIZED VIEW s1."cascade;mv1" AS SELECT a.i FROM "Cascade Sources"."a;quoted" a JOIN "Cascade Sources"."b.with""quote" b USING(i);
+CREATE MATERIALIZED VIEW s1."cascade""mv2" AS SELECT * FROM "Cascade Sources"."b.with""quote";
+
+statement ok
+BEGIN;
+DROP TABLE "Cascade Sources"."a;quoted" CASCADE;
+CREATE OR REPLACE MATERIALIZED VIEW s1."cascade""mv2" AS SELECT * FROM "Cascade Sources".c;
+DROP VIEW s1."cascade""mv2";
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Cascade Internal';
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN "Control Space".openivm_delta_tables d
+ON t.database_name=d.source_catalog AND t.schema_name=d.delta_schema AND t.table_name=d.delta_table_name
+WHERE d.source_schema='Cascade Sources';
+----
+3
+
+statement ok
+INSERT INTO "Cascade Sources"."a;quoted" VALUES (1),(1),(2),(8),(8);
+DELETE FROM "Cascade Sources"."a;quoted" WHERE i=1;
+UPDATE "Cascade Sources"."a;quoted" SET i=9 WHERE i=2;
+INSERT INTO "Cascade Sources"."a;quoted" VALUES (1),(9),(9);
+DELETE FROM "Cascade Sources"."a;quoted" WHERE i=8;
+UPDATE "Cascade Sources"."a;quoted" SET i=2 WHERE i=9;
+
+statement ok
+INSERT INTO "Cascade Sources"."b.with""quote" VALUES (1),(1),(2),(8),(8);
+DELETE FROM "Cascade Sources"."b.with""quote" WHERE i=1;
+UPDATE "Cascade Sources"."b.with""quote" SET i=9 WHERE i=2;
+INSERT INTO "Cascade Sources"."b.with""quote" VALUES (1),(9),(9);
+DELETE FROM "Cascade Sources"."b.with""quote" WHERE i=8;
+UPDATE "Cascade Sources"."b.with""quote" SET i=2 WHERE i=9;
+
+statement ok
+PRAGMA refresh('s1."cascade;mv1"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1."cascade;mv1" EXCEPT ALL SELECT a.i FROM "Cascade Sources"."a;quoted" a JOIN "Cascade Sources"."b.with""quote" b USING(i))
+UNION ALL (SELECT a.i FROM "Cascade Sources"."a;quoted" a JOIN "Cascade Sources"."b.with""quote" b USING(i) EXCEPT ALL SELECT * FROM s1."cascade;mv1"));
+----
+0
+
+statement ok
+PRAGMA refresh('s1."cascade""mv2"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1."cascade""mv2" EXCEPT ALL SELECT * FROM "Cascade Sources"."b.with""quote")
+UNION ALL (SELECT * FROM "Cascade Sources"."b.with""quote" EXCEPT ALL SELECT * FROM s1."cascade""mv2"));
+----
+0
+
+# Commit removes the final consumer and both physical source deltas.
+statement ok
+BEGIN;
+DROP TABLE "Cascade Sources"."a;quoted" CASCADE;
+CREATE OR REPLACE MATERIALIZED VIEW s1."cascade""mv2" AS SELECT * FROM "Cascade Sources".c;
+DROP VIEW s1."cascade""mv2";
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Cascade Internal';
+----
+0
+
+query I
+SELECT count(*) FROM "Control Space".openivm_delta_tables WHERE source_schema='Cascade Sources';
+----
+0
+
+statement ok
+CREATE TABLE "Cascade Sources"."a;quoted"(i INTEGER);
+INSERT INTO "Cascade Sources"."a;quoted" VALUES (1),(1),(2);
+
+# An independent committed sibling is still a consumer after the same replay.
+statement ok
+CREATE MATERIALIZED VIEW s1."cascade;mv1" AS SELECT a.i FROM "Cascade Sources"."a;quoted" a JOIN "Cascade Sources"."b.with""quote" b USING(i);
+CREATE MATERIALIZED VIEW s1."cascade""mv2" AS SELECT * FROM "Cascade Sources"."b.with""quote";
+CREATE MATERIALIZED VIEW s1.cascade_survivor AS SELECT * FROM "Cascade Sources"."b.with""quote";
+
+statement ok
+BEGIN;
+DROP TABLE "Cascade Sources"."a;quoted" CASCADE;
+DROP VIEW s1."cascade""mv2";
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN "Control Space".openivm_delta_tables d
+ON t.database_name=d.source_catalog AND t.schema_name=d.delta_schema AND t.table_name=d.delta_table_name
+WHERE d.source_schema='Cascade Sources';
+----
+1
+
+statement ok
+INSERT INTO "Cascade Sources"."b.with""quote" VALUES (1),(1),(2),(8),(8);
+DELETE FROM "Cascade Sources"."b.with""quote" WHERE i=1;
+UPDATE "Cascade Sources"."b.with""quote" SET i=9 WHERE i=2;
+INSERT INTO "Cascade Sources"."b.with""quote" VALUES (1),(9),(9);
+DELETE FROM "Cascade Sources"."b.with""quote" WHERE i=8;
+UPDATE "Cascade Sources"."b.with""quote" SET i=2 WHERE i=9;
+
+statement ok
+PRAGMA refresh('s1.cascade_survivor');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.cascade_survivor EXCEPT ALL SELECT * FROM "Cascade Sources"."b.with""quote")
+UNION ALL (SELECT * FROM "Cascade Sources"."b.with""quote" EXCEPT ALL SELECT * FROM s1.cascade_survivor));
+----
+0
+
+statement ok
+BEGIN;
+DROP VIEW s1.cascade_survivor;
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Cascade Internal';
+----
+0
+
+statement ok
+DROP TABLE "Cascade Sources"."b.with""quote";
+DROP TABLE "Cascade Sources".c;
+DROP SCHEMA "Cascade Sources";
+DROP SCHEMA "Cascade Internal";
+SET openivm_internal_schema='Quoted Internal';
+
+# Cleanup must see the consumer watermark advanced by this refresh, including
+# the final consumer in an explicit transaction. A slower consumer and an
+# unrelated same-named source must retain their rows until they refresh.
+statement ok
+SET openivm_metadata_schema='Control Space';
+SET openivm_internal_schema='Cleanup.Internal';
+SET openivm_cascade_refresh='off';
+CREATE SCHEMA q1;
+CREATE SCHEMA q2;
+
+foreach mode incremental full
+
+statement ok
+SET openivm_refresh_mode='${mode}';
+CREATE TABLE q1.items(i INTEGER);
+CREATE TABLE q2.items(i INTEGER);
+INSERT INTO q1.items VALUES (1),(1),(2);
+INSERT INTO q2.items VALUES (1),(1),(2);
+CREATE MATERIALIZED VIEW cleanup_first AS SELECT * FROM q1.items;
+CREATE MATERIALIZED VIEW cleanup_last AS SELECT * FROM q1.items;
+CREATE MATERIALIZED VIEW cleanup_other AS SELECT * FROM q2.items;
+
+statement ok
+INSERT INTO q1.items VALUES (1),(2),(3),(3);
+DELETE FROM q1.items WHERE i=1;
+UPDATE q1.items SET i=4 WHERE i=2;
+INSERT INTO q2.items VALUES (1),(2),(3),(3);
+DELETE FROM q2.items WHERE i=1;
+UPDATE q2.items SET i=4 WHERE i=2;
+
+statement ok
+PRAGMA refresh('cleanup_first');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cleanup_first EXCEPT ALL SELECT * FROM q1.items)
+UNION ALL (SELECT * FROM q1.items EXCEPT ALL SELECT * FROM cleanup_first));
+----
+0
+
+query II
+SELECT (SELECT count(*) > 0 FROM "Cleanup.Internal".openivm_delta_7131_items),
+       (SELECT count(*) > 0 FROM "Cleanup.Internal".openivm_delta_7132_items);
+----
+true	true
+
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA refresh('cleanup_last');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cleanup_last EXCEPT ALL SELECT * FROM q1.items)
+UNION ALL (SELECT * FROM q1.items EXCEPT ALL SELECT * FROM cleanup_last));
+----
+0
+
+query I
+SELECT count(*) FROM "Cleanup.Internal".openivm_delta_7131_items;
+----
+0
+
+statement ok
+ROLLBACK;
+
+# Both the old visible bag and its pending delta must survive rollback.
+query I
+SELECT count(*) FROM ((SELECT * FROM cleanup_last EXCEPT ALL SELECT * FROM (VALUES (1),(1),(2)) expected(i))
+UNION ALL (SELECT * FROM (VALUES (1),(1),(2)) expected(i) EXCEPT ALL SELECT * FROM cleanup_last));
+----
+0
+
+query I
+SELECT count(*) > 0 FROM "Cleanup.Internal".openivm_delta_7131_items;
+----
+true
+
+statement ok
+PRAGMA refresh('cleanup_last');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cleanup_last EXCEPT ALL SELECT * FROM q1.items)
+UNION ALL (SELECT * FROM q1.items EXCEPT ALL SELECT * FROM cleanup_last));
+----
+0
+
+query II
+SELECT (SELECT count(*) FROM "Cleanup.Internal".openivm_delta_7131_items),
+       (SELECT count(*) > 0 FROM "Cleanup.Internal".openivm_delta_7132_items);
+----
+0	true
+
+statement ok
+PRAGMA refresh('cleanup_other');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cleanup_other EXCEPT ALL SELECT * FROM q2.items)
+UNION ALL (SELECT * FROM q2.items EXCEPT ALL SELECT * FROM cleanup_other));
+----
+0
+
+query I
+SELECT count(*) FROM "Cleanup.Internal".openivm_delta_7132_items;
+----
+0
+
+statement ok
+DROP VIEW cleanup_first;
+DROP VIEW cleanup_last;
+DROP VIEW cleanup_other;
+DROP TABLE q1.items;
+DROP TABLE q2.items;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Cleanup.Internal';
+----
+0
+
+endloop
+
+statement ok
+DROP SCHEMA q1;
+DROP SCHEMA q2;
+DROP SCHEMA "Cleanup.Internal";
+SET openivm_refresh_mode='incremental';
+SET openivm_internal_schema='Quoted Internal';
+
+# Settings may spell an existing schema differently from its catalog entry.
+# Publication, dependency traversal and cleanup must agree on physical identity.
+statement ok
+USE openivm_internal_schema.main;
+SET openivm_disable_daemon=true;
+SET openivm_metadata_schema='Case Control';
+SET openivm_cascade_refresh='off';
+CREATE SCHEMA "Case Internal";
+SET openivm_internal_schema='case internal';
+CREATE TABLE main.case_source(i INTEGER);
+INSERT INTO main.case_source VALUES (1),(1),(2);
+CREATE MATERIALIZED VIEW main.case_parent AS SELECT * FROM main.case_source;
+SET openivm_internal_schema='CASE INTERNAL';
+CREATE MATERIALIZED VIEW main.case_child AS SELECT * FROM main.case_parent;
+
+# Single-source lineage stores a raw catalog name. Refresh must resolve it as
+# one identifier, including after reopen without either placement setting.
+statement ok
+CREATE TABLE main."Window Source"(grp INTEGER, val INTEGER);
+INSERT INTO main."Window Source" VALUES (1,10),(1,10),(2,20);
+CREATE MATERIALIZED VIEW main.quoted_window AS
+SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) AS r FROM main."Window Source";
+
+query I
+SELECT type FROM "Case Control".openivm_views WHERE view_sql_name='quoted_window';
+----
+5
+
+restart
+
+statement ok
+SET openivm_disable_daemon=true;
+SET openivm_cascade_refresh='off';
+INSERT INTO main.case_source VALUES (1),(2),(3),(3);
+DELETE FROM main.case_source WHERE i=1;
+UPDATE main.case_source SET i=4 WHERE i=2;
+INSERT INTO main."Window Source" VALUES (1,10),(1,20),(3,30),(3,30);
+DELETE FROM main."Window Source" WHERE val=10;
+UPDATE main."Window Source" SET grp=1, val=40 WHERE val=20;
+
+statement ok
+PRAGMA refresh('main.case_parent');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.case_parent EXCEPT ALL SELECT * FROM main.case_source)
+UNION ALL (SELECT * FROM main.case_source EXCEPT ALL SELECT * FROM main.case_parent));
+----
+0
+
+statement ok
+PRAGMA refresh('main.case_child');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.case_child EXCEPT ALL SELECT * FROM main.case_source)
+UNION ALL (SELECT * FROM main.case_source EXCEPT ALL SELECT * FROM main.case_child));
+----
+0
+
+statement ok
+PRAGMA refresh('main.quoted_window');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.quoted_window EXCEPT ALL
+SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) FROM main."Window Source")
+UNION ALL (SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) FROM main."Window Source"
+EXCEPT ALL SELECT * FROM main.quoted_window));
+----
+0
+
+# Both raw catalog spelling and SQL-quoted lineage must resolve the same source.
+statement ok
+UPDATE "Case Control".openivm_views SET lineage_json=replace(lineage_json, '"source":"Window Source"', '"source":"\"Window Source\""')
+WHERE view_sql_name='quoted_window';
+
+query I
+SELECT contains(lineage_json, '"source":"\"Window Source\""') FROM "Case Control".openivm_views
+WHERE view_sql_name='quoted_window';
+----
+true
+
+statement ok
+INSERT INTO main.case_source VALUES (4),(5),(5);
+DELETE FROM main.case_source WHERE i=3;
+UPDATE main.case_source SET i=6 WHERE i=4;
+INSERT INTO main."Window Source" VALUES (1,40),(2,20),(4,50),(4,50);
+DELETE FROM main."Window Source" WHERE val=30;
+UPDATE main."Window Source" SET val=60 WHERE val=40;
+SET openivm_cascade_refresh='downstream';
+
+statement ok
+PRAGMA refresh_pipeline('main.case_parent');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.case_parent EXCEPT ALL SELECT * FROM main.case_source)
+UNION ALL (SELECT * FROM main.case_source EXCEPT ALL SELECT * FROM main.case_parent));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.case_child EXCEPT ALL SELECT * FROM main.case_source)
+UNION ALL (SELECT * FROM main.case_source EXCEPT ALL SELECT * FROM main.case_child));
+----
+0
+
+statement ok
+PRAGMA refresh('main.quoted_window');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.quoted_window EXCEPT ALL
+SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) FROM main."Window Source")
+UNION ALL (SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) FROM main."Window Source"
+EXCEPT ALL SELECT * FROM main.quoted_window));
+----
+0
+
+statement ok
+DROP VIEW main.case_child;
+DROP VIEW main.case_parent;
+DROP VIEW main.quoted_window;
+DROP TABLE main.case_source;
+DROP TABLE main."Window Source";
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Case Internal';
+----
+0
+
+# Full-outer source-delta group recompute must retain both physical source
+# identities, including when the view lives in neither source schema. Group by
+# non-key columns so losing a match creates a distinct null-extended group.
+statement ok
+USE openivm_internal_schema.main;
+SET openivm_metadata_schema='Case Control';
+SET openivm_internal_schema='Outer Internal';
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE openivm_internal_schema.s1."Outer.Items"(id INTEGER, g VARCHAR, x INTEGER);
+CREATE TABLE openivm_internal_schema."Other Schema"."Outer.Items"(id INTEGER, g VARCHAR, x INTEGER);
+INSERT INTO openivm_internal_schema.s1."Outer.Items" VALUES
+    (1,'L1',10),(1,'L1',10),(2,'L2',20),(3,'L3',30),(5,'L5',50),(7,'L7',70),(NULL,'LN',90);
+INSERT INTO openivm_internal_schema."Other Schema"."Outer.Items" VALUES
+    (1,'R1',100),(1,'R1',100),(1,'R1',NULL),(2,'R2',200),(4,'R4',400),(6,'R6',600),(7,'R7',700),(NULL,'RN',900);
+
+statement ok
+CREATE MATERIALIZED VIEW openivm_internal_schema.main."Outer.Groups" AS SELECT a.g AS left_group, b.g AS right_group, COUNT(DISTINCT b.x) AS distinct_values, COUNT(*) AS row_count
+FROM openivm_internal_schema.s1."Outer.Items" a FULL OUTER JOIN openivm_internal_schema."Other Schema"."Outer.Items" b USING (id) GROUP BY a.g, b.g;
+
+# This is incremental affected-group maintenance, not full/current-diff refresh.
+query IT
+SELECT type, group_recompute_affected_mode FROM openivm_internal_schema."Case Control".openivm_views
+WHERE view_sql_name='Outer.Groups' AND view_catalog='openivm_internal_schema' AND view_schema='main';
+----
+6	source_delta
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM openivm_internal_schema.main."Outer.Groups" EXCEPT ALL SELECT a.g AS left_group, b.g AS right_group, COUNT(DISTINCT b.x) AS distinct_values, COUNT(*) AS row_count
+FROM openivm_internal_schema.s1."Outer.Items" a FULL OUTER JOIN openivm_internal_schema."Other Schema"."Outer.Items" b USING (id) GROUP BY a.g, b.g)
+    UNION ALL
+    (SELECT a.g AS left_group, b.g AS right_group, COUNT(DISTINCT b.x) AS distinct_values, COUNT(*) AS row_count
+FROM openivm_internal_schema.s1."Outer.Items" a FULL OUTER JOIN openivm_internal_schema."Other Schema"."Outer.Items" b USING (id) GROUP BY a.g, b.g EXCEPT ALL SELECT * FROM openivm_internal_schema.main."Outer.Groups")
+);
+----
+0
+
+statement ok
+USE openivm_internal_schema."Case Control";
+INSERT INTO openivm_internal_schema.s1."Outer.Items" VALUES (4,'L4',40),(9,'discard',90),(9,'discard',90);
+DELETE FROM openivm_internal_schema.s1."Outer.Items" WHERE id IN (1,9);
+UPDATE openivm_internal_schema.s1."Outer.Items" SET id=6 WHERE id=3;
+UPDATE openivm_internal_schema.s1."Outer.Items" SET x=41 WHERE id=4;
+INSERT INTO openivm_internal_schema."Other Schema"."Outer.Items" VALUES (5,'R5',500),(9,'discard',900),(9,'discard',900);
+DELETE FROM openivm_internal_schema."Other Schema"."Outer.Items" WHERE id IN (2,9);
+UPDATE openivm_internal_schema."Other Schema"."Outer.Items" SET id=8 WHERE id=7;
+UPDATE openivm_internal_schema."Other Schema"."Outer.Items" SET x=501 WHERE id=5;
+
+# Deleting left id=1 must discover the new (NULL,R1) group, although the
+# opposite-side id=1 rows have no delta. The right id=2 deletion is symmetric.
+statement ok
+PRAGMA refresh('openivm_internal_schema.main."Outer.Groups"');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM openivm_internal_schema.main."Outer.Groups" EXCEPT ALL SELECT a.g AS left_group, b.g AS right_group, COUNT(DISTINCT b.x) AS distinct_values, COUNT(*) AS row_count
+FROM openivm_internal_schema.s1."Outer.Items" a FULL OUTER JOIN openivm_internal_schema."Other Schema"."Outer.Items" b USING (id) GROUP BY a.g, b.g)
+    UNION ALL
+    (SELECT a.g AS left_group, b.g AS right_group, COUNT(DISTINCT b.x) AS distinct_values, COUNT(*) AS row_count
+FROM openivm_internal_schema.s1."Outer.Items" a FULL OUTER JOIN openivm_internal_schema."Other Schema"."Outer.Items" b USING (id) GROUP BY a.g, b.g EXCEPT ALL SELECT * FROM openivm_internal_schema.main."Outer.Groups")
+);
+----
+0
+
+# Rollback leaves the first transition intact; commit reverses it. Both source
+# images and conflicting duplicate INSERT/DELETE/UPDATE operations are batched
+# before each refresh.
+foreach outcome ROLLBACK COMMIT
+
+statement ok
+BEGIN;
+INSERT INTO openivm_internal_schema.s1."Outer.Items" VALUES (1,'L1',10),(1,'L1',10),(9,'discard',90);
+DELETE FROM openivm_internal_schema.s1."Outer.Items" WHERE id IN (4,9);
+UPDATE openivm_internal_schema.s1."Outer.Items" SET id=3 WHERE id=6;
+INSERT INTO openivm_internal_schema."Other Schema"."Outer.Items" VALUES (2,'R2',200),(2,'R2',200),(9,'discard',900);
+DELETE FROM openivm_internal_schema."Other Schema"."Outer.Items" WHERE id IN (5,9);
+UPDATE openivm_internal_schema."Other Schema"."Outer.Items" SET id=7 WHERE id=8;
+${outcome};
+
+statement ok
+PRAGMA refresh('openivm_internal_schema.main."Outer.Groups"');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM openivm_internal_schema.main."Outer.Groups" EXCEPT ALL SELECT a.g AS left_group, b.g AS right_group, COUNT(DISTINCT b.x) AS distinct_values, COUNT(*) AS row_count
+FROM openivm_internal_schema.s1."Outer.Items" a FULL OUTER JOIN openivm_internal_schema."Other Schema"."Outer.Items" b USING (id) GROUP BY a.g, b.g)
+    UNION ALL
+    (SELECT a.g AS left_group, b.g AS right_group, COUNT(DISTINCT b.x) AS distinct_values, COUNT(*) AS row_count
+FROM openivm_internal_schema.s1."Outer.Items" a FULL OUTER JOIN openivm_internal_schema."Other Schema"."Outer.Items" b USING (id) GROUP BY a.g, b.g EXCEPT ALL SELECT * FROM openivm_internal_schema.main."Outer.Groups")
+);
+----
+0
+
+endloop
+
+statement ok
+DROP VIEW openivm_internal_schema.main."Outer.Groups";
+DROP TABLE openivm_internal_schema.s1."Outer.Items";
+DROP TABLE openivm_internal_schema."Other Schema"."Outer.Items";
+
+query I
+SELECT count(*) FROM openivm_internal_schema."Case Control".openivm_views
+WHERE view_sql_name='Outer.Groups' AND view_catalog='openivm_internal_schema';
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='openivm_internal_schema' AND schema_name='Outer Internal';
+----
+0
+
+# LEFT JOIN projection lineage carries a qualified SQL identity when bare names
+# repeat, and a raw table name otherwise. Both must retain dots/escaped quotes
+# and the intended affected-key pushdown path in a separate internal schema.
+statement ok
+SET openivm_metadata_schema='Case Control';
+SET openivm_internal_schema='Projection Internal';
+SET openivm_cascade_refresh='off';
+SET openivm_files_path='__TEST_DIR__';
+CREATE SCHEMA openivm_internal_schema."Projection.Left";
+CREATE SCHEMA openivm_internal_schema."Projection.Right";
+USE openivm_internal_schema."Case Control";
+
+foreach nullable_table Items.Dot""Q projection_peer
+
+statement ok
+CREATE TABLE openivm_internal_schema."Projection.Left"."Items.Dot""Q"(id INTEGER, payload VARCHAR);
+CREATE TABLE openivm_internal_schema."Projection.Right"."${nullable_table}"(id INTEGER, label VARCHAR);
+INSERT INTO openivm_internal_schema."Projection.Left"."Items.Dot""Q" VALUES (1,'one'),(1,'one'),(2,'two'),(4,'four'),(6,'six'),(6,'six'),(NULL,'null-key');
+INSERT INTO openivm_internal_schema."Projection.Right"."${nullable_table}" VALUES (1,'x'),(4,'stable'),(4,'duplicate');
+
+statement ok
+CREATE MATERIALIZED VIEW openivm_internal_schema.main.left_namespace_projection AS
+SELECT l.id, l.payload, r.label FROM openivm_internal_schema."Projection.Left"."Items.Dot""Q" l LEFT JOIN openivm_internal_schema."Projection.Right"."${nullable_table}" r USING(id);
+
+query I
+SELECT count(*) FROM openivm_internal_schema."Case Control".openivm_views
+WHERE view_sql_name='left_namespace_projection' AND view_catalog='openivm_internal_schema' AND type=2
+AND internal_schema='Projection Internal' AND contains(lineage_json, '"k":"left_join_key_source"');
+----
+1
+
+# Both sources change in a single refresh, including duplicate bags, cancelled
+# inserts and match/unmatch transitions. Neither append-only shortcut applies.
+statement ok
+INSERT INTO openivm_internal_schema."Projection.Left"."Items.Dot""Q" VALUES (3,'three'),(9,'discard'),(9,'discard');
+DELETE FROM openivm_internal_schema."Projection.Left"."Items.Dot""Q" WHERE id IN (6,9);
+UPDATE openivm_internal_schema."Projection.Left"."Items.Dot""Q" SET payload=payload || '-updated' WHERE id IN (2,4);
+INSERT INTO openivm_internal_schema."Projection.Right"."${nullable_table}" VALUES (2,'z'),(4,'replacement'),(4,'replacement'),(9,'discard');
+DELETE FROM openivm_internal_schema."Projection.Right"."${nullable_table}" WHERE id IN (1,9) OR label='duplicate';
+UPDATE openivm_internal_schema."Projection.Right"."${nullable_table}" SET label='changed' WHERE label='stable';
+
+statement ok
+PRAGMA refresh('openivm_internal_schema.main.left_namespace_projection');
+
+query I
+SELECT count(*) FROM (
+(SELECT * FROM openivm_internal_schema.main.left_namespace_projection EXCEPT ALL SELECT l.id, l.payload, r.label FROM openivm_internal_schema."Projection.Left"."Items.Dot""Q" l LEFT JOIN openivm_internal_schema."Projection.Right"."${nullable_table}" r USING(id))
+UNION ALL
+(SELECT l.id, l.payload, r.label FROM openivm_internal_schema."Projection.Left"."Items.Dot""Q" l LEFT JOIN openivm_internal_schema."Projection.Right"."${nullable_table}" r USING(id) EXCEPT ALL SELECT * FROM openivm_internal_schema.main.left_namespace_projection));
+----
+0
+
+# Bag equality alone would let an unpushed recompute hide the namespace defect.
+query I
+SELECT contains(content, 'openivm_lj_src INNER JOIN openivm_affected')
+       AND contains(content, 'SELECT DISTINCT openivm_left_key')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_6d61696e_6c6566745f6e616d6573706163655f70726f6a656374696f6e_.sql');
+----
+true
+
+# Rollback must preserve source watermarks and ownership; the committed version
+# then reverses the transitions and moves a join key on both sides.
+foreach outcome ROLLBACK COMMIT
+
+statement ok
+BEGIN;
+INSERT INTO openivm_internal_schema."Projection.Left"."Items.Dot""Q" VALUES (1,'one'),(1,'one'),(8,'eight'),(9,'discard');
+DELETE FROM openivm_internal_schema."Projection.Left"."Items.Dot""Q" WHERE id IN (3,9);
+UPDATE openivm_internal_schema."Projection.Left"."Items.Dot""Q" SET id=5 WHERE id=4;
+INSERT INTO openivm_internal_schema."Projection.Right"."${nullable_table}" VALUES (1,'returned'),(1,'returned'),(8,'new'),(9,'discard');
+DELETE FROM openivm_internal_schema."Projection.Right"."${nullable_table}" WHERE id IN (2,9);
+UPDATE openivm_internal_schema."Projection.Right"."${nullable_table}" SET id=5 WHERE id=4;
+${outcome};
+
+statement ok
+PRAGMA refresh('openivm_internal_schema.main.left_namespace_projection');
+
+query I
+SELECT count(*) FROM (
+(SELECT * FROM openivm_internal_schema.main.left_namespace_projection EXCEPT ALL SELECT l.id, l.payload, r.label FROM openivm_internal_schema."Projection.Left"."Items.Dot""Q" l LEFT JOIN openivm_internal_schema."Projection.Right"."${nullable_table}" r USING(id))
+UNION ALL
+(SELECT l.id, l.payload, r.label FROM openivm_internal_schema."Projection.Left"."Items.Dot""Q" l LEFT JOIN openivm_internal_schema."Projection.Right"."${nullable_table}" r USING(id) EXCEPT ALL SELECT * FROM openivm_internal_schema.main.left_namespace_projection));
+----
+0
+
+endloop
+
+statement ok
+DROP VIEW openivm_internal_schema.main.left_namespace_projection;
+DROP TABLE openivm_internal_schema."Projection.Left"."Items.Dot""Q";
+DROP TABLE openivm_internal_schema."Projection.Right"."${nullable_table}";
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='openivm_internal_schema' AND schema_name='Projection Internal'
+AND starts_with(table_name,'openivm_');
+----
+0
+
+endloop
+
+statement ok
+DROP SCHEMA openivm_internal_schema."Projection.Left";
+DROP SCHEMA openivm_internal_schema."Projection.Right";

@@ -1,6 +1,7 @@
 #include "match/constraint_cache.hpp"
 
 #include "core/openivm_constants.hpp"
+#include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/main/connection.hpp"
 
@@ -86,6 +87,7 @@ static bool SameColumns(const vector<string> &left, const vector<string> &right)
 vector<CachedConstraint> ConstraintCache::GetConstraints(ClientContext &context, const string &table_name) {
 	vector<CachedConstraint> constraints;
 	Connection con(*context.db);
+	RefreshMetadata::UseSameLocation(context, con);
 	auto result = con.Query("SELECT table_name, constraint_kind, columns_json, referenced_table, "
 	                        "referenced_columns_json, is_trusted FROM " +
 	                        string(CONSTRAINTS_CACHE_TABLE));
@@ -146,6 +148,7 @@ bool ConstraintCache::HasFKToParent(ClientContext &context, const string &child_
 
 void ConstraintCache::DeclareRelyFK(ClientContext &context, const CachedConstraint &c) {
 	Connection con(*context.db);
+	RefreshMetadata::UseSameLocation(context, con);
 	con.Query("INSERT OR REPLACE INTO " + string(CONSTRAINTS_CACHE_TABLE) +
 	          " (table_name, constraint_kind, columns_json, referenced_table, referenced_columns_json, is_trusted) "
 	          "VALUES ('" +

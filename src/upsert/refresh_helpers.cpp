@@ -2,6 +2,7 @@
 #include "duckdb/main/database_manager.hpp"
 
 #include "core/openivm_constants.hpp"
+#include "core/published_view.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
@@ -21,6 +22,71 @@
 #include <set>
 
 namespace duckdb {
+
+static vector<string> ParseLineageSourceName(const string &table_name, const string &physical_table) {
+	// Single-source lineage can carry a raw catalog name, including embedded
+	// dots. Resolve that spelling before interpreting SQL qualification.
+	if (StringUtil::CIEquals(table_name, physical_table)) {
+		return {physical_table};
+	}
+	try {
+		return SqlUtils::ParseQualifiedIdentifier(table_name);
+	} catch (const ParserException &) {
+		// Other candidates may still match this raw name. Only metadata-backed
+		// identities are used to generate table references below.
+		return {table_name};
+	}
+}
+
+string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &view_name, const string &table_name,
+                               const vector<string> &delta_table_names) {
+	vector<string> candidates;
+	candidates.push_back(PublishedViewName(SqlUtils::LastIdentifierPart(table_name)));
+	candidates.push_back(SqlUtils::DeltaName(PublishedViewName(SqlUtils::LastIdentifierPart(table_name))));
+	candidates.push_back(table_name);
+	candidates.push_back(SqlUtils::LastIdentifierPart(table_name));
+	// DuckLake records a chained MV source under its physical backing table.
+	candidates.push_back(IncrementalTableNames::DataTableName(SqlUtils::LastIdentifierPart(table_name)));
+	candidates.push_back(SqlUtils::DeltaName(table_name));
+	candidates.push_back(SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name)));
+	for (auto &dt : delta_table_names) {
+		auto loc = metadata.GetSourceLocation(view_name, dt);
+		auto parts = ParseLineageSourceName(table_name, BaseTableNameFromDeltaKey(loc.table_name));
+		bool matches = false;
+		for (const auto &candidate : candidates) {
+			matches = matches || StringUtil::CIEquals(loc.table_name, candidate);
+		}
+		if (!matches) {
+			// Auxiliary definitions retain public SQL names; chained sources store
+			// the parent's internal key in their physical delta/visible-table name.
+			auto owner = PublishedSourceViewName(loc.table_name);
+			matches = StringUtil::CIEquals(metadata.GetViewSQLName(owner), parts.back());
+			if (matches) {
+				// The public name is qualified by the MV's schema, while its publication
+				// can live in a separate internal schema.
+				auto public_location = metadata.GetStoredViewLocation(owner, loc.catalog_name, loc.schema_name);
+				loc.catalog_name = public_location.catalog_name;
+				loc.schema_name = public_location.schema_name;
+			}
+		}
+		if (!matches) {
+			continue;
+		}
+		if (parts.size() > 1) {
+			if (parts.size() == 3 && (!StringUtil::CIEquals(loc.catalog_name, parts[0]) ||
+			                          !StringUtil::CIEquals(loc.schema_name, parts[1]))) {
+				continue;
+			}
+			if (parts.size() == 2 && !StringUtil::CIEquals(loc.schema_name, parts[0]) &&
+			    !(StringUtil::CIEquals(loc.catalog_name, parts[0]) && loc.schema_name == DEFAULT_SCHEMA)) {
+				continue;
+			}
+		}
+		OPENIVM_DEBUG_PRINT("[UPSERT] Source '%s' resolves to delta metadata '%s'\n", table_name.c_str(), dt.c_str());
+		return dt;
+	}
+	return SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name));
+}
 
 struct FojJoinInfo {
 	string left_table, left_col, right_table, right_col;
@@ -45,19 +111,24 @@ struct FojJoinInfo {
 				info.right_col = right_part.substr(rc + 1);
 			}
 		}
-		for (auto &dt_name : delta_table_names) {
-			auto loc = metadata.GetSourceLocation(view_name, dt_name);
-			string base = BaseTableNameFromDeltaKey(loc.table_name);
-			if (dt_name != loc.table_name) {
-				base = SqlUtils::FullName(loc.catalog_name, loc.schema_name, base);
+		auto resolve_source = [&](string &table, string &delta_name) {
+			if (table.empty()) {
+				return;
 			}
-			if (StringUtil::CIEquals(base, info.left_table)) {
-				info.dt_left_name = dt_name;
+			auto key = ResolveDeltaMetadataKey(metadata, view_name, table, delta_table_names);
+			for (auto &dt_name : delta_table_names) {
+				if (dt_name != key) {
+					continue;
+				}
+				auto loc = metadata.GetSourceLocation(view_name, dt_name);
+				table =
+				    SqlUtils::FullName(loc.catalog_name, loc.schema_name, BaseTableNameFromDeltaKey(loc.table_name));
+				delta_name = dt_name;
+				return;
 			}
-			if (StringUtil::CIEquals(base, info.right_table)) {
-				info.dt_right_name = dt_name;
-			}
-		}
+		};
+		resolve_source(info.left_table, info.dt_left_name);
+		resolve_source(info.right_table, info.dt_right_name);
 		return info;
 	}
 };
@@ -101,6 +172,47 @@ string BaseTableNameFromDeltaKey(const string &delta_key) {
 	return delta_key;
 }
 
+string BuildDuckLakeSignedDeltaRelation(const DuckLakeSourceLocation &loc, int64_t last_snapshot_id,
+                                        int64_t current_snapshot_id) {
+	constexpr const char *DUCKLAKE_SYNTHETIC_DELTA_TS = "1970-01-02 00:00:00";
+	string delta_columns = ", 1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) + ", TIMESTAMP '" +
+	                       DUCKLAKE_SYNTHETIC_DELTA_TS + "' AS " + string(openivm::TIMESTAMP_COL);
+	if (last_snapshot_id == current_snapshot_id) {
+		// The next snapshot does not exist yet. Retain the source's column types
+		// without binding a change scan with an invalid snapshot range.
+		return "(SELECT *" + delta_columns + " FROM " +
+		       SqlUtils::FullName(loc.catalog_name, loc.schema_name, loc.table_name) + " WHERE false)";
+	}
+	// Change scans include the lower bound; the stored snapshot was already consumed.
+	auto start_snapshot_id = last_snapshot_id + 1;
+	string insertions = "SELECT *" + delta_columns + " FROM " +
+	                    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
+	                                                    loc.table_name, start_snapshot_id, current_snapshot_id);
+	string deletions = "SELECT *, -1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) + ", TIMESTAMP '" +
+	                   DUCKLAKE_SYNTHETIC_DELTA_TS + "' AS " + string(openivm::TIMESTAMP_COL) + " FROM " +
+	                   SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
+	                                                   loc.table_name, start_snapshot_id, current_snapshot_id);
+	return "(" + insertions + "\nUNION ALL\n" + deletions + ")";
+}
+
+static string ResolveFullOuterDeltaSource(RefreshMetadata &metadata, const string &view_name, const string &delta_key) {
+	if (!metadata.IsDuckLakeTable(view_name, delta_key)) {
+		return metadata.ResolveDeltaQualifiedName(view_name, delta_key);
+	}
+	auto source = metadata.GetSourceLocation(view_name, delta_key);
+	auto last_snapshot = metadata.GetLastSnapshotId(view_name, delta_key);
+	auto current_snapshot = metadata.GetCurrentDuckLakeSnapshot(source.catalog_name);
+	if (last_snapshot < 0 || current_snapshot < last_snapshot) {
+		throw CatalogException("OpenIVM missing DuckLake snapshot metadata for view '%s', source '%s'", view_name,
+		                       delta_key);
+	}
+	OPENIVM_DEBUG_PRINT("[UPSERT] FULL OUTER source %s uses snapshots %lld -> %lld\n", delta_key.c_str(),
+	                    static_cast<long long>(last_snapshot), static_cast<long long>(current_snapshot));
+	return BuildDuckLakeSignedDeltaRelation(
+	    {source.catalog_name, source.schema_name, BaseTableNameFromDeltaKey(source.table_name)}, last_snapshot,
+	    current_snapshot);
+}
+
 string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
                                  const string &extra_predicate) {
 	string predicate;
@@ -141,30 +253,30 @@ string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec) {
 // changed join keys, then evaluate both null-extended projections to recover them.
 string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &view_name,
                                      const vector<string> &delta_table_names, const vector<string> &group_columns,
-                                     const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs,
-                                     const string &lpts_table_prefix) {
+                                     const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs) {
 	auto join = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
-	if (join.left_col.empty() || join.right_col.empty() || join.left_table == join.right_table) {
+	if (join.left_col.empty() || join.right_col.empty() || join.dt_left_name.empty() || join.dt_right_name.empty() ||
+	    join.left_table == join.right_table) {
 		return "";
 	}
 	string groups;
 	for (const auto &spec : delta_specs) {
-		bool left = StringUtil::CIEquals(spec.base_table, join.left_table);
-		if (!left && !StringUtil::CIEquals(spec.base_table, join.right_table)) {
+		bool left = StringUtil::CIEquals(spec.source_sql, join.left_table);
+		if (!left && !StringUtil::CIEquals(spec.source_sql, join.right_table)) {
 			continue;
 		}
 		const auto &other_table = left ? join.right_table : join.left_table;
 		const auto &source_key = left ? join.left_col : join.right_col;
 		const auto &other_key = left ? join.right_col : join.left_col;
-		auto source_ref = SqlUtils::FindTableReference(view_query_sql, lpts_table_prefix + spec.base_table);
-		auto other_ref = SqlUtils::FindTableReference(view_query_sql, lpts_table_prefix + other_table);
+		auto source_ref = SqlUtils::FindTableReference(view_query_sql, spec.source_sql);
+		auto other_ref = SqlUtils::FindTableReference(view_query_sql, other_table);
 		if (source_ref.empty() || other_ref.empty()) {
 			continue;
 		}
 		auto delta = BuildGroupRecomputeDeltaRowsSQL(spec);
 		string other_rows = "SELECT * FROM " + other_ref;
 		for (const auto &other_spec : delta_specs) {
-			if (StringUtil::CIEquals(other_spec.base_table, other_table)) {
+			if (StringUtil::CIEquals(other_spec.source_sql, other_table)) {
 				// Deleted opposite-side rows can carry an old unmatched group too.
 				other_rows += " UNION ALL SELECT * FROM " + BuildGroupRecomputeDeltaRowsSQL(other_spec);
 			}
@@ -239,7 +351,7 @@ static string BuildFullOuterAffectedGroupsSubquery(RefreshMetadata &metadata, co
 			if (!changed_keys.empty()) {
 				changed_keys += "\n  UNION\n  ";
 			}
-			string q_delta = metadata.ResolveDeltaQualifiedName(view_name, delta_table);
+			string q_delta = ResolveFullOuterDeltaSource(metadata, view_name, delta_table);
 			changed_keys += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(join_col) +
 			                " AS openivm_foj_key FROM " + q_delta + where_clause;
 		};
@@ -254,11 +366,11 @@ static string BuildFullOuterAffectedGroupsSubquery(RefreshMetadata &metadata, co
 
 	if (group_cols.size() == 1) {
 		if (!foj.dt_left_name.empty()) {
-			string q_dt_left = metadata.ResolveDeltaQualifiedName(view_name, foj.dt_left_name);
+			string q_dt_left = ResolveFullOuterDeltaSource(metadata, view_name, foj.dt_left_name);
 			affected += "\n  UNION\n  SELECT DISTINCT " + keys_tuple + " FROM " + q_dt_left + delta_where_left;
 		}
 		if (!foj.dt_right_name.empty() && !foj.left_table.empty()) {
-			string q_dt_right = metadata.ResolveDeltaQualifiedName(view_name, foj.dt_right_name);
+			string q_dt_right = ResolveFullOuterDeltaSource(metadata, view_name, foj.dt_right_name);
 			auto left_source = metadata.GetSourceLocation(view_name, foj.dt_left_name);
 			string q_left_base = SqlUtils::FullName(left_source.catalog_name, left_source.schema_name,
 			                                        BaseTableNameFromDeltaKey(left_source.table_name));
@@ -403,7 +515,7 @@ string StripOpenIVMDataPrefix(const string &name) {
 }
 
 static bool ProjectionSourceNameMatches(const DuckLakeSourceSpec &spec, const string &table_name) {
-	auto parts = SqlUtils::ParseQualifiedIdentifier(table_name);
+	auto parts = ParseLineageSourceName(table_name, spec.loc.table_name);
 	if (parts.size() == 3 && (!StringUtil::CIEquals(parts[0], spec.loc.catalog_name) ||
 	                          !StringUtil::CIEquals(parts[1], spec.loc.schema_name))) {
 		return false;
@@ -539,12 +651,8 @@ bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection 
 	                     " IS NOT DISTINCT FROM openivm_key_source." + SqlUtils::QuoteIdentifier(lineage.key_col) +
 	                     "))";
 	bool replaced = false;
-	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, lineage.key_source,
-	                                                                lineage.key_occurrence, replacement, replaced);
-	if (!replaced) {
-		pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, key_spec->loc.table_name,
-		                                                         lineage.key_occurrence, replacement, replaced);
-	}
+	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, key_table, lineage.key_occurrence,
+	                                                                replacement, replaced);
 	if (!replaced || pushed_query == view_query_sql) {
 		return false;
 	}
@@ -729,7 +837,7 @@ string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_na
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
                            bool cross_system, const string &attached_catalog, const string &attached_schema,
                            const string &catalog_prefix, const string &metadata_prefix, string *out_post_meta,
-                           vector<string> *deferred_cleanup, const vector<string> &metadata_catalogs) {
+                           vector<string> *deferred_cleanup, const vector<string> &delta_metadata_tables) {
 	string qdt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(view_name));
 	// parser.cpp gives AGGREGATE_GROUP / AGGREGATE_HAVING data tables a UNIQUE index on the group
 	// keys. A plain `DELETE FROM t; INSERT INTO t ...` re-inserts keys deleted in the same
@@ -777,8 +885,12 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 			continue;
 		}
 		string resolved = metadata.ResolveDeltaQualifiedName(view_name, dt, attached_catalog, attached_schema);
+		// Consumers are keyed by the source; the physical delta may sit in an internal schema.
+		auto source = metadata.GetSourceLocation(view_name, dt, attached_catalog, attached_schema);
+		auto source_schema = source.schema_name.empty() ? string(DEFAULT_SCHEMA) : source.schema_name;
 		delta_cleanup += RefreshMetadata::BuildDeltaCleanupSQL(resolved, dt, delta_metadata_table, deferred_cleanup,
-		                                                       metadata_catalogs);
+		                                                       delta_metadata_tables, source.catalog_name,
+		                                                       source.catalog_name.empty() ? string() : source_schema);
 	}
 
 	return query + update_ts + "\n" + delta_cleanup;
@@ -800,7 +912,7 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 
 	string union_parts;
 	if (!foj.dt_left_name.empty() && !foj.left_col.empty()) {
-		string dt = metadata.ResolveDeltaQualifiedName(view_name, foj.dt_left_name);
+		string dt = ResolveFullOuterDeltaSource(metadata, view_name, foj.dt_left_name);
 		union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(foj.left_col) + " AS _k FROM " + dt +
 		               delta_where_left;
 	}
@@ -808,7 +920,7 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 		if (!union_parts.empty()) {
 			union_parts += "\n  UNION\n  ";
 		}
-		string dt = metadata.ResolveDeltaQualifiedName(view_name, foj.dt_right_name);
+		string dt = ResolveFullOuterDeltaSource(metadata, view_name, foj.dt_right_name);
 		union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(foj.right_col) + " AS _k FROM " + dt +
 		               delta_where_right;
 	}
@@ -838,10 +950,17 @@ static string BuildGuardedDeltaWhere(const string &delta_ts_filter, const string
 	return predicate.empty() ? "" : " WHERE " + predicate;
 }
 
-static string BuildLeftJoinLineagePushedQuery(const string &view_query_sql, const string &affected_source,
-                                              const string &affected_alias, const string &lk,
-                                              const RefreshMetadata::LeftJoinKeySource &key_source) {
-	string source_ref = SqlUtils::FindTableReferenceOccurrence(view_query_sql, key_source.table, key_source.occurrence);
+static string BuildLeftJoinLineagePushedQuery(RefreshMetadata &metadata, const string &view_name,
+                                              const vector<string> &delta_table_names, const string &view_query_sql,
+                                              const string &affected_source, const string &affected_alias,
+                                              const string &lk, const RefreshMetadata::LeftJoinKeySource &key_source) {
+	// Lineage stores either a raw table name or a qualified SQL identity. Use
+	// source metadata to disambiguate embedded dots/quotes, then quote only raw names.
+	auto delta_key = ResolveDeltaMetadataKey(metadata, view_name, key_source.table, delta_table_names);
+	auto source = metadata.GetSourceLocation(view_name, delta_key);
+	auto source_parts = ParseLineageSourceName(key_source.table, BaseTableNameFromDeltaKey(source.table_name));
+	auto source_table = source_parts.size() == 1 ? SqlUtils::QuoteIdentifier(source_parts[0]) : key_source.table;
+	string source_ref = SqlUtils::FindTableReferenceOccurrence(view_query_sql, source_table, key_source.occurrence);
 	if (source_ref.empty()) {
 		return "";
 	}
@@ -851,8 +970,8 @@ static string BuildLeftJoinLineagePushedQuery(const string &view_query_sql, cons
 	                     affected_source + " " + affected_alias + " ON openivm_lj_src." + key_col +
 	                     " IS NOT DISTINCT FROM " + affected_alias + "." + lk + ")";
 	bool replaced = false;
-	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, key_source.table,
-	                                                                key_source.occurrence, replacement, replaced);
+	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, source_table, key_source.occurrence,
+	                                                                replacement, replaced);
 	if (!replaced || pushed_query == view_query_sql) {
 		return "";
 	}
@@ -879,8 +998,8 @@ static string TryBuildLeftJoinLineagePushdown(RefreshMetadata &metadata, const s
 	if (!metadata.GetLeftJoinKeySource(view_name, key_source)) {
 		return "";
 	}
-	string pushed_query =
-	    BuildLeftJoinLineagePushedQuery(view_query_sql, "openivm_affected", "openivm_lj_aff", lk, key_source);
+	string pushed_query = BuildLeftJoinLineagePushedQuery(metadata, view_name, delta_table_names, view_query_sql,
+	                                                      "openivm_affected", "openivm_lj_aff", lk, key_source);
 	if (pushed_query.empty()) {
 		return "";
 	}
@@ -926,8 +1045,8 @@ static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, co
 		if (!metadata.GetLeftJoinKeySource(view_name, key_source)) {
 			return "";
 		}
-		pushed_query =
-		    BuildLeftJoinLineagePushedQuery(view_query_sql, affected_table, "openivm_lj_aff", lk, key_source);
+		pushed_query = BuildLeftJoinLineagePushedQuery(metadata, view_name, delta_table_names, view_query_sql,
+		                                               affected_table, "openivm_lj_aff", lk, key_source);
 		if (pushed_query.empty() || !key_source.cardinality_transition_check_safe) {
 			return "";
 		}
@@ -967,8 +1086,8 @@ static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, co
 	string transition_query;
 	if (!nullable_side_quiet) {
 		string transition_source = "(SELECT " + lk + " FROM " + stats_table + " WHERE NOT openivm_safe)";
-		transition_query =
-		    BuildLeftJoinLineagePushedQuery(view_query_sql, transition_source, "openivm_lj_transition", lk, key_source);
+		transition_query = BuildLeftJoinLineagePushedQuery(metadata, view_name, delta_table_names, view_query_sql,
+		                                                   transition_source, "openivm_lj_transition", lk, key_source);
 		if (transition_query.empty()) {
 			return "";
 		}
@@ -1280,8 +1399,8 @@ ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connec
 	}
 	if (key.empty() && parts.size() == 1) {
 		auto candidates = con.Query("SELECT table_catalog, table_schema FROM information_schema.tables "
-		                            "WHERE table_type = 'VIEW' AND lower(table_name) = lower(" +
-		                            Value(name).ToSQLString() + ")");
+		                            "WHERE table_type = 'VIEW' AND " +
+		                            SqlUtils::IdentifierEqualsSQL("table_name", Value(name).ToSQLString()));
 		if (!candidates->HasError()) {
 			for (idx_t row = 0; row < candidates->RowCount(); row++) {
 				auto catalog = candidates->GetValue(0, row).ToString();
@@ -1304,8 +1423,8 @@ ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connec
 
 	if (key.empty()) {
 		throw CatalogException("Materialized view '%s' does not exist in IVM metadata; check view_sql_name, "
-		                       "view_catalog and view_schema in the native database's main.openivm_views",
-		                       view_name);
+		                       "view_catalog and view_schema in %s",
+		                       view_name, RefreshMetadata::MetadataTable(con, openivm::VIEWS_TABLE));
 	}
 	auto location = metadata.GetStoredViewLocation(key, resolved.view_catalog_name, resolved.view_schema_name);
 	resolved.view_catalog_name = location.catalog_name;
@@ -1340,8 +1459,9 @@ DuckLakeSourceLocation ResolveDuckLakeSourceLocation(Connection &con, const stri
 	loc.table_name = source_location.table_name;
 
 	if (StringUtil::StartsWith(table_name, openivm::DATA_TABLE_PREFIX)) {
+		// A parent MV's backing table lives in its internal location.
 		string source_view = table_name.substr(strlen(openivm::DATA_TABLE_PREFIX));
-		auto source_view_location = ResolveViewLocation(con, source_view, loc.catalog_name, loc.schema_name);
+		auto source_view_location = metadata.GetInternalLocation(source_view, loc.catalog_name, loc.schema_name);
 		loc.catalog_name = source_view_location.catalog_name;
 		loc.schema_name = source_view_location.schema_name;
 	}
@@ -1397,19 +1517,8 @@ string BuildDuckLakeSnapshotQuery(RefreshMetadata &metadata, Connection &con, co
 		if (StringUtil::StartsWith(source_name, openivm::DATA_TABLE_PREFIX)) {
 			source_name = source_name.substr(strlen(openivm::DATA_TABLE_PREFIX));
 		}
-		string visible_cols;
-		auto cols = con.Query("SELECT column_name FROM information_schema.columns WHERE table_catalog = '" +
-		                      SqlUtils::EscapeValue(loc.catalog_name) + "' AND table_schema = '" +
-		                      SqlUtils::EscapeValue(loc.schema_name) + "' AND table_name = '" +
-		                      SqlUtils::EscapeValue(source_name) + "' ORDER BY ordinal_position");
-		if (!cols->HasError()) {
-			for (idx_t i = 0; i < cols->RowCount(); i++) {
-				if (!visible_cols.empty()) {
-					visible_cols += ", ";
-				}
-				visible_cols += SqlUtils::QuoteIdentifier(cols->GetValue(0, i).ToString());
-			}
-		}
+		auto visible_cols =
+		    SqlUtils::JoinQuotedColumns(metadata.GetTableColumns(loc.catalog_name, loc.schema_name, source_name));
 		if (visible_cols.empty()) {
 			visible_cols = "*";
 		}
@@ -1432,6 +1541,18 @@ openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &v
                                                 const string &attached_db_catalog_name,
                                                 const string &attached_db_schema_name) {
 	case_insensitive_map_t<RefreshMetadata::SourceLocation> locations;
+	case_insensitive_set_t ambiguous_names;
+	RefreshMetadata metadata(con);
+	auto add_location = [&](const string &name, const RefreshMetadata::SourceLocation &location) {
+		auto existing = locations.find(name);
+		if (existing != locations.end() &&
+		    (!StringUtil::CIEquals(existing->second.catalog_name, location.catalog_name) ||
+		     !StringUtil::CIEquals(existing->second.schema_name, location.schema_name))) {
+			ambiguous_names.insert(name);
+		} else {
+			locations[name] = location;
+		}
+	};
 	OPENIVM_DEBUG_PRINT("[UPSERT] Qualifying %zu sources for %s from one metadata snapshot\n", delta_sources.size(),
 	                    view_name.c_str());
 	for (auto &source : delta_sources) {
@@ -1449,7 +1570,15 @@ openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &v
 		}
 		string base_name =
 		    BaseTableNameFromDeltaKey(RefreshMetadata::SourceTableName(source.table_name, catalog_name, schema_name));
-		locations[base_name] = {catalog_name, schema_name};
+		add_location(base_name, {catalog_name, schema_name});
+		// Legacy original-SQL definitions can name a public parent MV while their delta
+		// metadata names its physical publication/backing relation in the internal schema.
+		auto owner = PublishedSourceViewName(base_name);
+		if (owner != base_name && !metadata.GetViewQuery(owner).empty()) {
+			auto public_name = metadata.GetViewSQLName(owner);
+			auto public_location = metadata.GetStoredViewLocation(owner, catalog_name, schema_name);
+			add_location(public_name, {public_location.catalog_name, public_location.schema_name});
+		}
 	}
 	Parser parser(con.context->GetParserOptions());
 	parser.ParseQuery(view_query_sql);
@@ -1459,6 +1588,12 @@ openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &v
 		pins = openivm::TimeTravelPins::Peel(*con.context, *parser.statements.at(0), [&](BaseTableRef &ref) {
 			auto location = locations.find(ref.table_name);
 			if (location != locations.end() && ref.catalog_name.empty() && ref.schema_name.empty()) {
+				if (ambiguous_names.find(ref.table_name) != ambiguous_names.end()) {
+					throw BinderException(
+					    "OpenIVM cannot recover the schema of legacy unqualified source '%s' in '%s'; "
+					    "CREATE OR REPLACE the materialized view with qualified source names",
+					    ref.table_name, view_name);
+				}
 				ref.catalog_name = location->second.catalog_name;
 				ref.schema_name = location->second.schema_name;
 				qualified = true;

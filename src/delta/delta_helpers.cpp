@@ -314,15 +314,15 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binde
 	}
 
 	optional_ptr<TableCatalogEntry> opt_catalog_entry;
+	// Metadata keys the delta by its source; the physical table may sit in an internal schema.
+	string delta_key = SqlUtils::DeltaName(source_table->name);
+	string source_catalog = source_table->catalog.GetName();
+	string source_schema = source_table->schema.name;
 	{
-		string delta_table = SqlUtils::DeltaName(source_table->name);
-		string delta_table_schema = source_table->schema.name;
-		string delta_table_catalog = source_table->catalog.GetName();
-		QueryErrorContext error_context;
-		opt_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
-		    context, delta_table_catalog, delta_table_schema, delta_table, OnEntryNotFound::RETURN_NULL, error_context);
+		opt_catalog_entry =
+		    RefreshMetadata::FindSourceDelta(context, source_catalog, source_schema, source_table->name);
 		if (opt_catalog_entry == nullptr) {
-			throw Exception(ExceptionType::BINDER, "Table " + delta_table + " does not exist, no deltas to compute!");
+			throw Exception(ExceptionType::BINDER, "Table " + delta_key + " does not exist, no deltas to compute!");
 		}
 	}
 	auto &table_entry = opt_catalog_entry->Cast<TableCatalogEntry>();
@@ -375,10 +375,9 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binde
 	}
 
 	// Timestamp filter
-	auto timestamp_query =
-	    "select last_update from " + string(openivm::DELTA_TABLES_TABLE) + " where view_name = '" +
-	    SqlUtils::EscapeValue(view_name) + "' and " +
-	    RefreshMetadata::SourcePredicate(table_name, table_entry.ParentCatalog().GetName(), table_entry.schema.name);
+	auto timestamp_query = "select last_update from " + string(openivm::DELTA_TABLES_TABLE) + " where view_name = '" +
+	                       SqlUtils::EscapeValue(view_name) + "' and " +
+	                       RefreshMetadata::SourcePredicate(delta_key, source_catalog, source_schema);
 	auto r = con.Query(timestamp_query);
 	if (r->HasError()) {
 		throw Exception(ExceptionType::EXECUTOR, "IVM: failed to read last_update for view '" + view_name +

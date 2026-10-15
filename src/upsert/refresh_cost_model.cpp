@@ -30,22 +30,26 @@
 namespace duckdb {
 
 /// Get the row count of a table by name, returns 0 if table doesn't exist.
-static double GetTableRowCount(Connection &con, const string &table_name) {
-	auto result = con.Query("SELECT COUNT(*) FROM " + SqlUtils::QuoteIdentifier(table_name) + ";");
+static double GetTableRowCount(Connection &con, const string &table_sql) {
+	auto result = con.Query("SELECT COUNT(*) FROM " + table_sql + ";");
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return 0;
 	}
 	return result->GetValue(0, 0).GetValue<double>();
 }
 
-static const DeltaActivityResult::Source *FindDeltaActivitySource(const DeltaActivityResult *activity,
-                                                                  const string &delta_table_name,
-                                                                  const string &source_table_name) {
+static const DeltaActivityResult::Source *
+FindDeltaActivitySource(const DeltaActivityResult *activity, const string &delta_table_name,
+                        const string &source_table_name, const string &catalog_name, const string &schema_name) {
 	if (!activity) {
 		return nullptr;
 	}
 	string source_from_delta = BaseTableNameFromDeltaKey(delta_table_name);
 	for (auto &source : activity->sources) {
+		if (!StringUtil::CIEquals(source.catalog_name, catalog_name) ||
+		    !StringUtil::CIEquals(source.schema_name, schema_name)) {
+			continue;
+		}
 		if (StringUtil::CIEquals(source.delta_table_name, delta_table_name) ||
 		    StringUtil::CIEquals(source.source_table_name, source_table_name) ||
 		    (!source_from_delta.empty() && StringUtil::CIEquals(source.source_table_name, source_from_delta))) {
@@ -58,19 +62,24 @@ static const DeltaActivityResult::Source *FindDeltaActivitySource(const DeltaAct
 /// Get the number of pending delta rows for a given base delta table and view.
 static double GetDeltaRowCount(Connection &con, const string &delta_table_name, const string &view_name,
                                const DeltaActivityResult *activity) {
-	auto source = FindDeltaActivitySource(activity, delta_table_name, BaseTableNameFromDeltaKey(delta_table_name));
+	RefreshMetadata metadata(con);
+	auto location = metadata.GetSourceLocation(view_name, delta_table_name);
+	auto source = FindDeltaActivitySource(activity, delta_table_name, BaseTableNameFromDeltaKey(delta_table_name),
+	                                      location.catalog_name, location.schema_name);
 	if (source && source->pending_rows >= 0) {
 		return static_cast<double>(source->pending_rows);
 	}
 	if (source && source->ok && !source->has_changes) {
 		return 0;
 	}
-	auto ts_string = RefreshMetadata(con).GetLastUpdate(view_name, delta_table_name);
+	auto ts_string = metadata.GetLastUpdate(view_name, delta_table_name);
 	if (ts_string.empty()) {
 		return 0;
 	}
-	auto count_result = con.Query("SELECT COUNT(*) FROM " + SqlUtils::QuoteIdentifier(delta_table_name) + " WHERE " +
-	                              string(openivm::TIMESTAMP_COL) + " >= '" + ts_string + "';");
+	// The delta may live in an internal schema rather than beside its source.
+	auto count_result =
+	    con.Query("SELECT COUNT(*) FROM " + metadata.ResolveDeltaQualifiedName(view_name, delta_table_name) +
+	              " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" + ts_string + "';");
 	if (count_result->HasError() || count_result->RowCount() == 0 || count_result->GetValue(0, 0).IsNull()) {
 		return 0;
 	}
@@ -254,9 +263,9 @@ static JoinTermEstimate EstimateJoinTerms(Connection &con, const PlanStats &stat
 
 /// Get delta cardinality for a DuckLake table by counting changes between snapshots.
 static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_name, const string &schema_name,
-                                       const string &table_name, const string &view_name,
+                                       const string &table_name, const string &metadata_key, const string &view_name,
                                        const DeltaActivityResult *activity) {
-	auto source = FindDeltaActivitySource(activity, table_name, table_name);
+	auto source = FindDeltaActivitySource(activity, metadata_key, table_name, catalog_name, schema_name);
 	if (source && source->pending_rows >= 0) {
 		return static_cast<double>(source->pending_rows);
 	}
@@ -264,7 +273,7 @@ static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_na
 		return 0;
 	}
 	RefreshMetadata metadata(con);
-	auto last_snap = metadata.GetLastSnapshotId(view_name, table_name);
+	auto last_snap = metadata.GetLastSnapshotId(view_name, metadata_key);
 	auto cur_snap = metadata.GetCurrentDuckLakeSnapshot(catalog_name);
 	if (cur_snap < 0) {
 		return 0;
@@ -308,24 +317,32 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 			// Actual (unfiltered) table row count — for filter selectivity estimation.
 			// base_card from EstimateCardinality may reflect pushed-down filters, so
 			// actual_card / base_card gives us the filter selectivity ratio.
-			ts.actual_card = GetTableRowCount(con, ts.table_name);
+			auto catalog_name = get.GetTable()->ParentCatalog().GetName();
+			auto schema_name = get.GetTable()->schema.name;
+			ts.actual_card = GetTableRowCount(con, SqlUtils::FullName(catalog_name, schema_name, ts.table_name));
 			if (ts.actual_card == 0) {
 				ts.actual_card = 1;
 			}
 
-			// DuckLake vs standard delta cardinality
-			if (get.function.name == "ducklake_scan" && get.function.function_info) {
-				string cat_name = get.GetTable()->ParentCatalog().GetName();
-				string schema_name = get.GetTable()->schema.name;
-				ts.delta_table_name = ts.table_name; // DuckLake stores bare name
-				ts.delta_card =
-				    GetDuckLakeDeltaRowCount(con, cat_name, schema_name, ts.table_name, view_name, delta_activity);
+			bool ducklake_source = get.function.name == "ducklake_scan" && get.function.function_info;
+			ts.delta_table_name = ducklake_source ? ts.table_name : SqlUtils::DeltaName(ts.table_name);
+			// Repeated source names have qualified metadata keys. Resolve the key by
+			// physical identity before looking up its watermark or cached activity.
+			auto key = con.Query("SELECT table_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
+			                     " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND " +
+			                     RefreshMetadata::SourcePredicate(ts.delta_table_name, catalog_name, schema_name));
+			if (!key->HasError() && key->RowCount() == 1) {
+				ts.delta_table_name = key->GetValue(0, 0).ToString();
+			}
+			if (ducklake_source) {
+				ts.delta_card = GetDuckLakeDeltaRowCount(con, catalog_name, schema_name, ts.table_name,
+				                                         ts.delta_table_name, view_name, delta_activity);
 			} else {
 				stats.all_ducklake = false;
-				ts.delta_table_name = SqlUtils::DeltaName(ts.table_name);
 				ts.delta_card = GetDeltaRowCount(con, ts.delta_table_name, view_name, delta_activity);
 			}
-			auto source = FindDeltaActivitySource(delta_activity, ts.delta_table_name, ts.table_name);
+			auto source =
+			    FindDeltaActivitySource(delta_activity, ts.delta_table_name, ts.table_name, catalog_name, schema_name);
 			ts.has_deletes = source && source->has_deletes;
 
 			stats.table_stats.push_back(ts);
@@ -522,8 +539,9 @@ static RegressionWeights FitRegression(const vector<RefreshMetadata::RefreshHist
 
 RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator &plan, const string &view_name,
                                         const DeltaActivityResult *delta_activity) {
-	// Single connection for all cardinality queries
+	// Single connection for all cardinality queries, reading the caller's metadata schema
 	Connection con(*context.db);
+	RefreshMetadata::UseSameLocation(context, con);
 
 	// Read operational flags — cost model reflects what actually happens at refresh time.
 	bool nterm_enabled = SqlUtils::GetBoolSetting(context, "openivm_ducklake_nterm", true);
@@ -564,7 +582,10 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		has_active_delta = has_active_delta || ts.delta_card > 0;
 	}
 
-	double mv_card = GetTableRowCount(con, IncrementalTableNames::DataTableName(view_name));
+	auto internal_location = RefreshMetadata(con).GetInternalLocation(view_name);
+	double mv_card =
+	    GetTableRowCount(con, SqlUtils::FullName(internal_location.catalog_name, internal_location.schema_name,
+	                                             IncrementalTableNames::DataTableName(view_name)));
 	if (mv_card == 0) {
 		mv_card = 1;
 	}
@@ -905,9 +926,8 @@ string RefreshCostHistoryQuery(ClientContext &context, const FunctionParameters 
 	       " AS view_name, refresh_timestamp, method, incremental_compute_est, incremental_upsert_est,"
 	       " recompute_compute_est, recompute_replace_est, actual_duration_ms"
 	       " FROM " +
-	       SqlUtils::FullName(ClientData::Get(*con.context).catalog_search_path->GetDefault().catalog, DEFAULT_SCHEMA,
-	                          openivm::HISTORY_TABLE) +
-	       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' ORDER BY refresh_timestamp DESC LIMIT 20";
+	       RefreshMetadata::MetadataTable(con, openivm::HISTORY_TABLE) + " WHERE view_name = '" +
+	       SqlUtils::EscapeValue(view_name) + "' ORDER BY refresh_timestamp DESC LIMIT 20";
 }
 
 vector<StrategyCostEstimate> EstimatePerQuery(ClientContext &context, const string &view_name,

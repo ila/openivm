@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
+#include "duckdb/parser/parser.hpp"
 
 #include <cctype>
 #include <cstring>
@@ -45,6 +46,16 @@ string SqlUtils::TrimSQLFragment(const string &input) {
 		end--;
 	}
 	return input.substr(start, end - start);
+}
+
+string SqlUtils::IdentifierEqualsSQL(const string &left, const string &right) {
+	// SQL lower() folds Unicode, whereas StringUtil::CIEquals and catalog lookup
+	// fold only A-Z. Preserve every other code point, including quoted identifiers.
+	auto fold = [](const string &expression) {
+		return "translate(" + expression + ", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')";
+	};
+	// An application collation must not widen physical identifier equality either.
+	return "(" + fold(left) + " COLLATE \"binary\" = " + fold(right) + " COLLATE \"binary\")";
 }
 
 string SqlUtils::BuildCastSpec(const string &target_type, bool try_cast) {
@@ -242,25 +253,6 @@ vector<string> SqlUtils::ParseQualifiedIdentifier(const string &name) {
 			throw ParserException("Invalid qualified identifier '%s'", name);
 		}
 	}
-}
-
-static bool ReadQualifiedIdentifier(const string &sql, idx_t start, idx_t &end, string &identifier) {
-	idx_t pos = start;
-	string segment;
-	if (!ReadIdentifierSegment(sql, pos, segment)) {
-		return false;
-	}
-	identifier = segment;
-	while (pos < sql.size() && sql[pos] == '.') {
-		idx_t dot_pos = pos++;
-		if (!ReadIdentifierSegment(sql, pos, segment)) {
-			pos = dot_pos;
-			break;
-		}
-		identifier += "." + segment;
-	}
-	end = pos;
-	return true;
 }
 
 static bool ReadQualifiedIdentifierSpans(const string &sql, idx_t start, idx_t &end,
@@ -480,15 +472,20 @@ string SqlUtils::ExtractViewQuery(string &query) {
 
 string SqlUtils::SQLToLowercase(const string &sql) {
 	std::stringstream lowercase_stream;
-	bool in_string = false;
+	// Quoted identifiers carry physical catalog/schema identities. Folding them
+	// can select a different metadata catalog even though DuckDB binds the name.
+	char quote = '\0';
 	for (char c : sql) {
-		if (c == '\'') {
-			in_string = !in_string;
-		}
-		if (!in_string) {
-			lowercase_stream << (char)tolower(c);
-		} else {
+		if (quote) {
 			lowercase_stream << c;
+			if (c == quote) {
+				quote = '\0';
+			}
+		} else if (c == '\'' || c == '"') {
+			quote = c;
+			lowercase_stream << c;
+		} else {
+			lowercase_stream << StringUtil::CharacterToLower(c);
 		}
 	}
 	return lowercase_stream.str();
@@ -528,72 +525,18 @@ void SqlUtils::StripLineComments(string &query) {
 vector<string> SqlUtils::SplitSQLStatements(const string &sql) {
 	vector<string> statements;
 	idx_t start = 0;
-	bool in_single_quote = false;
-	bool in_double_quote = false;
-	bool in_line_comment = false;
-	bool in_block_comment = false;
-
-	for (idx_t i = 0; i < sql.size(); i++) {
-		auto c = sql[i];
-		auto next = i + 1 < sql.size() ? sql[i + 1] : '\0';
-
-		if (in_line_comment) {
-			if (c == '\n') {
-				in_line_comment = false;
-			}
+	// Match DuckDB's own statement splitting, including dollar-quoted strings
+	// and nested comments, rather than maintaining a second SQL lexer.
+	for (auto &token : Parser::Tokenize(sql)) {
+		if (token.type != SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR || sql[token.start] != ';') {
 			continue;
 		}
-		if (in_block_comment) {
-			if (c == '*' && next == '/') {
-				in_block_comment = false;
-				i++;
-			}
-			continue;
+		auto statement = TrimSQLFragment(sql.substr(start, token.start - start));
+		if (!statement.empty()) {
+			statements.push_back(std::move(statement));
 		}
-		if (in_single_quote) {
-			if (c == '\'' && next == '\'') {
-				i++;
-			} else if (c == '\'') {
-				in_single_quote = false;
-			}
-			continue;
-		}
-		if (in_double_quote) {
-			if (c == '"' && next == '"') {
-				i++;
-			} else if (c == '"') {
-				in_double_quote = false;
-			}
-			continue;
-		}
-
-		if (c == '-' && next == '-') {
-			in_line_comment = true;
-			i++;
-			continue;
-		}
-		if (c == '/' && next == '*') {
-			in_block_comment = true;
-			i++;
-			continue;
-		}
-		if (c == '\'') {
-			in_single_quote = true;
-			continue;
-		}
-		if (c == '"') {
-			in_double_quote = true;
-			continue;
-		}
-		if (c == ';') {
-			auto statement = TrimSQLFragment(sql.substr(start, i - start));
-			if (!statement.empty()) {
-				statements.push_back(std::move(statement));
-			}
-			start = i + 1;
-		}
+		start = token.start + 1;
 	}
-
 	auto statement = TrimSQLFragment(sql.substr(start));
 	if (!statement.empty()) {
 		statements.push_back(std::move(statement));
@@ -951,6 +894,19 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 	if (table_name.empty()) {
 		return matches;
 	}
+	// Keep component boundaries: a quoted dot is part of a name, not qualification.
+	auto target_parts = SqlUtils::ParseQualifiedIdentifier(table_name);
+	auto matches_table = [&](const vector<IdentifierSegmentSpan> &parts) {
+		if (parts.size() < target_parts.size()) {
+			return false;
+		}
+		for (idx_t part = 0; part < target_parts.size(); part++) {
+			if (!StringUtil::CIEquals(parts[parts.size() - target_parts.size() + part].value, target_parts[part])) {
+				return false;
+			}
+		}
+		return true;
+	};
 	bool in_single_quote = false;
 	bool expect_table = false;
 	for (idx_t i = 0; i < sql.size();) {
@@ -967,16 +923,16 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 		if (!in_single_quote && IsIdentifierTokenStart(c)) {
 			idx_t start = i;
 			idx_t end = i;
-			string qualified_identifier;
-			if (ReadQualifiedIdentifier(sql, start, end, qualified_identifier)) {
-				if (expect_table && SqlUtils::IdentifierMatchesTable(qualified_identifier, table_name)) {
+			vector<IdentifierSegmentSpan> parts;
+			if (ReadQualifiedIdentifierSpans(sql, start, end, parts)) {
+				if (expect_table && matches_table(parts)) {
 					matches.push_back({start, include_time_travel_clause ? ExtendPastTimeTravelClause(sql, end) : end});
 					i = matches.back().end;
 					expect_table = false;
 					continue;
 				}
 				i = end;
-				expect_table = IsTableReferenceKeyword(qualified_identifier);
+				expect_table = parts.size() == 1 && sql[start] != '"' && IsTableReferenceKeyword(parts[0].value);
 				continue;
 			}
 		}
@@ -1089,7 +1045,6 @@ int64_t SqlUtils::ExtractRefreshInterval(string &query) {
 	string interval_str = match[1].str();
 	// Strip the REFRESH EVERY clause from the query
 	query = std::regex_replace(query, refresh_re, "");
-	SqlUtils::RemoveRedundantWhitespaces(query);
 	return ParseRefreshInterval(interval_str);
 }
 

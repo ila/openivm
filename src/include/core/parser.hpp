@@ -11,6 +11,9 @@
 
 namespace duckdb {
 
+struct PlannerExtensionInput;
+struct BoundStatement;
+
 //! Name of the setting that declares which SQL dialect the caller writes materialized-view bodies in.
 constexpr const char *OPENIVM_INPUT_DIALECT_SETTING = "openivm_input_dialect";
 
@@ -54,8 +57,7 @@ SqlDialect OpenIvmInputDialect(ClientContext &context);
 //! `openivm_input_dialect` set callback: validates the value and mirrors it onto the parser extension.
 void SetOpenIvmInputDialect(ClientContext &context, SetScope scope, Value &parameter);
 
-string MaterializedViewLifecycleQuery(ClientContext &context, const FunctionParameters &parameters);
-string MaterializedViewDropQuery(ClientContext &context, const FunctionParameters &parameters);
+void BindMaterializedViewLifecycle(PlannerExtensionInput &input, BoundStatement &statement);
 
 struct MaterializedViewParseData : ParserExtensionParseData {
 	unique_ptr<SQLStatement> statement;
@@ -63,6 +65,7 @@ struct MaterializedViewParseData : ParserExtensionParseData {
 	bool is_replace = false;       // CREATE OR REPLACE: drop old MV before creating
 	string alter_sql;              // non-empty for ALTER MATERIALIZED VIEW (executed directly in plan function)
 	string target_name;            // parsed catalog-qualified CREATE/ALTER target
+	string original_query;         // lifecycle SQL for native verification/reparsing
 
 	unique_ptr<ParserExtensionParseData> Copy() const override {
 		auto copy = make_uniq_base<ParserExtensionParseData, MaterializedViewParseData>(statement->Copy());
@@ -71,11 +74,12 @@ struct MaterializedViewParseData : ParserExtensionParseData {
 		data.is_replace = is_replace;
 		data.alter_sql = alter_sql;
 		data.target_name = target_name;
+		data.original_query = original_query;
 		return copy;
 	}
 
 	string ToString() const override {
-		return statement->ToString();
+		return original_query;
 	}
 
 	explicit MaterializedViewParseData(unique_ptr<SQLStatement> statement, int64_t refresh_interval = -1)

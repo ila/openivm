@@ -18,9 +18,9 @@ static std::pair<string, string> SplitPartitionSpec(const string &raw) {
 
 static bool DeltaHasColumn(Connection &con, const RefreshMetadata::SourceLocation &source, const string &column_name) {
 	auto col_result = con.Query("SELECT 1 FROM information_schema.columns WHERE table_name = '" +
-	                            SqlUtils::EscapeValue(source.table_name) + "' AND table_catalog = '" +
+	                            SqlUtils::EscapeValue(source.delta_table_name) + "' AND table_catalog = '" +
 	                            SqlUtils::EscapeValue(source.catalog_name) + "' AND table_schema = '" +
-	                            SqlUtils::EscapeValue(source.schema_name) + "' AND lower(column_name) = lower('" +
+	                            SqlUtils::EscapeValue(source.delta_schema_name) + "' AND lower(column_name) = lower('" +
 	                            SqlUtils::EscapeValue(column_name) + "') LIMIT 1");
 	return !col_result->HasError() && col_result->RowCount() > 0;
 }
@@ -78,51 +78,28 @@ static bool IsSafeForDuckLakeSnapshotDiff(const vector<string> &partition_cols, 
 	return true;
 }
 
-static string StripTrackedPrefix(const string &name) {
-	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
-	static const string delta_prefix(openivm::DELTA_PREFIX);
-	string last = SqlUtils::LastIdentifierPart(name);
-	if (last.size() > data_prefix.size() && last.rfind(data_prefix, 0) == 0) {
-		return last.substr(data_prefix.size());
-	}
-	if (last.size() > delta_prefix.size() && last.rfind(delta_prefix, 0) == 0) {
-		return last.substr(delta_prefix.size());
-	}
-	return last;
-}
-
-static string FindTrackedDeltaKey(const vector<string> &delta_table_names, const string &table_name) {
-	for (auto &dt : delta_table_names) {
-		if (StringUtil::CIEquals(StripTrackedPrefix(dt), StripTrackedPrefix(table_name))) {
-			return dt;
-		}
-	}
-	return "";
-}
-
 static string ResolveStandardTrackedTableSQL(RefreshMetadata &metadata, const string &view_name,
                                              const vector<string> &delta_table_names, const string &table_name,
                                              bool delta_table, const string &view_catalog_name,
                                              const string &view_schema_name, const string &attached_db_catalog_name,
                                              const string &attached_db_schema_name) {
-	string metadata_key = FindTrackedDeltaKey(delta_table_names, table_name);
-	if (metadata_key.empty() && !StringUtil::StartsWith(table_name, openivm::DATA_TABLE_PREFIX)) {
-		metadata_key = SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name));
-	}
+	string metadata_key = ResolveDeltaMetadataKey(metadata, view_name, table_name, delta_table_names);
 	string fallback_catalog = attached_db_catalog_name.empty() ? view_catalog_name : attached_db_catalog_name;
 	string fallback_schema = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
 	auto loc = metadata.GetSourceLocation(view_name, metadata_key, fallback_catalog, fallback_schema);
-	string resolved_name = delta_table ? metadata_key : SqlUtils::LastIdentifierPart(table_name);
+	// A delta may live in an internal schema under a schema-qualified name.
+	string resolved_name = delta_table ? loc.delta_table_name : BaseTableNameFromDeltaKey(loc.table_name);
+	string resolved_schema = delta_table ? loc.delta_schema_name : loc.schema_name;
 	if (resolved_name.empty()) {
 		return "";
 	}
 	if (loc.catalog_name.empty()) {
 		return SqlUtils::QuoteIdentifier(resolved_name);
 	}
-	if (loc.schema_name.empty()) {
-		loc.schema_name = "main";
+	if (resolved_schema.empty()) {
+		resolved_schema = "main";
 	}
-	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, resolved_name);
+	return SqlUtils::FullName(loc.catalog_name, resolved_schema, resolved_name);
 }
 
 static string BuildLineageColumnExpr(const string &column_name, const string &cast_type, const string &alias = "") {
@@ -239,11 +216,11 @@ BuildLineageStandardAffectedKeysSQL(RefreshMetadata &metadata, Connection &con, 
 			return LineageAffectedKeysResult::UNSAFE;
 		}
 		arms.push_back("(" + arm_sql + ")");
-		covered_sources.insert(StripTrackedPrefix(op.source));
+		covered_sources.insert(ResolveDeltaMetadataKey(metadata, view_name, op.source, delta_table_names));
 	}
 
 	for (auto &dt : delta_table_names) {
-		if (!covered_sources.count(StripTrackedPrefix(dt))) {
+		if (!covered_sources.count(dt)) {
 			return LineageAffectedKeysResult::UNAVAILABLE;
 		}
 	}
@@ -653,14 +630,11 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	                    partition_cols.size(), have_lineage_affected_keys ? "yes" : "no");
 	vector<string> running_window_column_names = column_names;
 	if (running_window_incremental) {
-		auto data_cols = con.Query("SELECT column_name FROM information_schema.columns WHERE table_name = '" +
-		                           SqlUtils::EscapeValue(IncrementalTableNames::DataTableName(view_name)) +
-		                           "' ORDER BY ordinal_position");
-		if (!data_cols->HasError() && data_cols->RowCount() > 0) {
-			running_window_column_names.clear();
-			for (idx_t i = 0; i < data_cols->RowCount(); i++) {
-				running_window_column_names.push_back(data_cols->GetValue(0, i).ToString());
-			}
+		auto internal_location = metadata.GetInternalLocation(view_name, view_catalog_name, view_schema_name);
+		auto data_cols = metadata.GetTableColumns(internal_location.catalog_name, internal_location.schema_name,
+		                                          IncrementalTableNames::DataTableName(view_name));
+		if (!data_cols.empty()) {
+			running_window_column_names = std::move(data_cols);
 		}
 	}
 	return CompileWindowRecompute(view_name, view_query_sql, delta_ts_filter, internal_catalog_prefix, partition_cols,

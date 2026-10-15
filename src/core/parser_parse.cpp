@@ -5,22 +5,13 @@
 #include "core/sql_utils.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
-#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/statement/drop_statement.hpp"
-#include "duckdb/parser/statement/pragma_statement.hpp"
+#include "duckdb/parser/statement/extension_statement.hpp"
 #include "lpts_parser.hpp"
 
 #include <regex>
 
 namespace duckdb {
-
-static unique_ptr<SQLStatement> BuildInternalPragma(const string &name, const string &query) {
-	auto statement = make_uniq<PragmaStatement>();
-	statement->info->name = name;
-	statement->info->parameters.push_back(make_uniq<ConstantExpression>(Value(query)));
-	return std::move(statement);
-}
 
 SqlDialect OpenIvmInputDialect(ClientContext &context) {
 	Value setting_value;
@@ -52,30 +43,31 @@ static SqlDialect InputDialectFromInfo(ParserExtensionInfo *info) {
 ParserOverrideResult MaterializedViewParserExtension::OverrideFunction(ParserExtensionInfo *info, const string &query,
                                                                        ParserOptions &options) {
 	try {
-		auto extension_result = ParseMaterializedViewStatement(query, InputDialectFromInfo(info));
-		if (extension_result.type == ParserExtensionResultType::PARSE_SUCCESSFUL) {
-			vector<unique_ptr<SQLStatement>> statements;
-			statements.push_back(BuildInternalPragma("openivm_materialized_view_lifecycle", query));
-			return ParserOverrideResult(std::move(statements));
-		}
-
-		// DuckDB parses these statements natively, so the regular parser-extension
-		// fallback never sees them. Route view and source-table drops through
-		// OpenIVM so cleanup and source retractions use the caller transaction.
 		ParserOptions native_options = options;
 		native_options.extensions = nullptr;
-		Parser parser(native_options);
-		parser.ParseQuery(query);
-		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::DROP_STATEMENT) {
-			return ParserOverrideResult();
-		}
-		auto &drop = parser.statements[0]->Cast<DropStatement>();
-		if (drop.info->type != CatalogType::VIEW_ENTRY && drop.info->type != CatalogType::TABLE_ENTRY) {
-			return ParserOverrideResult();
-		}
 		vector<unique_ptr<SQLStatement>> statements;
-		statements.push_back(BuildInternalPragma("openivm_materialized_view_drop", query));
-		return ParserOverrideResult(std::move(statements));
+		bool overridden = false;
+		// Return lifecycle ASTs, not pragmas: DuckDB preprocesses all pragmas before
+		// executing any native statement in this input. Extension statements bind
+		// only when the driver reaches them, after preceding DDL/DML/BEGIN executes.
+		for (auto &sql : SqlUtils::SplitSQLStatements(query)) {
+			auto extension_result = ParseMaterializedViewStatement(sql, InputDialectFromInfo(info));
+			if (extension_result.type == ParserExtensionResultType::PARSE_SUCCESSFUL) {
+				auto extension = MaterializedViewParserExtension();
+				auto statement =
+				    make_uniq<ExtensionStatement>(std::move(extension), std::move(extension_result.parse_data));
+				statement->query = sql;
+				statements.push_back(std::move(statement));
+				overridden = true;
+				continue;
+			}
+			Parser parser(native_options);
+			parser.ParseQuery(sql);
+			for (auto &statement : parser.statements) {
+				statements.push_back(std::move(statement));
+			}
+		}
+		return overridden ? ParserOverrideResult(std::move(statements)) : ParserOverrideResult();
 	} catch (std::exception &ex) {
 		return ParserOverrideResult(ex);
 	}
@@ -87,16 +79,88 @@ ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(Parser
 }
 
 ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, SqlDialect input_dialect) {
-	auto query_lower = SqlUtils::SQLToLowercase(StringUtil::Replace(query, ";", ""));
+	// Mask comments only in the lifecycle header. The AS body must reach the
+	// native parser unchanged: removing a block comment between adjacent string
+	// literals can turn invalid SQL into a valid concatenated literal.
+	auto cleaned = query;
+	string query_body;
+	auto tokens = Parser::Tokenize(query);
+	idx_t cursor = 0;
+	for (idx_t i = 0; i <= tokens.size(); i++) {
+		auto end = i < tokens.size() ? tokens[i].start : query.size();
+		auto token = i > 0 ? &tokens[i - 1] : nullptr;
+		bool string_constant = token && token->type == SimplifiedTokenType::SIMPLIFIED_TOKEN_STRING_CONSTANT;
+		bool escaped = string_constant && (query[token->start] == 'e' || query[token->start] == 'E');
+		if (string_constant && query[cursor] == '$') {
+			auto tag_end = query.find('$', cursor + 1);
+			auto tag = query.substr(cursor, tag_end - cursor + 1);
+			auto close = query.find(tag, tag_end + 1);
+			cursor = close == string::npos ? query.size() : close + tag.size();
+		}
+		while (cursor < end) {
+			if (query[cursor] == '\'' || query[cursor] == '"') {
+				auto quote = query[cursor++];
+				while (cursor < end) {
+					auto c = query[cursor++];
+					if (escaped && c == '\\' && cursor < end) {
+						cursor++;
+					} else if (c == quote) {
+						if (cursor < end && query[cursor] == quote) {
+							cursor++;
+						} else {
+							break;
+						}
+					}
+				}
+				continue;
+			}
+			auto comment_start = cursor;
+			if (cursor + 1 < end && query[cursor] == '-' && query[cursor + 1] == '-') {
+				while (cursor < end && query[cursor] != '\n' && query[cursor] != '\r') {
+					cursor++;
+				}
+			} else if (cursor + 1 < end && query[cursor] == '/' && query[cursor + 1] == '*') {
+				cursor += 2;
+				idx_t depth = 1;
+				while (cursor < end && depth > 0) {
+					if (cursor + 1 < end && query[cursor] == '/' && query[cursor + 1] == '*') {
+						depth++;
+						cursor += 2;
+					} else if (cursor + 1 < end && query[cursor] == '*' && query[cursor + 1] == '/') {
+						depth--;
+						cursor += 2;
+					} else {
+						cursor++;
+					}
+				}
+			} else {
+				cursor++;
+				continue;
+			}
+			for (auto pos = comment_start; pos < cursor; pos++) {
+				if (cleaned[pos] != '\n' && cleaned[pos] != '\r') {
+					cleaned[pos] = ' ';
+				}
+			}
+		}
+		if (token && token->type == SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR && query[token->start] == ';') {
+			cleaned[token->start] = ' ';
+		}
+		if (token && token->type == SimplifiedTokenType::SIMPLIFIED_TOKEN_KEYWORD &&
+		    StringUtil::CIEquals(SqlUtils::TrimSQLFragment(cleaned.substr(token->start, end - token->start)), "as")) {
+			query_body = query.substr(token->start + 2);
+			cleaned.resize(token->start + 2);
+			break;
+		}
+	}
+	auto query_lower = SqlUtils::SQLToLowercase(cleaned);
 	StringUtil::Trim(query_lower);
-	// Strip SQL line comments (-- to end of line) before whitespace normalization.
-	// RemoveRedundantWhitespaces collapses '\n' to ' ', which would turn
-	// "-- comment\n rest" into "-- comment rest" where the rest is eaten by the comment.
-	SqlUtils::StripLineComments(query_lower);
-	SqlUtils::RemoveRedundantWhitespaces(query_lower);
+	// Collapse whitespace only for keyword detection, never in the AS query.
+	auto header = query_lower;
+	SqlUtils::RemoveRedundantWhitespaces(header);
 
 	// Handle ALTER MATERIALIZED VIEW <name> SET REFRESH EVERY '<interval>' | SET REFRESH MANUAL
-	if (StringUtil::Contains(query_lower, "alter materialized view")) {
+	if (StringUtil::StartsWith(header, "alter materialized view ")) {
 		const string identifier = "(?:\"(?:[^\"]|\"\")*\"|[a-zA-Z_][a-zA-Z0-9_$]*)";
 		const string qualified_identifier = identifier + "(?:\\s*\\.\\s*" + identifier + "){0,2}";
 		std::regex alter_re("^alter\\s+materialized\\s+view\\s+(" + qualified_identifier +
@@ -129,11 +193,12 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 		auto &materialized_view_data = dynamic_cast<MaterializedViewParseData &>(*parse_data);
 		materialized_view_data.alter_sql = alter_value;
 		materialized_view_data.target_name = alter_view_name;
+		materialized_view_data.original_query = query;
 		return ParserExtensionParseResult(std::move(parse_data));
 	}
 
-	if (!StringUtil::Contains(query_lower, "create materialized view") &&
-	    !StringUtil::Contains(query_lower, "create or replace materialized view")) {
+	if (!StringUtil::StartsWith(header, "create materialized view ") &&
+	    !StringUtil::StartsWith(header, "create or replace materialized view ")) {
 		return ParserExtensionParseResult();
 	}
 
@@ -146,7 +211,6 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 		is_replace = true;
 		// Strip "or replace" so the rest of the pipeline sees "create materialized view"
 		query_lower = std::regex_replace(query_lower, std::regex("\\bor\\s+replace\\s+"), "");
-		SqlUtils::RemoveRedundantWhitespaces(query_lower);
 	}
 
 	// Extract REFRESH EVERY clause before structural rewrite (strips it from the query)
@@ -154,6 +218,7 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Refresh interval: %lld seconds\n", (long long)refresh_interval);
 
 	SqlUtils::ReplaceMaterializedView(query_lower);
+	query_lower += query_body;
 	// All other rewrites (DISTINCT, AVG, LEFT JOIN key, aggregate aliases) are done
 	// at the plan level in PlanFunction via PlanRewrite + LPTS.
 	OPENIVM_DEBUG_PRINT("[CREATE MV] After structural rewrite: %s\n", query_lower.c_str());
@@ -173,6 +238,7 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 	auto &materialized_view_data = dynamic_cast<MaterializedViewParseData &>(*parse_data);
 	materialized_view_data.is_replace = is_replace;
 	materialized_view_data.target_name = SqlUtils::ExtractTableName(query_lower);
+	materialized_view_data.original_query = query;
 	return ParserExtensionParseResult(std::move(parse_data));
 }
 

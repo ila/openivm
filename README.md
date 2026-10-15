@@ -118,6 +118,8 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `openivm_disable_daemon` | BOOLEAN | `false` | Do not start the background refresh daemon at extension load | [Automatic refresh](docs/refresh/automatic-refresh.md) |
 | `openivm_profile_refresh` | BOOLEAN | `false` | Record per-step refresh timings in `openivm_refresh_profile` | [Automatic refresh](docs/refresh/automatic-refresh.md) |
 | `openivm_profile_retention_days` | BIGINT | `31` | Delete profile rows older than this many days when profiling writes new rows | [Automatic refresh](docs/refresh/automatic-refresh.md) |
+| `openivm_metadata_schema` | VARCHAR | empty | Schema for OpenIVM control metadata in each native catalog. Empty keeps existing metadata where it is (`main` for new metadata); a schema name moves existing metadata there on the next `CREATE MATERIALIZED VIEW` or refresh | [Metadata placement](docs/internals/metadata-placement.md) |
+| `openivm_internal_schema` | VARCHAR | empty | Schema for internal maintenance tables (backing, publication, auxiliary-state and delta tables) within each data catalog. Empty keeps them beside the MV and its sources; applies to objects created while set | [Metadata placement](docs/internals/metadata-placement.md#internal-maintenance-objects) |
 | `openivm_files_path` | VARCHAR | — | Directory for compiled SQL reference files (off when unset) | [Build: inspect SQL](docs/build/building.md#inspect-the-generated-sql) |
 | `openivm_explain_initial_load` | BOOLEAN | `false` | Print the `CREATE MATERIALIZED VIEW` initial-load SQL and its `EXPLAIN` plans | [Build: inspect SQL](docs/build/building.md#inspect-the-generated-sql) |
 | `openivm_explain_initial_load_only` | BOOLEAN | `false` | With `openivm_explain_initial_load`, print the diagnostic without creating the MV | — |
@@ -169,16 +171,25 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 - **Can schemas contain same-named views or source tables?** Yes. Use
   `PRAGMA refresh('dl.observation.product_summary')` to identify a view explicitly.
   A short name works when it identifies one MV; ambiguous names produce an error.
-- **Where are internal tables stored?** For DuckLake views, control metadata stays
-  in the native frontend database's `main` schema. MV backing and internal delta
-  tables live in the MV's schema; native source deltas live with their source.
+- **Where are internal tables stored?** Control metadata (`openivm_views`,
+  `openivm_delta_tables`, history, profile, hooks and dependency tables) lives in
+  the native catalog that owns the view — the native frontend database for DuckLake
+  views — in the schema set by `openivm_metadata_schema` (default `main`). MV backing,
+  publication, auxiliary-state and MV delta tables live in the MV's schema; native
+  source deltas live with their source. `SET openivm_internal_schema = 'openivm_internal'`
+  puts newly created internal tables in that schema of each data catalog instead
+  (source deltas get schema-qualified names there). Changing the metadata schema
+  never moves them.
 - **Why are DuckLake delta tables empty?** DuckLake source changes come from
   snapshots. Internal MV delta tables are still created for lifecycle handling
   and can be empty. Leave them in place.
 - **Can metadata stay outside DuckLake?** It already does. Start the built CLI with
   `./build/release/duckdb openivm_frontend.duckdb`, then attach your lake. Reopen
   that frontend and reattach the same lake under the same name in later sessions.
-  A configurable metadata schema such as `openivm` is not implemented; use `main`.
+- **Can control metadata use its own schema?** Yes: `SET openivm_metadata_schema = 'openivm'`.
+  Existing metadata is found where it lives and moved automatically by the next
+  `CREATE MATERIALIZED VIEW` or refresh; do not move OpenIVM tables by hand. See
+  [metadata placement](docs/internals/metadata-placement.md).
 - **Where is the generated SQL?** File export is opt-in. Create an output directory
   and set `openivm_files_path` before CREATE or refresh. Then call
   `PRAGMA openivm_files('dl.observation.product_summary')` to inspect exact paths.

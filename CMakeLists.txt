@@ -135,6 +135,9 @@ if(NOT EMSCRIPTEN)
 
     add_executable(scheduler_catalog_test test/integration/scheduler_catalog_test.cpp)
     target_link_libraries(scheduler_catalog_test ${OPENIVM_LINK_LIBS})
+
+    add_executable(source_delta_publication_test test/integration/source_delta_publication_test.cpp)
+    target_link_libraries(source_delta_publication_test ${OPENIVM_LINK_LIBS})
 endif()
 
 # Benchmark tools are currently supported on Unix native platforms.

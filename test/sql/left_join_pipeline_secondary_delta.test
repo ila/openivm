@@ -10,6 +10,82 @@ require openivm
 statement ok
 SET openivm_cascade_refresh = 'off';
 
+# A transaction-local refresh compiles against committed metadata, where both
+# source deltas are empty. Keep the outer-join transition guard in that reusable
+# plan: deleting both sides of a match otherwise retracts a phantom NULL-padded
+# row as well as the old matched row, leaving a negative-count group behind.
+foreach outcome COMMIT ROLLBACK
+
+statement ok
+CREATE TABLE lj_guard_left(id INTEGER);
+CREATE TABLE lj_guard_right(id INTEGER, val INTEGER);
+INSERT INTO lj_guard_left VALUES (1),(1),(2),(3);
+INSERT INTO lj_guard_right VALUES (1,10),(3,30);
+CREATE MATERIALIZED VIEW lj_guard_mv AS
+SELECT l.id, SUM(r.val) AS total, COUNT(r.id) AS matches, COUNT(*) AS row_count
+FROM lj_guard_left l LEFT JOIN lj_guard_right r USING (id) GROUP BY l.id;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='lj_guard_mv';
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM openivm_delta_lj_guard_left) +
+       (SELECT count(*) FROM openivm_delta_lj_guard_right);
+----
+0
+
+statement ok
+BEGIN;
+DELETE FROM lj_guard_left WHERE id=1;
+DELETE FROM lj_guard_right WHERE id=1;
+INSERT INTO lj_guard_left VALUES (4),(4),(5);
+DELETE FROM lj_guard_left WHERE id=5;
+UPDATE lj_guard_left SET id=4 WHERE id=3;
+INSERT INTO lj_guard_right VALUES (2,20),(4,40),(5,50);
+DELETE FROM lj_guard_right WHERE id=5;
+UPDATE lj_guard_right SET val=41 WHERE id=4;
+
+statement ok
+PRAGMA refresh('lj_guard_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM lj_guard_mv EXCEPT ALL
+     SELECT l.id, SUM(r.val), COUNT(r.id), COUNT(*)
+     FROM lj_guard_left l LEFT JOIN lj_guard_right r USING (id) GROUP BY l.id)
+    UNION ALL
+    (SELECT l.id, SUM(r.val), COUNT(r.id), COUNT(*)
+     FROM lj_guard_left l LEFT JOIN lj_guard_right r USING (id) GROUP BY l.id
+     EXCEPT ALL SELECT * FROM lj_guard_mv)
+);
+----
+0
+
+statement ok
+${outcome};
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM lj_guard_mv EXCEPT ALL
+     SELECT l.id, SUM(r.val), COUNT(r.id), COUNT(*)
+     FROM lj_guard_left l LEFT JOIN lj_guard_right r USING (id) GROUP BY l.id)
+    UNION ALL
+    (SELECT l.id, SUM(r.val), COUNT(r.id), COUNT(*)
+     FROM lj_guard_left l LEFT JOIN lj_guard_right r USING (id) GROUP BY l.id
+     EXCEPT ALL SELECT * FROM lj_guard_mv)
+);
+----
+0
+
+statement ok
+DROP VIEW lj_guard_mv;
+DROP TABLE lj_guard_left;
+DROP TABLE lj_guard_right;
+
+endloop
+
 # ============================================================
 # Setup: cust (preserved) LEFT JOIN ord (intermediate) LEFT JOIN line (inner)
 #   n_ord = COUNT(o.oid)  <- aggregate over the INTERMEDIATE preserved-side column (the buggy case)
@@ -512,8 +588,12 @@ SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61
 ----
 0
 
+# Exact serialized arrays also verify cardinality without the JSON extension.
 query I
-SELECT contains(leftjoin_secondary_meta_json, '"inner_tables":["lj,r"]')::INT
+SELECT (contains(leftjoin_secondary_meta_json, '"inner_tables":["memory.main.\"lj,r\""]')
+        AND contains(leftjoin_secondary_meta_json, '"inner_keys":["id"]')
+        AND contains(leftjoin_secondary_meta_json, '"pres_tables":["memory.main.lj_comma_left"]')
+        AND contains(leftjoin_secondary_meta_json, '"pres_keys":["id"]'))::INT
 FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
 ----
 1
@@ -558,7 +638,7 @@ SELECT COUNT(*) FROM (
 statement ok
 UPDATE openivm_views
 SET leftjoin_secondary_meta_json =
-    replace(leftjoin_secondary_meta_json, '"inner_tables":["lj,r"]', '"inner_table":"lj,r"')
+    replace(leftjoin_secondary_meta_json, '"inner_tables":["memory.main.\"lj,r\""]', '"inner_table":"lj,r"')
 WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
 
 statement ok
@@ -570,7 +650,7 @@ WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
 statement ok
 UPDATE openivm_views
 SET leftjoin_secondary_meta_json =
-    replace(leftjoin_secondary_meta_json, '"pres_tables":["lj_comma_left"]', '"pres_table":"lj_comma_left"')
+    replace(leftjoin_secondary_meta_json, '"pres_tables":["memory.main.lj_comma_left"]', '"pres_table":"lj_comma_left"')
 WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
 
 statement ok
@@ -578,6 +658,20 @@ UPDATE openivm_views
 SET leftjoin_secondary_meta_json =
     replace(leftjoin_secondary_meta_json, '"pres_keys":["id"]', '"pres_key":"id"')
 WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
+
+# Verify the fixture really installed the legacy representation before refreshing.
+query I
+SELECT (contains(leftjoin_secondary_meta_json, '"inner_table":"lj,r"')
+        AND contains(leftjoin_secondary_meta_json, '"inner_key":"id"')
+        AND contains(leftjoin_secondary_meta_json, '"pres_table":"lj_comma_left"')
+        AND contains(leftjoin_secondary_meta_json, '"pres_key":"id"')
+        AND NOT contains(leftjoin_secondary_meta_json, '"inner_tables":')
+        AND NOT contains(leftjoin_secondary_meta_json, '"inner_keys":')
+        AND NOT contains(leftjoin_secondary_meta_json, '"pres_tables":')
+        AND NOT contains(leftjoin_secondary_meta_json, '"pres_keys":'))::INT
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
+----
+1
 
 statement ok
 DELETE FROM "lj,r" WHERE id = 2;

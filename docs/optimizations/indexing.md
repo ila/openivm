@@ -31,9 +31,9 @@ index.
 DuckLake does not support DuckDB-native index types. Group column identification falls
 back to metadata stored in `openivm_views`.
 
-**Qualified or non-default locations:** the index is also skipped when the MV's data
-table is created with a catalog/schema prefix, i.e. when the MV name is qualified or the
-current catalog/schema differs from the metadata catalog's default.
+**Qualified or non-default locations:** the index is also skipped when the MV name is
+qualified or the current schema is not `main` of the view's native catalog. The
+`openivm_metadata_schema` setting does not affect this choice.
 
 ## Zone Maps on `openivm_timestamp`
 

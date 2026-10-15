@@ -21,3 +21,11 @@ test_release_internal: test_scheduler_catalog
 test_scheduler_catalog:
 	cmake --build build/release --target scheduler_catalog_test
 	python3 test/integration/test_scheduler_catalog.py ./build/release/extension/openivm/scheduler_catalog_test
+
+.PHONY: test_source_delta_publication
+
+test_release_internal: test_source_delta_publication
+
+test_source_delta_publication:
+	cmake --build build/release --target source_delta_publication_test
+	python3 test/integration/test_source_delta_publication.py ./build/release/extension/openivm/source_delta_publication_test

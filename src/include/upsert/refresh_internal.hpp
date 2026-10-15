@@ -36,6 +36,9 @@ struct DuckLakeSourceLocation {
 	string table_name;
 };
 
+string BuildDuckLakeSignedDeltaRelation(const DuckLakeSourceLocation &loc, int64_t last_snapshot_id,
+                                        int64_t current_snapshot_id);
+
 struct DuckLakeSourceSpec {
 	string metadata_key;
 	DuckLakeSourceLocation loc;
@@ -179,12 +182,14 @@ string BuildSnapshotDeltaRefreshSQL(const string &data_table, const string &quer
                                     const string &old_table, const string &new_table, const string &filter);
 bool IsSummableLogicalType(const LogicalType &type);
 string NormalizeColumnNameForMatch(const string &name);
+// Resolve a logical source to its metadata key using catalog and schema as well as its name.
+string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &view_name, const string &table_name,
+                               const vector<string> &delta_table_names);
 string BaseTableNameFromDeltaKey(const string &delta_key);
 string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec);
 string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &view_name,
                                      const vector<string> &delta_table_names, const vector<string> &group_columns,
-                                     const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs,
-                                     const string &lpts_table_prefix);
+                                     const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs);
 string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
                                  const string &extra_predicate = "");
 
@@ -194,7 +199,7 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
                            bool cross_system, const string &attached_catalog = "", const string &attached_schema = "",
                            const string &catalog_prefix = "", const string &metadata_prefix = "",
                            string *out_post_meta = nullptr, vector<string> *deferred_cleanup = nullptr,
-                           const vector<string> &metadata_catalogs = {});
+                           const vector<string> &delta_metadata_tables = {});
 
 string BuildFullOuterAffectedGroupRefresh(RefreshMetadata &metadata, const string &view_name,
                                           const vector<string> &delta_table_names, const vector<string> &group_cols,

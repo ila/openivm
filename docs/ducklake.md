@@ -44,7 +44,10 @@ schemas can contain views with the same name. Use a qualified name when refreshi
 or inspecting one of those views:
 
 ```sql
--- Control metadata stays in the native frontend database's main schema.
+-- Control metadata stays in the native frontend database, in main unless
+-- openivm_metadata_schema selects another schema. Find that schema first:
+SELECT database_name, schema_name FROM duckdb_tables() WHERE table_name = 'openivm_views';
+-- then, for example with the default schema:
 SELECT view_sql_name, view_catalog, view_schema, view_name AS internal_key
 FROM main.openivm_views;
 PRAGMA refresh('dl.observation.product_summary');
@@ -80,7 +83,9 @@ ORDER BY database_name, schema_name, table_name;
 
 For DuckLake MVs, OpenIVM's control tables (`openivm_views`,
 `openivm_delta_tables`, dependency and refresh-history tables) already live in
-`main` of the native DuckDB frontend database, not as Parquet tables in DuckLake.
+the native DuckDB frontend database, not as Parquet tables in DuckLake. They use
+its `main` schema unless `openivm_metadata_schema` selects another one; that
+setting never moves the MV's DuckLake tables.
 Start the CLI with a persistent frontend file to retain them between sessions:
 
 ```bash
@@ -90,9 +95,10 @@ Start the CLI with a persistent frontend file to retain them between sessions:
 Then attach the lake and create views in its catalog as in the quick start. After
 reopening the same frontend file, attach the same lake under the same catalog name
 before refreshing. Starting the CLI without a filename uses an in-memory frontend;
-its OpenIVM metadata will not survive closing the process. There is currently no
-setting to relocate OpenIVM control tables into an `openivm` schema. Do not move
-those tables manually.
+its OpenIVM metadata will not survive closing the process. To keep control tables
+in a dedicated schema, `SET openivm_metadata_schema = 'openivm'`; OpenIVM moves
+existing metadata there itself. Do not move those tables manually. See
+[metadata placement](internals/metadata-placement.md).
 
 For native sources in another attached DuckDB database, refresh commits the MV
 and its watermark together, then cleans up external source deltas. Rollback

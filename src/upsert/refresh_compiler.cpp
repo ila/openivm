@@ -1553,7 +1553,7 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 			const string &source_full = spec.source_sql;
 			string source_ref = SqlUtils::FindTableReference(view_query_sql, source_full);
 			if (source_ref.empty()) {
-				source_ref = SqlUtils::FindTableReference(view_query_sql, base);
+				source_ref = SqlUtils::FindTableReference(view_query_sql, SqlUtils::QuoteIdentifier(base));
 			}
 			D_ASSERT(!source_ref.empty());
 			string restricted_source = "(SELECT * FROM " + source_ref + " AS openivm_src WHERE EXISTS (SELECT 1 FROM " +
