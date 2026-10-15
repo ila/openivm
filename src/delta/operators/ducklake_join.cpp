@@ -145,55 +145,6 @@ static bool DuckLakeDeltaKeyHasMatch(Connection &con, const string &catalog, con
 	return result->GetValue(0, 0).GetValue<bool>();
 }
 
-static bool PathStartsWith(const vector<size_t> &path, const vector<size_t> &prefix) {
-	// Equality is the exact-path case; reversing the guard would let std::equal read beyond path.
-	return path.size() >= prefix.size() && // mull-ignore: cxx_ge_to_gt,cxx_ge_to_lt
-	       std::equal(prefix.begin(), prefix.end(), path.begin());
-}
-
-static void DemoteOuterJoinsForLeaf(LogicalOperator *node, const vector<size_t> &leaf_path, vector<size_t> &path) {
-	if (auto *join = dynamic_cast<LogicalJoin *>(node)) {
-		bool left_has_delta = false;
-		bool right_has_delta = false;
-		path.push_back(0);
-		left_has_delta = PathStartsWith(leaf_path, path);
-		path.pop_back();
-		path.push_back(1);
-		right_has_delta = PathStartsWith(leaf_path, path);
-		path.pop_back();
-
-		bool demote = false;
-		switch (join->join_type) {
-		case JoinType::LEFT:
-			demote = right_has_delta;
-			break;
-		case JoinType::RIGHT:
-			demote = left_has_delta;
-			break;
-		case JoinType::OUTER:
-			demote = left_has_delta || right_has_delta;
-			break;
-		default:
-			break;
-		}
-		if (demote) {
-			join->join_type = JoinType::INNER;
-		}
-	}
-	// This planner traversal must visit [0, child_count); >= disables it and <= indexes one past children.
-	for (size_t child_idx = 0; child_idx < node->children.size(); // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
-	     child_idx++) {
-		path.push_back(child_idx);
-		DemoteOuterJoinsForLeaf(node->children[child_idx].get(), leaf_path, path);
-		path.pop_back();
-	}
-}
-
-static void DemoteOuterJoinsForLeaf(LogicalOperator *node, const vector<size_t> &leaf_path) {
-	vector<size_t> path;
-	DemoteOuterJoinsForLeaf(node, leaf_path, path);
-}
-
 static idx_t FindBindingPosition(LogicalOperator &op, const ColumnBinding &binding, const char *context_label) {
 	auto bindings = op.GetColumnBindings();
 	// The <= mutant indexes one past bindings.
@@ -455,8 +406,8 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		// term's delta. Preserved joins elsewhere in a left-deep star must remain
 		// outer joins so unmatched rows continue to flow to later dimensions.
 		if (has_left_join) {
-			if (flattened_leaves) {
-				DemoteOuterJoinsForLeaf(term.get(), leaves[i].path);
+			if (flattened_leaves || input.context.model.type == RefreshType::SIMPLE_PROJECTION) {
+				DemoteOuterJoinsForMask(term.get(), leaves, (1ULL << i), input.context.model.type);
 			} else if (leaves[i].is_right_of_left_join) {
 				DemoteLeftJoins(term.get());
 			}

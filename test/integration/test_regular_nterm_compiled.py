@@ -382,6 +382,40 @@ UPDATE full_d SET label='updated' WHERE k=2;
 SELECT p.id,p.b_label,d.label FROM p LEFT JOIN full_d d ON p.lookup_key=d.k""",
         )
 
+        run_scenario(
+            binary,
+            root,
+            "full_join_chain_unmatched_delta",
+            """
+CREATE TABLE chain_a(id INT,k INT);
+CREATE TABLE chain_b(k INT,v INT);
+CREATE TABLE chain_d(id INT,v INT);
+INSERT INTO chain_a VALUES (1,1);
+INSERT INTO chain_d VALUES (2,12),(3,13);
+CREATE MATERIALIZED VIEW chain_mv AS
+WITH p AS (
+    SELECT a.id,COALESCE(a.k,b.k) AS k,b.v
+    FROM chain_a a FULL JOIN chain_b b ON a.k=b.k
+)
+SELECT p.id,p.v,d.v AS dv FROM p FULL JOIN chain_d d ON p.k=d.id;
+INSERT INTO chain_b VALUES (2,99),(3,30),(3,30),(4,40);
+UPDATE chain_b SET v=0 WHERE k=2;
+DELETE FROM chain_b WHERE k=4;
+""",
+            "chain_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+                "delta_shape": {"chain_a": "UNCHANGED", "chain_b": "MIXED", "chain_d": "UNCHANGED"},
+            },
+            """WITH p AS (
+    SELECT a.id,COALESCE(a.k,b.k) AS k,b.v
+    FROM chain_a a FULL JOIN chain_b b ON a.k=b.k
+)
+SELECT p.id,p.v,d.v AS dv FROM p FULL JOIN chain_d d ON p.k=d.id""",
+        )
+
     print("regular N-term compiled SQL integration tests passed")
 
 
