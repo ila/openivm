@@ -347,6 +347,41 @@ UPDATE scalar_d SET label='new_d3' WHERE id=3;
 SELECT p.id,p.b_label,d.label FROM p LEFT JOIN scalar_d d ON p.sid=d.id""",
         )
 
+        run_scenario(
+            binary,
+            root,
+            "nested_full_lookup_mixed",
+            """
+CREATE TABLE full_a(id INT,k INT);
+CREATE TABLE full_b(k INT,label VARCHAR);
+CREATE TABLE full_d(k INT,label VARCHAR);
+INSERT INTO full_a VALUES (1,1),(2,2),(3,3);
+INSERT INTO full_b VALUES (1,'one'),(2,'two'),(4,'four');
+INSERT INTO full_d VALUES (1,'d1'),(2,'d2'),(3,'d3'),(4,'d4');
+CREATE MATERIALIZED VIEW full_lookup_mv AS
+WITH p AS (
+    SELECT a.id,COALESCE(a.k,b.k) AS lookup_key,b.label AS b_label
+    FROM full_a a FULL JOIN full_b b ON a.k=b.k
+)
+SELECT p.id,p.b_label,d.label FROM p LEFT JOIN full_d d ON p.lookup_key=d.k;
+UPDATE full_d SET label='temporary' WHERE k=1;
+DELETE FROM full_d WHERE k=1;
+INSERT INTO full_d VALUES (1,'replaced');
+UPDATE full_d SET label='updated' WHERE k=2;
+""",
+            "full_lookup_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+            },
+            """WITH p AS (
+    SELECT a.id,COALESCE(a.k,b.k) AS lookup_key,b.label AS b_label
+    FROM full_a a FULL JOIN full_b b ON a.k=b.k
+)
+SELECT p.id,p.b_label,d.label FROM p LEFT JOIN full_d d ON p.lookup_key=d.k""",
+        )
+
     print("regular N-term compiled SQL integration tests passed")
 
 

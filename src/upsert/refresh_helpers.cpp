@@ -785,6 +785,17 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 	return query + update_ts + "\n" + delta_cleanup;
 }
 
+static string BuildGuardedDeltaWhere(const string &delta_ts_filter, const string &extra_predicate) {
+	string predicate = delta_ts_filter;
+	if (!extra_predicate.empty()) {
+		if (!predicate.empty()) {
+			predicate += " AND ";
+		}
+		predicate += extra_predicate;
+	}
+	return predicate.empty() ? "" : " WHERE " + predicate;
+}
+
 static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const string &view_name,
                                               const vector<string> &delta_table_names, const string &data_table,
                                               const string &view_query_sql, const string &delta_ts_filter,
@@ -817,6 +828,15 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 	string where_clause;
 	string affected_ctes;
 	if (!union_parts.empty()) {
+		// Base keys cover NULL-padding transitions at the FULL JOIN. The view delta
+		// also carries keys affected by other inputs, such as a downstream lookup.
+		string qdv = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
+		// A non-NULL key already scopes its row. Adding the other, NULL slot would
+		// refresh unrelated unmatched rows too. Retain the all-NULL key pairs.
+		string left_where = BuildGuardedDeltaWhere(delta_ts_filter, "(" + lk + " IS NOT NULL OR " + rk + " IS NULL)");
+		string right_where = BuildGuardedDeltaWhere(delta_ts_filter, "(" + rk + " IS NOT NULL OR " + lk + " IS NULL)");
+		union_parts += "\n  UNION\n  SELECT " + lk + " AS _k FROM " + qdv + left_where + "\n  UNION\n  SELECT " + rk +
+		               " AS _k FROM " + qdv + right_where;
 		affected_ctes = "WITH openivm_affected AS (\n  " + union_parts + "\n)\n";
 		where_clause = "EXISTS (SELECT 1 FROM openivm_affected WHERE _k IS NOT DISTINCT FROM " + lk +
 		               " OR _k IS NOT DISTINCT FROM " + rk + ")";
@@ -826,17 +846,6 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 
 	return BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_foj", where_clause, where_clause,
 	                                   affected_ctes);
-}
-
-static string BuildGuardedDeltaWhere(const string &delta_ts_filter, const string &extra_predicate) {
-	string predicate = delta_ts_filter;
-	if (!extra_predicate.empty()) {
-		if (!predicate.empty()) {
-			predicate += " AND ";
-		}
-		predicate += extra_predicate;
-	}
-	return predicate.empty() ? "" : " WHERE " + predicate;
 }
 
 static string BuildLeftJoinLineagePushedQuery(const string &view_query_sql, const string &affected_source,

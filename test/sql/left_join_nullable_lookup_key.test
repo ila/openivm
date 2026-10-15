@@ -886,3 +886,120 @@ query I
 SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_nullable_case) EXCEPT ALL (SELECT * FROM expr_nullable_case));
 ----
 0
+
+# Repeated references form a small projection DAG, not an exponentially
+# expanded lineage tree. Keep this workload deterministic without timing gates.
+
+statement ok
+CREATE TABLE deep_key_a(id BIGINT,k INTEGER);
+
+statement ok
+CREATE TABLE deep_key_b(k INTEGER,label VARCHAR);
+
+statement ok
+CREATE TABLE deep_key_d(id BIGINT,label VARCHAR);
+
+statement ok
+INSERT INTO deep_key_a VALUES (1,NULL),(1,NULL),(2,2);
+
+statement ok
+INSERT INTO deep_key_b VALUES (0,'first'),(2,'second');
+
+statement ok
+INSERT INTO deep_key_d VALUES (67108864,'d1'),(134217728,'d2');
+
+statement ok
+CREATE VIEW expected_deep_key AS WITH deep0 AS (SELECT a.id,a.id AS sid,COALESCE(b.label,'default') AS b_label FROM deep_key_a a LEFT JOIN deep_key_b b ON COALESCE(a.k,0)=b.k),
+deep1 AS (SELECT id,sid+sid AS sid,b_label FROM deep0),
+deep2 AS (SELECT id,sid+sid AS sid,b_label FROM deep1),
+deep3 AS (SELECT id,sid+sid AS sid,b_label FROM deep2),
+deep4 AS (SELECT id,sid+sid AS sid,b_label FROM deep3),
+deep5 AS (SELECT id,sid+sid AS sid,b_label FROM deep4),
+deep6 AS (SELECT id,sid+sid AS sid,b_label FROM deep5),
+deep7 AS (SELECT id,sid+sid AS sid,b_label FROM deep6),
+deep8 AS (SELECT id,sid+sid AS sid,b_label FROM deep7),
+deep9 AS (SELECT id,sid+sid AS sid,b_label FROM deep8),
+deep10 AS (SELECT id,sid+sid AS sid,b_label FROM deep9),
+deep11 AS (SELECT id,sid+sid AS sid,b_label FROM deep10),
+deep12 AS (SELECT id,sid+sid AS sid,b_label FROM deep11),
+deep13 AS (SELECT id,sid+sid AS sid,b_label FROM deep12),
+deep14 AS (SELECT id,sid+sid AS sid,b_label FROM deep13),
+deep15 AS (SELECT id,sid+sid AS sid,b_label FROM deep14),
+deep16 AS (SELECT id,sid+sid AS sid,b_label FROM deep15),
+deep17 AS (SELECT id,sid+sid AS sid,b_label FROM deep16),
+deep18 AS (SELECT id,sid+sid AS sid,b_label FROM deep17),
+deep19 AS (SELECT id,sid+sid AS sid,b_label FROM deep18),
+deep20 AS (SELECT id,sid+sid AS sid,b_label FROM deep19),
+deep21 AS (SELECT id,sid+sid AS sid,b_label FROM deep20),
+deep22 AS (SELECT id,sid+sid AS sid,b_label FROM deep21),
+deep23 AS (SELECT id,sid+sid AS sid,b_label FROM deep22),
+deep24 AS (SELECT id,sid+sid AS sid,b_label FROM deep23),
+deep25 AS (SELECT id,sid+sid AS sid,b_label FROM deep24),
+deep26 AS (SELECT id,sid+sid AS sid,b_label FROM deep25)
+SELECT p.id,p.b_label,d.label FROM deep26 p LEFT JOIN deep_key_d d ON p.sid=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW deep_key_mv AS WITH deep0 AS (SELECT a.id,a.id AS sid,COALESCE(b.label,'default') AS b_label FROM deep_key_a a LEFT JOIN deep_key_b b ON COALESCE(a.k,0)=b.k),
+deep1 AS (SELECT id,sid+sid AS sid,b_label FROM deep0),
+deep2 AS (SELECT id,sid+sid AS sid,b_label FROM deep1),
+deep3 AS (SELECT id,sid+sid AS sid,b_label FROM deep2),
+deep4 AS (SELECT id,sid+sid AS sid,b_label FROM deep3),
+deep5 AS (SELECT id,sid+sid AS sid,b_label FROM deep4),
+deep6 AS (SELECT id,sid+sid AS sid,b_label FROM deep5),
+deep7 AS (SELECT id,sid+sid AS sid,b_label FROM deep6),
+deep8 AS (SELECT id,sid+sid AS sid,b_label FROM deep7),
+deep9 AS (SELECT id,sid+sid AS sid,b_label FROM deep8),
+deep10 AS (SELECT id,sid+sid AS sid,b_label FROM deep9),
+deep11 AS (SELECT id,sid+sid AS sid,b_label FROM deep10),
+deep12 AS (SELECT id,sid+sid AS sid,b_label FROM deep11),
+deep13 AS (SELECT id,sid+sid AS sid,b_label FROM deep12),
+deep14 AS (SELECT id,sid+sid AS sid,b_label FROM deep13),
+deep15 AS (SELECT id,sid+sid AS sid,b_label FROM deep14),
+deep16 AS (SELECT id,sid+sid AS sid,b_label FROM deep15),
+deep17 AS (SELECT id,sid+sid AS sid,b_label FROM deep16),
+deep18 AS (SELECT id,sid+sid AS sid,b_label FROM deep17),
+deep19 AS (SELECT id,sid+sid AS sid,b_label FROM deep18),
+deep20 AS (SELECT id,sid+sid AS sid,b_label FROM deep19),
+deep21 AS (SELECT id,sid+sid AS sid,b_label FROM deep20),
+deep22 AS (SELECT id,sid+sid AS sid,b_label FROM deep21),
+deep23 AS (SELECT id,sid+sid AS sid,b_label FROM deep22),
+deep24 AS (SELECT id,sid+sid AS sid,b_label FROM deep23),
+deep25 AS (SELECT id,sid+sid AS sid,b_label FROM deep24),
+deep26 AS (SELECT id,sid+sid AS sid,b_label FROM deep25)
+SELECT p.id,p.b_label,d.label FROM deep26 p LEFT JOIN deep_key_d d ON p.sid=d.id;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='deep_key_mv';
+----
+2
+
+statement ok
+UPDATE deep_key_b SET label='temporary' WHERE k=0;
+
+statement ok
+DELETE FROM deep_key_b WHERE k=0;
+
+statement ok
+INSERT INTO deep_key_a VALUES (4,NULL);
+
+statement ok
+UPDATE deep_key_a SET k=2 WHERE id=4;
+
+statement ok
+DELETE FROM deep_key_a WHERE id=4;
+
+statement ok
+UPDATE deep_key_d SET label='new_d1' WHERE id=67108864;
+
+statement ok
+PRAGMA refresh('deep_key_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM deep_key_mv) EXCEPT ALL (SELECT * FROM expected_deep_key));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_deep_key) EXCEPT ALL (SELECT * FROM deep_key_mv));
+----
+0
