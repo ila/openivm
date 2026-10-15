@@ -132,3 +132,63 @@ query I
 SELECT count(*) FROM openivm_views WHERE view_sql_name='my materialized view';
 ----
 0
+
+# A quoted name or string literal containing "alter materialized view" is not an ALTER statement
+statement ok
+CREATE MATERIALIZED VIEW "alter materialized view x" AS SELECT i FROM source WHERE i<=2;
+
+query T
+SELECT view_name FROM duckdb_views() WHERE view_name LIKE 'alter%';
+----
+alter materialized view x
+
+statement ok
+INSERT INTO source VALUES (1);
+
+statement ok
+PRAGMA refresh('"alter materialized view x"');
+
+query I
+SELECT count(*) FROM (SELECT * FROM "alter materialized view x" EXCEPT ALL SELECT i FROM source WHERE i<=2);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i FROM source WHERE i<=2 EXCEPT ALL SELECT * FROM "alter materialized view x");
+----
+0
+
+statement ok
+DROP VIEW "alter materialized view x";
+
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name='alter materialized view x';
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW str_alter_mv AS SELECT i, 'alter materialized view' AS s FROM source;
+
+statement ok
+INSERT INTO source VALUES (7);
+
+statement ok
+PRAGMA refresh('str_alter_mv');
+
+query I
+SELECT count(*) FROM (SELECT * FROM str_alter_mv EXCEPT ALL SELECT i, 'alter materialized view' FROM source);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i, 'alter materialized view' FROM source EXCEPT ALL SELECT * FROM str_alter_mv);
+----
+0
+
+statement ok
+DROP VIEW str_alter_mv;
+
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name='str_alter_mv';
+----
+0

@@ -96,7 +96,8 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 	SqlUtils::RemoveRedundantWhitespaces(query_lower);
 
 	// Handle ALTER MATERIALIZED VIEW <name> SET REFRESH EVERY '<interval>' | SET REFRESH MANUAL
-	if (StringUtil::Contains(query_lower, "alter materialized view")) {
+	// Decided from the statement header only; text inside quoted names or strings must not trigger it.
+	if (std::regex_search(query_lower, std::regex("^\\s*alter\\s+materialized\\s+view\\b"))) {
 		const string identifier = "(?:\"(?:[^\"]|\"\")*\"|[a-zA-Z_][a-zA-Z0-9_$]*)";
 		const string qualified_identifier = identifier + "(?:\\s*\\.\\s*" + identifier + "){0,2}";
 		std::regex alter_re("^alter\\s+materialized\\s+view\\s+(" + qualified_identifier +
