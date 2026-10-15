@@ -2,6 +2,11 @@
 # description: DuckLake DROP VIEW ... CASCADE searches every metadata catalog but drops only its own consumers (#126)
 # group: [sql]
 
+# DuckLake MVs always register in the database's default native catalog, even after
+# USE of another database, so a DuckLake parent and DuckLake child cannot have
+# different metadata owners. The cascade below therefore also searches peer's
+# metadata, which registers same-named native views that must be left alone.
+
 require openivm
 
 require parquet

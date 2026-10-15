@@ -2036,6 +2036,9 @@ static void AppendUnusedSourceDropProgram(Connection &con, const vector<RefreshM
 	}
 }
 
+// Returned by DROP rewrites that already applied their cleanup.
+static constexpr const char *EXECUTED_DROP_PROGRAM = "SELECT true AS Success";
+
 static string ExecuteAutocommitDropProgram(Connection &con, const string &program) {
 	con.BeginTransaction();
 	try {
@@ -2051,10 +2054,22 @@ static string ExecuteAutocommitDropProgram(Connection &con, const string &progra
 		}
 		throw;
 	}
-	return "SELECT true AS Success";
+	return EXECUTED_DROP_PROGRAM;
 }
 
-static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop_info) {
+// OpenIVM owns nothing for the target: run DuckDB's own DROP. Batched statements
+// execute that drop themselves, so they also receive the resolved entry.
+static string PlainDropProgram(const DropInfo &drop_info, unique_ptr<DropInfo> *plain_drop) {
+	if (plain_drop) {
+		*plain_drop = make_uniq<DropInfo>(drop_info);
+	}
+	return (drop_info.type == CatalogType::VIEW_ENTRY ? BuildDropViewStatement(drop_info)
+	                                                  : BuildDropTableStatement(drop_info)) +
+	       ";\n";
+}
+
+static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop_info,
+                                          unique_ptr<DropInfo> *plain_drop) {
 	unique_ptr<MutationLockGuard> autocommit_guard;
 	if (context.transaction.IsAutoCommit()) {
 		autocommit_guard = make_uniq<MutationLockGuard>(context);
@@ -2083,7 +2098,7 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	// Lifecycle/refresh programs own their internal state cleanup. They are not
 	// source-table deletions and must not produce a second set of retractions.
 	if (!table_entry || SqlUtils::IsDelta(drop_info.name) || IncrementalTableNames::IsDataTable(drop_info.name)) {
-		return BuildDropTableStatement(drop_info) + ";\n";
+		return PlainDropProgram(drop_info, plain_drop);
 	}
 
 	Connection con(*context.db);
@@ -2123,7 +2138,7 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 		}
 	}
 	if (direct_views.empty()) {
-		return BuildDropTableStatement(drop_info) + ";\n";
+		return PlainDropProgram(drop_info, plain_drop);
 	}
 	auto dependent_views = CollectCascadeDropViews(connections, catalogs, direct_views, "", "");
 	auto statement = "DROP TABLE " + drop_info.catalog + "." + drop_info.schema + "." + drop_info.name + " CASCADE";
@@ -2149,7 +2164,7 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	if (context.transaction.IsAutoCommit()) {
 		if (staged_drop) {
 			ExecuteStagedDDL(context, {Value(program)});
-			return "SELECT true AS Success";
+			return EXECUTED_DROP_PROGRAM;
 		}
 		return ExecuteAutocommitDropProgram(con, program);
 	}
@@ -2161,8 +2176,10 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	return program;
 }
 
-string MaterializedViewDropQuery(ClientContext &context, const FunctionParameters &parameters) {
-	auto query = StringValue::Get(parameters.values[0]);
+// Returns the program that performs `query`, or EXECUTED_DROP_PROGRAM when the
+// cleanup has already run. `plain_drop` receives the resolved entry when OpenIVM
+// owns nothing for the target.
+static string BuildDropProgram(ClientContext &context, const string &query, unique_ptr<DropInfo> *plain_drop) {
 	ParserOptions options = context.GetParserOptions();
 	options.extensions = nullptr;
 	Parser parser(options);
@@ -2173,7 +2190,7 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	auto &drop = parser.statements[0]->Cast<DropStatement>();
 	Binder::BindSchemaOrCatalog(context, drop.info->catalog, drop.info->schema);
 	if (drop.info->type == CatalogType::TABLE_ENTRY) {
-		return BuildSourceDropTableProgram(context, *drop.info);
+		return BuildSourceDropTableProgram(context, *drop.info, plain_drop);
 	}
 	if (drop.info->type != CatalogType::VIEW_ENTRY) {
 		throw InternalException("OpenIVM DROP rewrite expected DROP VIEW");
@@ -2216,9 +2233,8 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	}
 	auto view_key = RefreshMetadata(con).FindViewKey(catalog_name, schema_name, drop.info->name);
 	if (view_key.empty()) {
-		return BuildDropViewStatement(*drop.info) + ";\n";
+		return PlainDropProgram(*drop.info, plain_drop);
 	}
-	string program = BuildDropViewStatement(*drop.info) + ";\n";
 	string data_table_name = IncrementalTableNames::DataTableName(view_key);
 	string data_table_ref;
 	if (view_entry) {
@@ -2238,12 +2254,12 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 		                    SqlUtils::EscapeValue(view_key) + "'");
 	}
 	if (data_table_ref.empty() || tracked->HasError() || tracked->RowCount() == 0) {
-		return program;
+		return PlainDropProgram(*drop.info, plain_drop);
 	}
 	if (!legacy_identity && !tracked->GetValue(0, 0).IsNull() && !tracked->GetValue(1, 0).IsNull()) {
 		if (!StringUtil::CIEquals(tracked->GetValue(0, 0).ToString(), catalog_name) ||
 		    !StringUtil::CIEquals(tracked->GetValue(1, 0).ToString(), schema_name)) {
-			return program;
+			return PlainDropProgram(*drop.info, plain_drop);
 		}
 	} else {
 		// Rows created before target identity was persisted can only be cleaned
@@ -2253,7 +2269,7 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 		string default_schema = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
 		if (!StringUtil::CIEquals(default_entry.catalog, catalog_name) ||
 		    !StringUtil::CIEquals(default_schema, schema_name)) {
-			return program;
+			return PlainDropProgram(*drop.info, plain_drop);
 		}
 	}
 
@@ -2276,7 +2292,7 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	}
 	auto statement = "DROP VIEW " + catalog_name + "." + schema_name + "." + drop.info->name + " CASCADE";
 	RejectCrossCatalogCascadeInTransaction(context, connections, drop_views, statement);
-	program.clear();
+	string program;
 	vector<RefreshMetadata::DeltaSource> delta_sources;
 	DroppedViewsByCatalog excluded_views;
 	vector<std::pair<string, string>> view_programs;
@@ -2308,7 +2324,7 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 		OPENIVM_DEBUG_PRINT("[DROP] Staging cleanup of %zu views across catalogs for '%s'\n", drop_views.size(),
 		                    drop.info->name.c_str());
 		ExecuteStagedDDL(context, {Value(program)});
-		return "SELECT true AS Success";
+		return EXECUTED_DROP_PROGRAM;
 	}
 	TransactionalMVLockState::Get(context).AcquireMutationLock();
 	if (!context.transaction.IsAutoCommit()) {
@@ -2319,5 +2335,121 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 		}
 	}
 	return program;
+}
+
+string MaterializedViewDropQuery(ClientContext &context, const FunctionParameters &parameters) {
+	return BuildDropProgram(context, StringValue::Get(parameters.values[0]), nullptr);
+}
+
+struct BatchedStatementBindData : public TableFunctionData {
+	string sql;
+	bool lifecycle = false;
+	vector<Value> ddl;
+};
+
+struct BatchedStatementState : public GlobalTableFunctionState {
+	bool finished = false;
+};
+
+// Pragma expansion resolves every statement of a query string before the first one
+// runs. Here a lifecycle statement is planned when bound, like the parser-extension
+// path, and a DROP resolves its dependents when executed, after earlier statements.
+static unique_ptr<FunctionData> BindBatchedStatement(ClientContext &context, TableFunctionBindInput &input,
+                                                     vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<BatchedStatementBindData>();
+	result->sql = StringValue::Get(input.inputs[0]);
+	auto parse_result = ParseMaterializedViewStatement(result->sql, OpenIvmInputDialect(context));
+	if (parse_result.type == ParserExtensionResultType::PARSE_SUCCESSFUL) {
+		result->lifecycle = true;
+		string view_key;
+		auto plan_result = PlanMaterializedView(context, std::move(parse_result.parse_data), view_key);
+		for (auto &parameter : plan_result.parameters) {
+			if (!parameter.GetValue<string>().empty()) {
+				result->ddl.push_back(parameter);
+			}
+		}
+	} else {
+		ParserOptions options = context.GetParserOptions();
+		options.extensions = nullptr;
+		Parser parser(options);
+		parser.ParseQuery(result->sql);
+		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::DROP_STATEMENT) {
+			throw InvalidInputException("%s expects one materialized-view or DROP statement",
+			                            OPENIVM_BATCHED_STATEMENT_FUNCTION);
+		}
+		// Without OpenIVM state the DROP runs in the caller's transaction, as DuckDB's would.
+		auto &info = *parser.statements[0]->Cast<DropStatement>().info;
+		Binder::BindSchemaOrCatalog(context, info.catalog, info.schema);
+		QueryErrorContext error_context;
+		auto entry =
+		    Catalog::GetEntry(context, info.catalog, info.schema, EntryLookupInfo(info.type, info.name, error_context),
+		                      OnEntryNotFound::RETURN_NULL);
+		auto catalog_name = entry ? entry->ParentCatalog().GetName() : info.catalog;
+		if (catalog_name.empty()) {
+			auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
+			catalog_name =
+			    default_entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : default_entry.catalog;
+		}
+		if (input.binder) {
+			input.binder->GetStatementProperties().RegisterDBModify(Catalog::GetCatalog(context, catalog_name), context,
+			                                                        DatabaseModificationType::DROP_CATALOG_ENTRY);
+		}
+	}
+	return_types.push_back(LogicalType::BOOLEAN);
+	names.emplace_back("Success");
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> InitBatchedStatement(ClientContext &context,
+                                                                 TableFunctionInitInput &input) {
+	return make_uniq<BatchedStatementState>();
+}
+
+static void ExecuteBatchedStatement(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &state = input.global_state->Cast<BatchedStatementState>();
+	if (state.finished) {
+		return;
+	}
+	auto &bind_data = input.bind_data->Cast<BatchedStatementBindData>();
+	if (bind_data.lifecycle) {
+		// Same execution as the parser-extension path for a batched lifecycle statement.
+		ExecuteStagedDDL(context, bind_data.ddl);
+	} else {
+		unique_ptr<DropInfo> plain_drop;
+		auto program = BuildDropProgram(context, bind_data.sql, &plain_drop);
+		if (plain_drop) {
+			Catalog::GetCatalog(context, plain_drop->catalog).DropEntry(context, *plain_drop);
+		} else if (program != EXECUTED_DROP_PROGRAM) {
+			if (!context.transaction.IsAutoCommit()) {
+				// The program belongs to the caller's transaction, which a helper cannot join.
+				throw TransactionException("OpenIVM cannot run %s from a multi-statement query inside an explicit "
+				                           "transaction. Send this DROP as its own statement.",
+				                           bind_data.sql);
+			}
+			// A standalone DROP runs this program in the caller's current catalog and
+			// schema. Select the same location and apply the program atomically.
+			auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
+			string catalog =
+			    default_entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : default_entry.catalog;
+			string schema = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
+			vector<Value> ddl;
+			ddl.emplace_back("USE " + SqlUtils::QuoteIdentifier(catalog) + "." + SqlUtils::QuoteIdentifier(schema));
+			ddl.emplace_back("BEGIN TRANSACTION");
+			for (auto &statement : SqlUtils::SplitSQLStatements(program)) {
+				ddl.emplace_back(statement);
+			}
+			ddl.emplace_back("COMMIT");
+			OPENIVM_DEBUG_PRINT("[BATCH] Applying %zu DROP statements at their turn\n", ddl.size());
+			ExecuteStagedDDL(context, ddl);
+		}
+	}
+	output.SetValue(0, 0, Value::BOOLEAN(true));
+	output.SetCardinality(1);
+	state.finished = true;
+}
+
+TableFunction BatchedStatementFunction() {
+	return TableFunction(OPENIVM_BATCHED_STATEMENT_FUNCTION, {LogicalType::VARCHAR}, ExecuteBatchedStatement,
+	                     BindBatchedStatement, InitBatchedStatement);
 }
 } // namespace duckdb

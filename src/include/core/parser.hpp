@@ -57,6 +57,11 @@ void SetOpenIvmInputDialect(ClientContext &context, SetScope scope, Value &param
 string MaterializedViewLifecycleQuery(ClientContext &context, const FunctionParameters &parameters);
 string MaterializedViewDropQuery(ClientContext &context, const FunctionParameters &parameters);
 
+//! Runs one OpenIVM statement of a multi-statement query when its turn comes, after
+//! the statements before it in the same query string have executed.
+constexpr const char *OPENIVM_BATCHED_STATEMENT_FUNCTION = "openivm_execute_batched_statement";
+TableFunction BatchedStatementFunction();
+
 struct MaterializedViewParseData : ParserExtensionParseData {
 	unique_ptr<SQLStatement> statement;
 	int64_t refresh_interval = -1; // seconds, -1 = not specified (manual only)
