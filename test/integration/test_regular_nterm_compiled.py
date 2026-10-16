@@ -474,6 +474,69 @@ p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM normalized a FULL JOIN scal
 SELECT p.id,d.label FROM p FULL JOIN scalar_pad_d d ON p.lookup_key=d.k""",
         )
 
+        run_scenario(
+            binary,
+            root,
+            "full_join_multisource_replacement_key",
+            """
+CREATE TABLE rel_a(id INT,k INT);
+CREATE TABLE rel_b(k INT);
+CREATE TABLE rel_d(k INT,v INT);
+CREATE TABLE rel_e(k INT,label VARCHAR);
+INSERT INTO rel_a VALUES (1,1),(2,2);
+INSERT INTO rel_b VALUES (1),(2);
+INSERT INTO rel_d VALUES (1,2),(2,3);
+INSERT INTO rel_e VALUES (0,'default'),(2,'old'),(3,'kept');
+CREATE MATERIALIZED VIEW scoped_mv AS
+WITH p AS (SELECT a.id,COALESCE(a.k,b.k) AS k FROM rel_a a FULL JOIN rel_b b ON a.k=b.k),
+q AS (SELECT p.id,COALESCE(d.v,0) AS next_key FROM p FULL JOIN rel_d d ON p.k=d.k)
+SELECT q.id,e.label FROM q FULL JOIN rel_e e ON q.next_key=e.k;
+UPDATE rel_d SET v=9 WHERE k=1;
+INSERT INTO rel_d VALUES (1,9);
+DELETE FROM rel_d WHERE k=1;
+""",
+            "scoped_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+            },
+            """WITH p AS (SELECT a.id,COALESCE(a.k,b.k) AS k FROM rel_a a FULL JOIN rel_b b ON a.k=b.k),
+q AS (SELECT p.id,COALESCE(d.v,0) AS next_key FROM p FULL JOIN rel_d d ON p.k=d.k)
+SELECT q.id,e.label FROM q FULL JOIN rel_e e ON q.next_key=e.k""",
+        )
+
+        run_scenario(
+            binary,
+            root,
+            "full_join_string_operator_scope",
+            """
+CREATE TABLE concat_a(id INT,s VARCHAR);
+CREATE TABLE concat_b(k VARCHAR,v INT);
+CREATE TABLE concat_d(k INT,label VARCHAR);
+INSERT INTO concat_a VALUES (1,'a');
+INSERT INTO concat_b VALUES ('ax',2);
+INSERT INTO concat_d VALUES (0,'default'),(2,'old'),(3,'new');
+CREATE MATERIALIZED VIEW scoped_mv AS
+WITH n AS (SELECT id,COALESCE(s,'') || 'x' AS nk FROM concat_a),
+p AS (SELECT n.id,COALESCE(b.v,0) AS lookup_key FROM n FULL JOIN concat_b b ON n.nk=b.k)
+SELECT p.id,d.label FROM p FULL JOIN concat_d d ON p.lookup_key=d.k;
+UPDATE concat_b SET v=9;
+INSERT INTO concat_b VALUES ('ax',9);
+DELETE FROM concat_b WHERE v=9;
+INSERT INTO concat_b VALUES ('ax',3);
+""",
+            "scoped_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+            },
+            """WITH n AS (SELECT id,COALESCE(s,'') || 'x' AS nk FROM concat_a),
+p AS (SELECT n.id,COALESCE(b.v,0) AS lookup_key FROM n FULL JOIN concat_b b ON n.nk=b.k)
+SELECT p.id,d.label FROM p FULL JOIN concat_d d ON p.lookup_key=d.k""",
+        )
+
     print("regular N-term compiled SQL integration tests passed")
 
 

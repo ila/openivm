@@ -2186,49 +2186,35 @@ string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts) {
 	return "";
 }
 
-static bool BuildFullOuterScopeSource(Expression &key, const CreateMVPlanFacts &facts,
-                                      RefreshMetadata::FullOuterScopeSource &source) {
-	vector<ColumnBinding> bindings;
-	CollectLeafColumnBindings(&key, bindings);
-	vector<OccurrenceColumnRef> refs;
-	for (auto &binding : bindings) {
-		if (!ResolveBindingToOccurrenceRefsInternal(binding, facts, refs, 0)) {
-			return false;
-		}
-	}
-	if (refs.empty()) {
-		return false;
-	}
-	// A scalar key can reference several columns, but the discovery scan must
-	// evaluate it entirely from the same source occurrence.
-	for (auto &ref : refs) {
-		if (OccurrenceKey(ref) != OccurrenceKey(refs[0])) {
-			return false;
-		}
-	}
-	for (auto &occurrence : facts.source_occurrences) {
-		if (OccurrenceKey(occurrence.table, occurrence.occurrence) != OccurrenceKey(refs[0])) {
-			continue;
-		}
-		auto &get = *facts.gets_by_index.at(occurrence.table_index);
-		vector<string> names;
-		for (auto &binding : get.GetColumnBindings()) {
-			string name;
-			if (!GetLogicalGetColumnName(get, binding.column_index, name)) {
-				return false;
+static bool CollectFullOuterScopeSources(LogicalOperator &node, const CreateMVPlanFacts &facts, const string &presence,
+                                         vector<RefreshMetadata::FullOuterScopeInput> &sources) {
+	string input_presence = presence;
+	if (node.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		for (auto &expression : node.Cast<LogicalProjection>().expressions) {
+			if (expression->expression_class == ExpressionClass::BOUND_CONSTANT &&
+			    StringUtil::StartsWith(expression->alias, openivm::FULL_SCOPE_PREFIX)) {
+				input_presence = expression->alias;
+				break;
 			}
-			names.push_back(std::move(name));
 		}
-		if (!RenderPlanOutputExpression(key, get, facts, names, source.key_expression)) {
+	}
+	if (node.type == LogicalOperatorType::LOGICAL_GET) {
+		auto entry = facts.occurrence_by_index.find(node.Cast<LogicalGet>().table_index);
+		if (entry == facts.occurrence_by_index.end()) {
 			return false;
 		}
-		source.table = occurrence.table;
-		source.occurrence = occurrence.occurrence;
-		OPENIVM_DEBUG_PRINT("[CREATE] FULL JOIN replacement scope for %s[%llu]: %s\n", source.table.c_str(),
-		                    static_cast<unsigned long long>(source.occurrence), source.key_expression.c_str());
-		return true;
+		RefreshMetadata::FullOuterScopeInput input;
+		input.table = entry->second.table;
+		input.occurrence = entry->second.occurrence;
+		input.presence_column = input_presence;
+		sources.push_back(std::move(input));
 	}
-	return false;
+	for (auto &child : node.children) {
+		if (!CollectFullOuterScopeSources(*child, facts, input_presence, sources)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 vector<RefreshMetadata::FullOuterScope> BuildFullOuterScopes(const CreateMVPlanFacts &facts) {
@@ -2261,8 +2247,9 @@ vector<RefreshMetadata::FullOuterScope> BuildFullOuterScopes(const CreateMVPlanF
 				complete = false;
 				break;
 			}
-			auto &key = side == 0 ? join->conditions[0].left : join->conditions[0].right;
-			if (!BuildFullOuterScopeSource(*key, facts, source)) {
+			source.key_column = source.presence_column + "_key";
+			if (!CollectFullOuterScopeSources(child, facts, source.presence_column, source.inputs) ||
+			    source.inputs.empty()) {
 				complete = false;
 				break;
 			}

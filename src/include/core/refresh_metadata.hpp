@@ -331,11 +331,15 @@ public:
 	static string LeftJoinKeySourceToJson(const LeftJoinKeySource &source);
 
 	// Nested outer-join inputs used to discover NULL-padding keys of a FULL projection.
-	struct FullOuterScopeSource {
+	struct FullOuterScopeInput {
 		string table;
 		idx_t occurrence = 0;
-		string key_expression;
 		string presence_column;
+	};
+	struct FullOuterScopeSource {
+		string key_column;
+		string presence_column;
+		vector<FullOuterScopeInput> inputs;
 	};
 	struct FullOuterScope {
 		FullOuterScopeSource left, right;

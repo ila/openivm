@@ -1679,3 +1679,232 @@ query I
 SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding_mirror) EXCEPT ALL (SELECT * FROM dl.scalar_padding_mirror));
 ----
 0
+
+# Replacement scopes evaluate whole join inputs, including keys spanning
+# multiple sources and SQL operators in normalized string keys.
+
+statement ok
+CREATE TABLE dl.rel_scope_a(id INT,k INT);
+
+statement ok
+CREATE TABLE dl.rel_scope_b(k INT);
+
+statement ok
+CREATE TABLE dl.rel_scope_d(k INT,v INT);
+
+statement ok
+CREATE TABLE dl.rel_scope_e(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO dl.rel_scope_a VALUES (1,1),(2,2),(3,3);
+
+statement ok
+INSERT INTO dl.rel_scope_b VALUES (1),(2),(4);
+
+statement ok
+INSERT INTO dl.rel_scope_d VALUES (1,2),(2,3),(4,4);
+
+statement ok
+INSERT INTO dl.rel_scope_e VALUES (0,'default'),(2,'old'),(3,'kept'),(4,'four'),(99,'unrelated');
+
+statement ok
+CREATE VIEW expected_rel_scope AS WITH p AS (SELECT a.id,COALESCE(a.k,b.k) AS k FROM dl.rel_scope_a a FULL JOIN dl.rel_scope_b b ON a.k=b.k), q AS (SELECT p.id,COALESCE(d.v,0) AS next_key FROM p FULL JOIN dl.rel_scope_d d ON p.k=d.k) SELECT q.id,e.label FROM q FULL JOIN dl.rel_scope_e e ON q.next_key=e.k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.rel_scope AS WITH p AS (SELECT a.id,COALESCE(a.k,b.k) AS k FROM dl.rel_scope_a a FULL JOIN dl.rel_scope_b b ON a.k=b.k), q AS (SELECT p.id,COALESCE(d.v,0) AS next_key FROM p FULL JOIN dl.rel_scope_d d ON p.k=d.k) SELECT q.id,e.label FROM q FULL JOIN dl.rel_scope_e e ON q.next_key=e.k;
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.rel_scope) EXCEPT ALL (SELECT * FROM expected_rel_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_rel_scope) EXCEPT ALL (SELECT * FROM dl.rel_scope));
+----
+0
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='rel_scope';
+----
+2
+
+statement ok
+UPDATE dl.rel_scope_d SET v=9 WHERE k=1;
+
+statement ok
+INSERT INTO dl.rel_scope_d VALUES (1,9);
+
+statement ok
+DELETE FROM dl.rel_scope_d WHERE k=1;
+
+statement ok
+PRAGMA refresh('dl.rel_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.rel_scope) EXCEPT ALL (SELECT * FROM expected_rel_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_rel_scope) EXCEPT ALL (SELECT * FROM dl.rel_scope));
+----
+0
+
+statement ok
+INSERT INTO dl.rel_scope_d VALUES (1,4),(1,4);
+
+statement ok
+UPDATE dl.rel_scope_b SET k=5 WHERE k=2;
+
+statement ok
+INSERT INTO dl.rel_scope_b VALUES (2);
+
+statement ok
+UPDATE dl.rel_scope_a SET k=4 WHERE id=3;
+
+statement ok
+UPDATE dl.rel_scope_e SET label='new_default' WHERE k=0;
+
+statement ok
+PRAGMA refresh('dl.rel_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.rel_scope) EXCEPT ALL (SELECT * FROM expected_rel_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_rel_scope) EXCEPT ALL (SELECT * FROM dl.rel_scope));
+----
+0
+
+statement ok
+UPDATE dl.rel_scope_d SET v=8 WHERE k=1;
+
+statement ok
+DELETE FROM dl.rel_scope_d WHERE k=1 OR k=4;
+
+statement ok
+DELETE FROM dl.rel_scope_a WHERE id=1;
+
+statement ok
+INSERT INTO dl.rel_scope_a VALUES (1,5);
+
+statement ok
+INSERT INTO dl.rel_scope_d VALUES (5,2);
+
+statement ok
+PRAGMA refresh('dl.rel_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.rel_scope) EXCEPT ALL (SELECT * FROM expected_rel_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_rel_scope) EXCEPT ALL (SELECT * FROM dl.rel_scope));
+----
+0
+
+statement ok
+CREATE TABLE dl.concat_scope_a(id INT,s VARCHAR);
+
+statement ok
+CREATE TABLE dl.concat_scope_b(k VARCHAR,v INT);
+
+statement ok
+CREATE TABLE dl.concat_scope_d(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO dl.concat_scope_a VALUES (1,'a'),(2,NULL);
+
+statement ok
+INSERT INTO dl.concat_scope_b VALUES ('ax',2),('x',3);
+
+statement ok
+INSERT INTO dl.concat_scope_d VALUES (0,'default'),(2,'old'),(3,'new');
+
+statement ok
+CREATE VIEW expected_concat_scope AS WITH n AS (SELECT id,COALESCE(s,'') || 'x' AS nk FROM dl.concat_scope_a), p AS (SELECT n.id,COALESCE(b.v,0) AS lookup_key FROM n FULL JOIN dl.concat_scope_b b ON n.nk=b.k) SELECT p.id,d.label FROM p FULL JOIN dl.concat_scope_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.concat_scope AS WITH n AS (SELECT id,COALESCE(s,'') || 'x' AS nk FROM dl.concat_scope_a), p AS (SELECT n.id,COALESCE(b.v,0) AS lookup_key FROM n FULL JOIN dl.concat_scope_b b ON n.nk=b.k) SELECT p.id,d.label FROM p FULL JOIN dl.concat_scope_d d ON p.lookup_key=d.k;
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.concat_scope) EXCEPT ALL (SELECT * FROM expected_concat_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_concat_scope) EXCEPT ALL (SELECT * FROM dl.concat_scope));
+----
+0
+
+statement ok
+UPDATE dl.concat_scope_b SET v=9 WHERE k='ax';
+
+statement ok
+INSERT INTO dl.concat_scope_b VALUES ('ax',9);
+
+statement ok
+DELETE FROM dl.concat_scope_b WHERE v=9;
+
+statement ok
+INSERT INTO dl.concat_scope_b VALUES ('ax',3);
+
+statement ok
+PRAGMA refresh('dl.concat_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.concat_scope) EXCEPT ALL (SELECT * FROM expected_concat_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_concat_scope) EXCEPT ALL (SELECT * FROM dl.concat_scope));
+----
+0
+
+statement ok
+UPDATE dl.concat_scope_b SET v=9 WHERE k='ax';
+
+statement ok
+INSERT INTO dl.concat_scope_b VALUES ('ax',9);
+
+statement ok
+DELETE FROM dl.concat_scope_b WHERE k='ax';
+
+statement ok
+PRAGMA refresh('dl.concat_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.concat_scope) EXCEPT ALL (SELECT * FROM expected_concat_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_concat_scope) EXCEPT ALL (SELECT * FROM dl.concat_scope));
+----
+0
+
+statement ok
+INSERT INTO dl.concat_scope_b VALUES ('ax',2),('ax',2);
+
+statement ok
+UPDATE dl.concat_scope_a SET s='a' WHERE id=2;
+
+statement ok
+UPDATE dl.concat_scope_d SET label='changed' WHERE k=2;
+
+statement ok
+PRAGMA refresh('dl.concat_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.concat_scope) EXCEPT ALL (SELECT * FROM expected_concat_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_concat_scope) EXCEPT ALL (SELECT * FROM dl.concat_scope));
+----
+0
