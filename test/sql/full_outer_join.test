@@ -2570,3 +2570,323 @@ query I
 SELECT COUNT(*) FROM ((SELECT d_label,COUNT(*) AS n FROM expected_nested_full_left GROUP BY d_label) EXCEPT ALL (SELECT * FROM nested_full_child));
 ----
 0
+
+# Matched-to-matched changes cannot manufacture a default-key scope.
+
+statement ok
+CREATE TABLE scope_a(id INT,k INT);
+
+statement ok
+CREATE TABLE scope_b(k INT,v INT);
+
+statement ok
+CREATE TABLE scope_d(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO scope_a VALUES (1,1);
+
+statement ok
+INSERT INTO scope_a SELECT i,i FROM range(100,1100)t(i);
+
+statement ok
+INSERT INTO scope_b VALUES (1,2);
+
+statement ok
+INSERT INTO scope_d VALUES (0,'default'),(2,'old'),(3,'new');
+
+statement ok
+CREATE VIEW scope_expected AS WITH p AS (SELECT a.id,COALESCE(b.v,0) AS k FROM scope_a a FULL JOIN scope_b b ON a.k=b.k) SELECT p.id,d.label FROM p FULL JOIN scope_d d ON p.k=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW scope_mv AS WITH p AS (SELECT a.id,COALESCE(b.v,0) AS k FROM scope_a a FULL JOIN scope_b b ON a.k=b.k) SELECT p.id,d.label FROM p FULL JOIN scope_d d ON p.k=d.k;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='scope_mv';
+----
+2
+
+statement ok rowid_snapshot
+BEGIN;
+
+statement ok rowid_snapshot
+SELECT COUNT(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_73636f70655f6d76_;
+
+statement ok
+CREATE TABLE scope_untouched AS SELECT rowid AS old_rowid,id FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_73636f70655f6d76_ WHERE id>=100;
+
+statement ok
+UPDATE scope_b SET v=99 WHERE k=1;
+
+statement ok
+INSERT INTO scope_b VALUES (1,99);
+
+statement ok
+DELETE FROM scope_b WHERE v=99;
+
+statement ok
+INSERT INTO scope_b VALUES (1,3);
+
+statement ok
+PRAGMA refresh('scope_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_mv) EXCEPT ALL (SELECT * FROM scope_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_expected) EXCEPT ALL (SELECT * FROM scope_mv));
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM scope_untouched EXCEPT ALL SELECT rowid,id FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_73636f70655f6d76_ WHERE id>=100);
+----
+0
+
+statement ok rowid_snapshot
+COMMIT;
+
+statement ok
+DELETE FROM scope_b;
+
+statement ok
+INSERT INTO scope_b VALUES (1,99);
+
+statement ok
+DELETE FROM scope_b;
+
+statement ok
+PRAGMA refresh('scope_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_mv) EXCEPT ALL (SELECT * FROM scope_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_expected) EXCEPT ALL (SELECT * FROM scope_mv));
+----
+0
+
+statement ok
+INSERT INTO scope_b VALUES (1,2);
+
+statement ok
+UPDATE scope_b SET v=3;
+
+statement ok
+INSERT INTO scope_b VALUES (1,3);
+
+statement ok
+DELETE FROM scope_b WHERE rowid=(SELECT max(rowid) FROM scope_b);
+
+statement ok
+PRAGMA refresh('scope_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_mv) EXCEPT ALL (SELECT * FROM scope_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_expected) EXCEPT ALL (SELECT * FROM scope_mv));
+----
+0
+
+# A delta in one UNION ALL arm must not replace the other arm.
+
+statement ok
+CREATE TABLE branch_a(id INT,k INT,payload VARCHAR);
+
+statement ok
+CREATE TABLE branch_b(id INT,k INT,payload VARCHAR);
+
+statement ok
+CREATE TABLE branch_d(k INT,v INT);
+
+statement ok
+CREATE TABLE branch_e(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO branch_a VALUES (1,1,'a'),(1,1,'a');
+
+statement ok
+INSERT INTO branch_b SELECT i,i,'unchanged' FROM range(100,1100)t(i);
+
+statement ok
+INSERT INTO branch_d VALUES (1,2);
+
+statement ok
+INSERT INTO branch_d SELECT i,i FROM range(100,1100)t(i);
+
+statement ok
+INSERT INTO branch_e VALUES (0,'default'),(2,'two');
+
+statement ok
+INSERT INTO branch_e SELECT i,'unchanged' FROM range(100,1100)t(i);
+
+statement ok
+CREATE VIEW branch_expected AS WITH u AS (SELECT id,k,payload FROM branch_a UNION ALL SELECT id,k,payload FROM branch_b), p AS (SELECT u.id,u.payload,COALESCE(d.v,0) AS lookup_key FROM u FULL JOIN branch_d d ON u.k=d.k) SELECT p.id,p.payload,e.label FROM p FULL JOIN branch_e e ON p.lookup_key=e.k;
+
+statement ok
+CREATE MATERIALIZED VIEW branch_mv AS WITH u AS (SELECT id,k,payload FROM branch_a UNION ALL SELECT id,k,payload FROM branch_b), p AS (SELECT u.id,u.payload,COALESCE(d.v,0) AS lookup_key FROM u FULL JOIN branch_d d ON u.k=d.k) SELECT p.id,p.payload,e.label FROM p FULL JOIN branch_e e ON p.lookup_key=e.k;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='branch_mv';
+----
+2
+
+statement ok rowid_snapshot
+BEGIN;
+
+statement ok rowid_snapshot
+SELECT COUNT(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6272616e63685f6d76_;
+
+statement ok
+CREATE OR REPLACE TABLE branch_untouched AS SELECT rowid AS old_rowid FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6272616e63685f6d76_ WHERE id>=100;
+
+statement ok
+UPDATE branch_a SET payload='temporary' WHERE id IN (1,100);
+
+statement ok
+INSERT INTO branch_a VALUES (2,1,'temporary');
+
+statement ok
+DELETE FROM branch_a WHERE id=2;
+
+statement ok
+UPDATE branch_a SET payload='new' WHERE id IN (1,100);
+
+statement ok
+PRAGMA refresh('branch_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM branch_mv) EXCEPT ALL (SELECT * FROM branch_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM branch_expected) EXCEPT ALL (SELECT * FROM branch_mv));
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT old_rowid FROM branch_untouched EXCEPT ALL SELECT rowid FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6272616e63685f6d76_ WHERE id>=100);
+----
+0
+
+statement ok rowid_snapshot
+COMMIT;
+
+statement ok rowid_snapshot
+BEGIN;
+
+statement ok rowid_snapshot
+SELECT COUNT(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6272616e63685f6d76_;
+
+statement ok
+CREATE OR REPLACE TABLE branch_untouched AS SELECT rowid AS old_rowid FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6272616e63685f6d76_ WHERE id<>100 OR id IS NULL;
+
+statement ok
+UPDATE branch_b SET payload='temporary' WHERE id IN (1,100);
+
+statement ok
+INSERT INTO branch_b VALUES (2,1,'temporary');
+
+statement ok
+DELETE FROM branch_b WHERE id=2;
+
+statement ok
+UPDATE branch_b SET payload='new' WHERE id IN (1,100);
+
+statement ok
+PRAGMA refresh('branch_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM branch_mv) EXCEPT ALL (SELECT * FROM branch_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM branch_expected) EXCEPT ALL (SELECT * FROM branch_mv));
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT old_rowid FROM branch_untouched EXCEPT ALL SELECT rowid FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6272616e63685f6d76_ WHERE id<>100 OR id IS NULL);
+----
+0
+
+statement ok rowid_snapshot
+COMMIT;
+
+# Padding existence uses all join conditions, not only the first key.
+
+statement ok
+CREATE TABLE scope_multi_a(id INT,k INT,kind INT);
+
+statement ok
+CREATE TABLE scope_multi_b(k INT,kind INT,v INT);
+
+statement ok
+CREATE TABLE scope_multi_d(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO scope_multi_a VALUES (1,1,10),(2,2,20),(NULL,NULL,0);
+
+statement ok
+INSERT INTO scope_multi_b VALUES (1,10,2),(2,20,3);
+
+statement ok
+INSERT INTO scope_multi_d VALUES (0,'default'),(2,'two'),(3,'three');
+
+statement ok
+CREATE VIEW scope_multi_expected AS WITH p AS (SELECT a.id,COALESCE(b.v,0) AS k FROM scope_multi_a a FULL JOIN scope_multi_b b ON a.k=b.k AND a.kind=b.kind) SELECT p.id,d.label FROM p FULL JOIN scope_multi_d d ON p.k=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW scope_multi_mv AS WITH p AS (SELECT a.id,COALESCE(b.v,0) AS k FROM scope_multi_a a FULL JOIN scope_multi_b b ON a.k=b.k AND a.kind=b.kind) SELECT p.id,d.label FROM p FULL JOIN scope_multi_d d ON p.k=d.k;
+
+statement ok
+UPDATE scope_multi_b SET kind=99 WHERE k=1;
+
+statement ok
+INSERT INTO scope_multi_b VALUES (1,10,99);
+
+statement ok
+DELETE FROM scope_multi_b WHERE v=99;
+
+statement ok
+PRAGMA refresh('scope_multi_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_multi_mv) EXCEPT ALL (SELECT * FROM scope_multi_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_multi_expected) EXCEPT ALL (SELECT * FROM scope_multi_mv));
+----
+0
+
+statement ok
+UPDATE scope_multi_b SET kind=10 WHERE k=1;
+
+statement ok
+DELETE FROM scope_multi_b WHERE k=2;
+
+statement ok
+INSERT INTO scope_multi_b VALUES (2,20,3);
+
+statement ok
+PRAGMA refresh('scope_multi_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_multi_mv) EXCEPT ALL (SELECT * FROM scope_multi_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_multi_expected) EXCEPT ALL (SELECT * FROM scope_multi_mv));
+----
+0

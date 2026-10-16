@@ -454,3 +454,40 @@ FROM openivm_compile_with_facts(
 WHERE stmt_kind = 'data';
 ----
 1
+
+# Native delta row projections use Spark star EXCEPT, preserving literal text.
+
+statement ok
+CREATE TABLE sph_scope_a(id INT,k INT);
+
+statement ok
+CREATE TABLE sph_scope_b(k INT,v INT);
+
+statement ok
+CREATE TABLE sph_scope_d(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO sph_scope_a VALUES (1,1);
+
+statement ok
+INSERT INTO sph_scope_b VALUES (1,2);
+
+statement ok
+INSERT INTO sph_scope_d VALUES (0,'default'),(2,'two'),(3,'three');
+
+statement ok
+CREATE MATERIALIZED VIEW sph_scope_mv AS WITH p AS (SELECT a.id,COALESCE(b.v,0) AS k FROM sph_scope_a a FULL JOIN sph_scope_b b ON a.k=b.k) SELECT p.id,d.label,'* EXCLUDE (literal)' AS txt FROM p FULL JOIN sph_scope_d d ON p.k=d.k;
+
+statement ok
+UPDATE sph_scope_b SET v=3 WHERE k=1;
+
+query I
+SELECT CASE WHEN regexp_matches(string_agg(sql, ' ' ORDER BY stmt_order), '\*\s+EXCEPT\s*\([^)]*openivm_multiplicity')
+             AND NOT regexp_matches(string_agg(sql, ' ' ORDER BY stmt_order), '\*\s+EXCLUDE\s*\([^)]*openivm_multiplicity')
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%* EXCLUDE (literal)%'
+             AND min(refresh_type)=2
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts('sph_scope_mv','{"target_dialect":"spark","compile_only":true}')
+WHERE stmt_kind='data';
+----
+1

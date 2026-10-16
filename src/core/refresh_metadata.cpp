@@ -1347,7 +1347,7 @@ vector<RefreshMetadata::FullOuterScope> RefreshMetadata::GetFullOuterScopes(cons
 	}
 	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "scopes")) {
 		FullOuterScope scope;
-		bool complete = MetadataJson::ExtractJsonString(object, "comparison", scope.comparison);
+		bool complete = true;
 		for (idx_t side = 0; side < 2; side++) {
 			auto &source = side == 0 ? scope.left : scope.right;
 			string prefix = side == 0 ? "left_" : "right_";
@@ -1357,7 +1357,7 @@ vector<RefreshMetadata::FullOuterScope> RefreshMetadata::GetFullOuterScopes(cons
 				FullOuterScopeInput input;
 				complete = complete && MetadataJson::ExtractJsonString(input_json, "table", input.table) &&
 				           ParseJsonIndex(input_json, "occ", input.occurrence) &&
-				           MetadataJson::ExtractJsonString(input_json, "presence", input.presence_column);
+				           ParseJsonIndex(input_json, "presence_index", input.presence_index);
 				source.inputs.push_back(std::move(input));
 			}
 			complete = complete && !source.inputs.empty();
@@ -1372,7 +1372,7 @@ vector<RefreshMetadata::FullOuterScope> RefreshMetadata::GetFullOuterScopes(cons
 string RefreshMetadata::FullOuterScopesToJson(const vector<FullOuterScope> &scopes) {
 	vector<string> objects;
 	for (auto &scope : scopes) {
-		vector<string> fields {"\"comparison\":" + SqlUtils::JsonQuote(scope.comparison)};
+		vector<string> fields;
 		for (idx_t side = 0; side < 2; side++) {
 			auto &source = side == 0 ? scope.left : scope.right;
 			string prefix = side == 0 ? "left_" : "right_";
@@ -1383,7 +1383,7 @@ string RefreshMetadata::FullOuterScopesToJson(const vector<FullOuterScope> &scop
 			for (auto &input : source.inputs) {
 				inputs.push_back("{\"table\":" + SqlUtils::JsonQuote(input.table) +
 				                 ",\"occ\":" + SqlUtils::JsonQuote(to_string(input.occurrence)) +
-				                 ",\"presence\":" + SqlUtils::JsonQuote(input.presence_column) + "}");
+				                 ",\"presence_index\":" + SqlUtils::JsonQuote(to_string(input.presence_index)) + "}");
 			}
 			fields.push_back(SqlUtils::JsonQuote(prefix + "inputs") + ":[" + StringUtil::Join(inputs, ",") + "]");
 		}

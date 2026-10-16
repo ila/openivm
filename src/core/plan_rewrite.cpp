@@ -36,6 +36,7 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_index_regen.hpp"
 
@@ -1295,8 +1296,8 @@ static OuterJoinBindings FindFirstOuterJoinBindings(LogicalOperator *plan, bool 
 	return bindings;
 }
 
-static void PropagateBindingThroughOperatorPath(unique_ptr<LogicalOperator> &plan, ColumnBinding &binding,
-                                                LogicalType &type) {
+static void PropagateBindingThroughOperatorPath(Binder &binder, unique_ptr<LogicalOperator> &plan,
+                                                ColumnBinding &binding, LogicalType &type, const string &alias = "") {
 	plan->ResolveOperatorTypes();
 	auto top_bindings = plan->GetColumnBindings();
 	auto top_types = plan->types;
@@ -1348,11 +1349,44 @@ static void PropagateBindingThroughOperatorPath(unique_ptr<LogicalOperator> &pla
 				}
 			}
 			if (!found) {
-				auto col_ref = make_uniq<BoundColumnRefExpression>(type, current);
+				auto col_ref = make_uniq<BoundColumnRefExpression>(alias, type, current);
 				projection.expressions.push_back(std::move(col_ref));
 				current = ColumnBinding(projection.table_index, projection.expressions.size() - 1);
 			}
 			projection.ResolveOperatorTypes();
+		} else if (entry.op->type == LogicalOperatorType::LOGICAL_UNION) {
+			auto &setop = entry.op->Cast<LogicalSetOperation>();
+			auto bindings = setop.children[entry.child_idx]->GetColumnBindings();
+			auto position = std::find(bindings.begin(), bindings.end(), current);
+			D_ASSERT(position != bindings.end());
+			auto column = idx_t(position - bindings.begin());
+			if (column >= setop.column_count) {
+				// A new hidden value belongs only to this arm. Other arms must
+				// carry NULL, rather than inherit the arm's presence marker.
+				for (idx_t side = 0; side < setop.children.size(); side++) {
+					auto &child = setop.children[side];
+					child->ResolveOperatorTypes();
+					auto child_bindings = child->GetColumnBindings();
+					vector<unique_ptr<Expression>> expressions;
+					for (idx_t i = 0; i < setop.column_count; i++) {
+						expressions.push_back(make_uniq<BoundColumnRefExpression>(child->types[i], child_bindings[i]));
+					}
+					unique_ptr<Expression> value;
+					if (side == entry.child_idx) {
+						value = make_uniq<BoundColumnRefExpression>(alias, type, current);
+					} else {
+						value = make_uniq<BoundConstantExpression>(Value(type));
+						value->alias = alias;
+					}
+					expressions.push_back(std::move(value));
+					auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(expressions));
+					projection->children.push_back(std::move(child));
+					child = std::move(projection);
+				}
+				column = setop.column_count++;
+			}
+			current = ColumnBinding(setop.table_index, column);
+			setop.ResolveOperatorTypes();
 		} else if (entry.op->type == LogicalOperatorType::LOGICAL_FILTER) {
 			auto &filter = entry.op->Cast<LogicalFilter>();
 			if (!filter.projection_map.empty()) {
@@ -1387,9 +1421,9 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
 	// filters with projection maps, and CTE/projection stacks can hide either key
 	// before the top of the plan. Push both keys through the operator path first,
 	// then build one final projection that exposes user columns plus hidden keys.
-	PropagateBindingThroughOperatorPath(plan, key_binding, key_type);
+	PropagateBindingThroughOperatorPath(binder, plan, key_binding, key_type);
 	if (is_full_outer) {
-		PropagateBindingThroughOperatorPath(plan, right_key_binding, right_key_type);
+		PropagateBindingThroughOperatorPath(binder, plan, right_key_binding, right_key_type);
 	}
 
 	auto top_bindings = plan->GetColumnBindings();
@@ -1501,6 +1535,36 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 	                    is_full_outer ? " + openivm_right_match_count" : "");
 }
 
+static ColumnBinding AddScopePresence(Binder &binder, unique_ptr<LogicalOperator> &plan,
+                                      unique_ptr<LogicalOperator> &child, const string &name,
+                                      const Expression *key = nullptr) {
+	child->ResolveOperatorTypes();
+	auto bindings = child->GetColumnBindings();
+	vector<unique_ptr<Expression>> expressions;
+	for (idx_t i = 0; i < bindings.size(); i++) {
+		expressions.push_back(make_uniq<BoundColumnRefExpression>(child->types[i], bindings[i]));
+	}
+	auto present = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
+	present->alias = name;
+	expressions.push_back(std::move(present));
+	if (key) {
+		auto copy = key->Copy();
+		copy->alias = name + "_key";
+		expressions.push_back(std::move(copy));
+	}
+	auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(expressions));
+	projection->children.push_back(std::move(child));
+	ColumnBinding presence(projection->table_index, bindings.size());
+	ColumnBindingReplacer replacer;
+	for (idx_t i = 0; i < bindings.size(); i++) {
+		replacer.replacement_bindings.emplace_back(bindings[i], ColumnBinding(projection->table_index, i));
+	}
+	replacer.stop_operator = projection.get();
+	child = std::move(projection);
+	replacer.VisitOperator(*plan);
+	return presence;
+}
+
 static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
                                     bool has_aggregate) {
 	auto outer_join = FindFirstOuterJoinBindings(plan.get(), has_aggregate);
@@ -1535,36 +1599,43 @@ static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, uniq
 		}
 	};
 	collect(*selected);
+	if (!nested_outer.empty()) {
+		idx_t source_index = 0;
+		for (auto &input : selected->children) {
+			vector<std::pair<ColumnBinding, string>> sources;
+			std::function<void(unique_ptr<LogicalOperator> &, bool)> mark_inputs =
+			    [&](unique_ptr<LogicalOperator> &node, bool in_scope) {
+				    if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+				        IsOuterJoin(node->Cast<LogicalComparisonJoin>().join_type)) {
+					    in_scope = true;
+				    }
+				    if (in_scope && node->type == LogicalOperatorType::LOGICAL_GET) {
+					    auto name = string(openivm::FULL_SCOPE_PREFIX) + "source_" + to_string(source_index++);
+					    sources.emplace_back(AddScopePresence(binder, plan, node, name), name);
+					    return;
+				    }
+				    for (auto &child : node->children) {
+					    mark_inputs(child, in_scope);
+				    }
+			    };
+			mark_inputs(input, false);
+			for (auto &source : sources) {
+				LogicalType type = LogicalType::BOOLEAN;
+				// Source participation is needed inside the scoped input only;
+				// it is not an extra persisted output of the materialized view.
+				PropagateBindingThroughOperatorPath(binder, input, source.first, type, source.second);
+			}
+		}
+	}
 	for (idx_t index = 0; index < nested_outer.size(); index++) {
 		for (idx_t side = 0; side < 2; side++) {
 			auto &child = nested_outer[index]->children[side];
-			child->ResolveOperatorTypes();
-			auto bindings = child->GetColumnBindings();
-			vector<unique_ptr<Expression>> expressions;
-			for (idx_t i = 0; i < bindings.size(); i++) {
-				expressions.push_back(make_uniq<BoundColumnRefExpression>(child->types[i], bindings[i]));
-			}
 			string name = string(openivm::FULL_SCOPE_PREFIX) + to_string(index) + (side == 0 ? "_left" : "_right");
-			auto present = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
-			present->alias = name;
-			expressions.push_back(std::move(present));
 			auto &condition = nested_outer[index]->conditions[0];
-			auto key = (side == 0 ? condition.left : condition.right)->Copy();
-			key->alias = name + "_key";
-			expressions.push_back(std::move(key));
-			auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(expressions));
-			projection->children.push_back(std::move(child));
-			projection->ResolveOperatorTypes();
-			ColumnBinding presence(projection->table_index, bindings.size());
-			ColumnBindingReplacer replacer;
-			for (idx_t i = 0; i < bindings.size(); i++) {
-				replacer.replacement_bindings.emplace_back(bindings[i], ColumnBinding(projection->table_index, i));
-			}
-			replacer.stop_operator = projection.get();
-			child = std::move(projection);
-			replacer.VisitOperator(*plan);
+			auto presence =
+			    AddScopePresence(binder, plan, child, name, (side == 0 ? condition.left : condition.right).get());
 			LogicalType type = LogicalType::BOOLEAN;
-			PropagateBindingThroughOperatorPath(plan, presence, type);
+			PropagateBindingThroughOperatorPath(binder, plan, presence, type, name);
 			auto &root = plan->Cast<LogicalProjection>();
 			D_ASSERT(presence.table_index == root.table_index);
 			root.expressions[presence.column_index]->alias = name;

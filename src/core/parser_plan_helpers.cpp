@@ -2186,7 +2186,31 @@ string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts) {
 	return "";
 }
 
-static bool CollectFullOuterScopeSources(LogicalOperator &node, const CreateMVPlanFacts &facts, const string &presence,
+static bool ScopePresenceMatches(ColumnBinding binding, const string &name, const CreateMVPlanFacts &facts) {
+	auto projection = facts.projections_by_index.find(binding.table_index);
+	if (projection != facts.projections_by_index.end()) {
+		auto &expression = *projection->second->expressions[binding.column_index];
+		if (expression.expression_class == ExpressionClass::BOUND_CONSTANT) {
+			auto &value = expression.Cast<BoundConstantExpression>().value;
+			return expression.alias == name && !value.IsNull() && value.GetValue<bool>();
+		}
+		if (expression.type == ExpressionType::BOUND_COLUMN_REF) {
+			return ScopePresenceMatches(expression.Cast<BoundColumnRefExpression>().binding, name, facts);
+		}
+	}
+	auto setop = facts.setops_by_index.find(binding.table_index);
+	if (setop != facts.setops_by_index.end()) {
+		for (auto &child : setop->second->children) {
+			if (ScopePresenceMatches(child->GetColumnBindings()[binding.column_index], name, facts)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static bool CollectFullOuterScopeSources(LogicalOperator &node, const LogicalProjection &input_projection,
+                                         const CreateMVPlanFacts &facts, const string &presence,
                                          vector<RefreshMetadata::FullOuterScopeInput> &sources) {
 	string input_presence = presence;
 	if (node.type == LogicalOperatorType::LOGICAL_PROJECTION) {
@@ -2206,11 +2230,22 @@ static bool CollectFullOuterScopeSources(LogicalOperator &node, const CreateMVPl
 		RefreshMetadata::FullOuterScopeInput input;
 		input.table = entry->second.table;
 		input.occurrence = entry->second.occurrence;
-		input.presence_column = input_presence;
+		bool found = false;
+		for (idx_t i = 0; i < input_projection.expressions.size(); i++) {
+			if (ScopePresenceMatches(ColumnBinding(input_projection.table_index, i), input_presence, facts)) {
+				input.presence_index = i;
+				found = true;
+				break;
+			}
+		}
+		D_ASSERT(found);
+		if (!found) {
+			throw InternalException("Missing source presence in FULL JOIN input");
+		}
 		sources.push_back(std::move(input));
 	}
 	for (auto &child : node.children) {
-		if (!CollectFullOuterScopeSources(*child, facts, input_presence, sources)) {
+		if (!CollectFullOuterScopeSources(*child, input_projection, facts, input_presence, sources)) {
 			return false;
 		}
 	}
@@ -2226,7 +2261,6 @@ vector<RefreshMetadata::FullOuterScope> BuildFullOuterScopes(const CreateMVPlanF
 			continue;
 		}
 		RefreshMetadata::FullOuterScope scope;
-		scope.comparison = ExpressionTypeToOperator(join->conditions[0].comparison);
 		bool complete = true;
 		for (idx_t side = 0; side < 2; side++) {
 			auto &child = *join->children[side];
@@ -2248,7 +2282,7 @@ vector<RefreshMetadata::FullOuterScope> BuildFullOuterScopes(const CreateMVPlanF
 				break;
 			}
 			source.key_column = source.presence_column + "_key";
-			if (!CollectFullOuterScopeSources(child, facts, source.presence_column, source.inputs) ||
+			if (!CollectFullOuterScopeSources(child, projection, facts, source.presence_column, source.inputs) ||
 			    source.inputs.empty()) {
 				complete = false;
 				break;

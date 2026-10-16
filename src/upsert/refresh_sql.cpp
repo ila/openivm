@@ -42,6 +42,24 @@ static string SparkPortableRefreshSQL(string sql) {
 	static const std::regex bigint_cast_regex(R"(([A-Za-z_][A-Za-z0-9_\.]*)::BIGINT)", std::regex_constants::icase);
 	static const std::regex now_regex(R"(\bnow\(\))", std::regex_constants::icase);
 	static const std::regex null_safe_regex(R"(\s+IS\s+NOT\s+DISTINCT\s+FROM\s+)", std::regex_constants::icase);
+	// Only rewrite the star modifier. EXCLUDE can also occur in identifiers,
+	// literals and comments, which must survive target-dialect rendering.
+	auto tokens = Parser::Tokenize(sql);
+	for (idx_t i = tokens.size(); i > 1; i--) {
+		auto &token = tokens[i - 1];
+		if (token.type != SimplifiedTokenType::SIMPLIFIED_TOKEN_KEYWORD ||
+		    !StringUtil::CIEquals(sql.substr(token.start, 7), "EXCLUDE")) {
+			continue;
+		}
+		auto previous = i - 2;
+		while (previous > 0 && tokens[previous].type == SimplifiedTokenType::SIMPLIFIED_TOKEN_COMMENT) {
+			previous--;
+		}
+		if (tokens[previous].type == SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR &&
+		    sql[tokens[previous].start] == '*') {
+			sql.replace(token.start, 7, "EXCEPT");
+		}
+	}
 	sql = std::regex_replace(sql, quoted_cast_regex, "CAST($1 AS $2)");
 	sql = std::regex_replace(sql, bigint_cast_regex, "CAST($1 AS BIGINT)");
 	sql = std::regex_replace(sql, now_regex, "current_timestamp()");

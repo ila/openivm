@@ -17,6 +17,7 @@
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 
@@ -807,6 +808,7 @@ static string BuildGuardedDeltaWhere(const string &delta_ts_filter, const string
 struct FullOuterScopeRelation {
 	string reference;
 	string query;
+	vector<string> columns;
 };
 
 static unique_ptr<SelectStatement> ParseScopeQuery(const string &sql) {
@@ -845,7 +847,7 @@ static FullOuterScopeRelation ReadScopeRelation(const SelectNode &view,
 		auto ref = make_uniq<BaseTableRef>();
 		ref->table_name = entry.first;
 		input->from_table = std::move(ref);
-		return {entry.first, input->ToString()};
+		return {entry.first, input->ToString(), info.aliases};
 	}
 	throw InternalException("Missing FULL JOIN input for presence column '%s'", source.presence_column);
 }
@@ -929,10 +931,31 @@ static string BuildScopeChanges(const FullOuterScopeRelation &relation,
 			}
 			auto query = ReplaceScopeInputs(relation.query, source.inputs, replacements);
 			terms.push_back("SELECT * FROM (" + query + ") openivm_scope_changed WHERE " +
-			                SqlUtils::QuoteIdentifier(source.inputs[changed].presence_column) + " IS TRUE");
+			                SqlUtils::QuoteIdentifier(relation.columns[source.inputs[changed].presence_index]) +
+			                " IS TRUE");
 		}
 	}
 	return "(" + StringUtil::Join(terms, " UNION ALL ") + ")";
+}
+
+static string ReadScopePredicate(const SelectNode &view, const FullOuterScopeRelation (&relations)[2]) {
+	for (auto &entry : view.cte_map.map) {
+		if (entry.second->query->node->type != QueryNodeType::SELECT_NODE) {
+			continue;
+		}
+		auto &select = entry.second->query->node->Cast<SelectNode>();
+		if (select.from_table->type != TableReferenceType::JOIN) {
+			continue;
+		}
+		auto &join = select.from_table->Cast<JoinRef>();
+		if (join.left->type == TableReferenceType::BASE_TABLE && join.right->type == TableReferenceType::BASE_TABLE &&
+		    join.left->Cast<BaseTableRef>().table_name == relations[0].reference &&
+		    join.right->Cast<BaseTableRef>().table_name == relations[1].reference) {
+			D_ASSERT(join.condition);
+			return join.condition->ToString();
+		}
+	}
+	throw InternalException("Missing relational FULL JOIN scope predicate");
 }
 
 static string BuildNestedFullOuterKeys(RefreshMetadata &metadata, const string &view_name,
@@ -947,51 +970,57 @@ static string BuildNestedFullOuterKeys(RefreshMetadata &metadata, const string &
 	vector<string> terms;
 	for (auto &scope : scopes) {
 		FullOuterScopeRelation relations[2] {ReadScopeRelation(view, scope.left), ReadScopeRelation(view, scope.right)};
+		auto predicate = ReadScopePredicate(view, relations);
 		vector<FullOuterScopeRows> rows[2];
+		string endpoints[2][2];
 		for (idx_t side = 0; side < 2; side++) {
 			auto &source = side == 0 ? scope.left : scope.right;
+			vector<string> previous_inputs;
 			for (auto &input : source.inputs) {
 				rows[side].push_back(ReadScopeRows(metadata, view_name, delta_table_names, relations[side].query, input,
 				                                   delta_ts_filter));
+				previous_inputs.push_back(rows[side].back().previous);
 			}
+			endpoints[side][0] = relations[side].query;
+			endpoints[side][1] = ReplaceScopeInputs(relations[side].query, source.inputs, previous_inputs);
 		}
 		for (idx_t side = 0; side < 2; side++) {
 			auto &source = side == 0 ? scope.left : scope.right;
-			auto &other = side == 0 ? scope.right : scope.left;
 			auto changed = BuildScopeChanges(relations[side], source, rows[side]);
-			vector<string> previous_inputs;
-			for (auto &input : rows[1 - side]) {
-				previous_inputs.push_back(input.previous);
-			}
-			auto old_other = ReplaceScopeInputs(relations[1 - side].query, other.inputs, previous_inputs);
-			auto other_rows = "(SELECT * FROM (" + relations[1 - side].query +
-			                  ") openivm_scope_now UNION ALL SELECT * FROM (" + old_other + ") openivm_scope_before)";
-			auto source_key = "openivm_changed." + SqlUtils::QuoteIdentifier(source.key_column);
-			auto other_key = "openivm_other." + SqlUtils::QuoteIdentifier(other.key_column);
-			auto predicate = side == 0 ? source_key + " " + scope.comparison + " " + other_key
-			                           : other_key + " " + scope.comparison + " " + source_key;
-			auto affected_other = "(SELECT openivm_other.* FROM " + other_rows +
-			                      " openivm_other WHERE EXISTS (SELECT 1 FROM " + changed + " openivm_changed WHERE " +
-			                      predicate + "))";
 			for (idx_t padded_side = 0; padded_side < 2; padded_side++) {
+				auto candidate = SqlUtils::QuoteIdentifier(relations[padded_side].reference);
+				auto opposite = SqlUtils::QuoteIdentifier(relations[1 - padded_side].reference);
+				auto changed_alias = padded_side == side ? string("openivm_changed") : opposite;
+				auto affected = padded_side == side ? candidate + "." + SqlUtils::QuoteIdentifier(source.key_column) +
+				                                          " IS NOT DISTINCT FROM openivm_changed." +
+				                                          SqlUtils::QuoteIdentifier(source.key_column)
+				                                    : predicate;
+				vector<string> unmatched;
+				for (idx_t endpoint = 0; endpoint < 2; endpoint++) {
+					// Padding is real only when the complete join predicate has no
+					// match at that endpoint. A matched-to-matched update must not
+					// manufacture a default key shared by unrelated unmatched rows.
+					unmatched.push_back("SELECT " + candidate + ".* FROM (" + endpoints[padded_side][endpoint] + ") " +
+					                    candidate + " WHERE EXISTS (SELECT 1 FROM " + changed + " " + changed_alias +
+					                    " WHERE " + affected + ") AND NOT EXISTS (SELECT 1 FROM (" +
+					                    endpoints[1 - padded_side][endpoint] + ") " + opposite + " WHERE " + predicate +
+					                    ")");
+				}
 				auto padded = view.Copy();
 				auto replace = [&](idx_t input_side, const string &replacement) {
 					padded->cte_map.map.at(relations[input_side].reference)->query =
 					    ParseScopeQuery("SELECT * FROM " + replacement);
 				};
-				replace(side, padded_side == 0
-				                  ? changed
-				                  : "(SELECT * FROM (" + relations[side].query + ") openivm_empty WHERE false)");
-				replace(1 - side, padded_side == 0
-				                      ? "(SELECT * FROM (" + relations[1 - side].query + ") openivm_empty WHERE false)"
-				                      : affected_other);
-				auto presence = padded_side == 0 ? source.presence_column : other.presence_column;
+				replace(padded_side, "(" + StringUtil::Join(unmatched, " UNION ALL ") + ")");
+				replace(1 - padded_side,
+				        "(SELECT * FROM (" + relations[1 - padded_side].query + ") openivm_empty WHERE false)");
+				auto &padded_source = padded_side == 0 ? scope.left : scope.right;
 				auto query = padded->ToString();
 				for (auto &key : {string("openivm_left_key"), string("openivm_right_key")}) {
-					auto opposite = key == "openivm_left_key" ? "openivm_right_key" : "openivm_left_key";
+					auto opposite_key = key == "openivm_left_key" ? "openivm_right_key" : "openivm_left_key";
 					terms.push_back("SELECT " + key + " AS _k FROM (" + query + ") openivm_padding WHERE " +
-					                SqlUtils::QuoteIdentifier(presence) + " IS TRUE AND (" + key + " IS NOT NULL OR " +
-					                opposite + " IS NULL)");
+					                SqlUtils::QuoteIdentifier(padded_source.presence_column) + " IS TRUE AND (" + key +
+					                " IS NOT NULL OR " + opposite_key + " IS NULL)");
 				}
 			}
 		}

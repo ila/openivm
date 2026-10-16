@@ -334,7 +334,7 @@ public:
 	struct FullOuterScopeInput {
 		string table;
 		idx_t occurrence = 0;
-		string presence_column;
+		idx_t presence_index = 0;
 	};
 	struct FullOuterScopeSource {
 		string key_column;
@@ -343,7 +343,6 @@ public:
 	};
 	struct FullOuterScope {
 		FullOuterScopeSource left, right;
-		string comparison;
 	};
 	vector<FullOuterScope> GetFullOuterScopes(const string &view_name);
 	static string FullOuterScopesToJson(const vector<FullOuterScope> &scopes);
