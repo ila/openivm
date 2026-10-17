@@ -537,6 +537,51 @@ p AS (SELECT n.id,COALESCE(b.v,0) AS lookup_key FROM n FULL JOIN concat_b b ON n
 SELECT p.id,d.label FROM p FULL JOIN concat_d d ON p.lookup_key=d.k""",
         )
 
+        for join_type in ("FULL", "LEFT", "RIGHT"):
+            first_arm = (
+                f"arm_a a {join_type} JOIN arm_d d ON a.k=d.k"
+                if join_type != "RIGHT"
+                else "arm_d d RIGHT JOIN arm_a a ON d.k=a.k"
+            )
+            base_query = f"""WITH p AS (
+    SELECT a.id,a.k,d.v FROM {first_arm}
+    UNION ALL SELECT b.id,b.k,dx.v FROM arm_b b LEFT JOIN arm_d dx ON b.k=dx.k
+) SELECT p.id,p.v,e.label FROM p FULL JOIN arm_e e ON p.k=e.k"""
+            run_scenario(
+                binary,
+                root,
+                f"outer_join_in_union_{join_type.lower()}",
+                f"""
+CREATE TABLE arm_a(id INT,k INT);
+CREATE TABLE arm_b(id INT,k INT);
+CREATE TABLE arm_d(k INT,v INT);
+CREATE TABLE arm_e(k INT,label VARCHAR);
+INSERT INTO arm_a VALUES(1,1),(1,1),(2,2),(NULL,NULL);
+INSERT INTO arm_b VALUES(100,100);
+INSERT INTO arm_d VALUES(1,2),(2,3),(NULL,9);
+INSERT INTO arm_e VALUES(0,'default'),(1,'one'),(2,'two'),(3,'three'),(100,'hundred');
+CREATE MATERIALIZED VIEW arm_mv AS {base_query};
+UPDATE arm_e SET label='temporary' WHERE k=2;
+INSERT INTO arm_e VALUES(2,'transient');
+DELETE FROM arm_e WHERE label='transient';
+UPDATE arm_e SET label='new' WHERE k=2;
+UPDATE arm_d SET v=99 WHERE k=1;
+INSERT INTO arm_d VALUES(1,99);
+DELETE FROM arm_d WHERE v=99;
+INSERT INTO arm_d VALUES(1,4);
+INSERT INTO arm_a VALUES(3,1);
+UPDATE arm_a SET k=2 WHERE id=3;
+DELETE FROM arm_a WHERE id=3;
+""",
+                "arm_mv",
+                {
+                    "target_dialect": "duckdb",
+                    "compile_only": True,
+                    "force_view_delta_cascade": True,
+                },
+                base_query,
+            )
+
     print("regular N-term compiled SQL integration tests passed")
 
 

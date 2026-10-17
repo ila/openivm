@@ -825,14 +825,16 @@ static FullOuterScopeRelation ReadScopeRelation(const SelectNode &view,
 	for (auto &entry : view.cte_map.map) {
 		input->cte_map.map[entry.first] = entry.second->Copy();
 		auto &info = *entry.second;
-		auto marker = std::find(info.aliases.begin(), info.aliases.end(), source.presence_column);
-		if (marker == info.aliases.end() ||
-		    std::find(info.aliases.begin(), info.aliases.end(), source.key_column) == info.aliases.end() ||
+		auto key = std::find(info.aliases.begin(), info.aliases.end(), source.key_column);
+		if (key == info.aliases.end() || key == info.aliases.begin() ||
 		    info.query->node->type != QueryNodeType::SELECT_NODE) {
 			continue;
 		}
 		auto &select = info.query->node->Cast<SelectNode>();
-		auto position = idx_t(marker - info.aliases.begin());
+		// AddScopePresence appends the marker immediately before its key.
+		// The local key is not propagated through ancestor UNIONs, so its
+		// alias stays unique even when LPTS renames the propagated marker.
+		auto position = idx_t(key - info.aliases.begin()) - 1;
 		if (position >= select.select_list.size()) {
 			continue;
 		}
@@ -990,19 +992,24 @@ static string BuildNestedFullOuterKeys(RefreshMetadata &metadata, const string &
 			for (idx_t padded_side = 0; padded_side < 2; padded_side++) {
 				auto candidate = SqlUtils::QuoteIdentifier(relations[padded_side].reference);
 				auto opposite = SqlUtils::QuoteIdentifier(relations[1 - padded_side].reference);
-				auto changed_alias = padded_side == side ? string("openivm_changed") : opposite;
-				auto affected = padded_side == side ? candidate + "." + SqlUtils::QuoteIdentifier(source.key_column) +
-				                                          " IS NOT DISTINCT FROM openivm_changed." +
-				                                          SqlUtils::QuoteIdentifier(source.key_column)
-				                                    : predicate;
 				vector<string> unmatched;
 				for (idx_t endpoint = 0; endpoint < 2; endpoint++) {
+					auto candidate_rows = endpoints[padded_side][endpoint];
+					string affected;
+					if (padded_side == side) {
+						// Retain changed rows that actually exist at this endpoint,
+						// rather than widening to every row sharing an inner key.
+						candidate_rows = "SELECT * FROM " + changed + " INTERSECT ALL SELECT * FROM (" +
+						                 candidate_rows + ") openivm_scope_endpoint";
+					} else {
+						affected =
+						    "EXISTS (SELECT 1 FROM " + changed + " " + opposite + " WHERE " + predicate + ") AND ";
+					}
 					// Padding is real only when the complete join predicate has no
 					// match at that endpoint. A matched-to-matched update must not
 					// manufacture a default key shared by unrelated unmatched rows.
-					unmatched.push_back("SELECT " + candidate + ".* FROM (" + endpoints[padded_side][endpoint] + ") " +
-					                    candidate + " WHERE EXISTS (SELECT 1 FROM " + changed + " " + changed_alias +
-					                    " WHERE " + affected + ") AND NOT EXISTS (SELECT 1 FROM (" +
+					unmatched.push_back("SELECT " + candidate + ".* FROM (" + candidate_rows + ") " + candidate +
+					                    " WHERE " + affected + "NOT EXISTS (SELECT 1 FROM (" +
 					                    endpoints[1 - padded_side][endpoint] + ") " + opposite + " WHERE " + predicate +
 					                    ")");
 				}

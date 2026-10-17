@@ -2890,3 +2890,335 @@ query I
 SELECT COUNT(*) FROM ((SELECT * FROM scope_multi_expected) EXCEPT ALL (SELECT * FROM scope_multi_mv));
 ----
 0
+
+# Outer joins inside UNION arms retain their scope markers after LPTS renaming.
+
+statement ok
+CREATE TABLE arm_a(id INT,k INT);
+
+statement ok
+CREATE TABLE arm_b(id INT,k INT);
+
+statement ok
+CREATE TABLE arm_d(k INT,v INT);
+
+statement ok
+CREATE TABLE arm_e(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO arm_a VALUES(1,1),(2,2),(NULL,NULL);
+
+statement ok
+INSERT INTO arm_b VALUES(100,100);
+
+statement ok
+INSERT INTO arm_d VALUES(1,2),(2,3),(NULL,9);
+
+statement ok
+INSERT INTO arm_e VALUES(0,'default'),(1,'one'),(2,'two'),(3,'three'),(4,'four'),(100,'hundred');
+
+statement ok
+CREATE VIEW arm_full_expected AS WITH p AS (SELECT a.id,a.k,d.v FROM arm_a a FULL JOIN arm_d d ON a.k=d.k UNION ALL SELECT b.id,b.k,dx.v FROM arm_b b LEFT JOIN arm_d dx ON b.k=dx.k) SELECT p.id,p.v,e.label FROM p FULL JOIN arm_e e ON p.k=e.k;
+
+statement ok
+CREATE MATERIALIZED VIEW arm_full_mv AS WITH p AS (SELECT a.id,a.k,d.v FROM arm_a a FULL JOIN arm_d d ON a.k=d.k UNION ALL SELECT b.id,b.k,dx.v FROM arm_b b LEFT JOIN arm_d dx ON b.k=dx.k) SELECT p.id,p.v,e.label FROM p FULL JOIN arm_e e ON p.k=e.k;
+
+statement ok
+CREATE VIEW arm_left_expected AS WITH p AS (SELECT a.id,a.k,d.v FROM arm_a a LEFT JOIN arm_d d ON a.k=d.k UNION ALL SELECT b.id,b.k,dx.v FROM arm_b b LEFT JOIN arm_d dx ON b.k=dx.k) SELECT p.id,p.v,e.label FROM p FULL JOIN arm_e e ON p.k=e.k;
+
+statement ok
+CREATE MATERIALIZED VIEW arm_left_mv AS WITH p AS (SELECT a.id,a.k,d.v FROM arm_a a LEFT JOIN arm_d d ON a.k=d.k UNION ALL SELECT b.id,b.k,dx.v FROM arm_b b LEFT JOIN arm_d dx ON b.k=dx.k) SELECT p.id,p.v,e.label FROM p FULL JOIN arm_e e ON p.k=e.k;
+
+statement ok
+CREATE VIEW arm_right_expected AS WITH p AS (SELECT a.id,a.k,d.v FROM arm_d d RIGHT JOIN arm_a a ON d.k=a.k UNION ALL SELECT b.id,b.k,dx.v FROM arm_b b LEFT JOIN arm_d dx ON b.k=dx.k) SELECT p.id,p.v,e.label FROM p FULL JOIN arm_e e ON p.k=e.k;
+
+statement ok
+CREATE MATERIALIZED VIEW arm_right_mv AS WITH p AS (SELECT a.id,a.k,d.v FROM arm_d d RIGHT JOIN arm_a a ON d.k=a.k UNION ALL SELECT b.id,b.k,dx.v FROM arm_b b LEFT JOIN arm_d dx ON b.k=dx.k) SELECT p.id,p.v,e.label FROM p FULL JOIN arm_e e ON p.k=e.k;
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_sql_name IN ('arm_full_mv','arm_left_mv','arm_right_mv') AND type=2;
+----
+3
+
+statement ok
+UPDATE arm_e SET label='temporary' WHERE k=2;
+
+statement ok
+INSERT INTO arm_e VALUES(2,'transient');
+
+statement ok
+DELETE FROM arm_e WHERE label='transient';
+
+statement ok
+UPDATE arm_e SET label='new' WHERE k=2;
+
+statement ok
+PRAGMA refresh('arm_full_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_full_mv) EXCEPT ALL (SELECT * FROM arm_full_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_full_expected) EXCEPT ALL (SELECT * FROM arm_full_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('arm_left_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_left_mv) EXCEPT ALL (SELECT * FROM arm_left_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_left_expected) EXCEPT ALL (SELECT * FROM arm_left_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('arm_right_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_right_mv) EXCEPT ALL (SELECT * FROM arm_right_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_right_expected) EXCEPT ALL (SELECT * FROM arm_right_mv));
+----
+0
+
+statement ok
+UPDATE arm_d SET v=99 WHERE k=1;
+
+statement ok
+INSERT INTO arm_d VALUES(1,99);
+
+statement ok
+DELETE FROM arm_d WHERE v=99;
+
+statement ok
+INSERT INTO arm_d VALUES(1,4);
+
+statement ok
+PRAGMA refresh('arm_full_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_full_mv) EXCEPT ALL (SELECT * FROM arm_full_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_full_expected) EXCEPT ALL (SELECT * FROM arm_full_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('arm_left_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_left_mv) EXCEPT ALL (SELECT * FROM arm_left_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_left_expected) EXCEPT ALL (SELECT * FROM arm_left_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('arm_right_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_right_mv) EXCEPT ALL (SELECT * FROM arm_right_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_right_expected) EXCEPT ALL (SELECT * FROM arm_right_mv));
+----
+0
+
+statement ok
+INSERT INTO arm_a VALUES(3,3);
+
+statement ok
+INSERT INTO arm_d VALUES(3,2);
+
+statement ok
+UPDATE arm_a SET k=2 WHERE id=3;
+
+statement ok
+DELETE FROM arm_d WHERE k=3;
+
+statement ok
+INSERT INTO arm_b VALUES(101,2);
+
+statement ok
+UPDATE arm_b SET k=3 WHERE id=101;
+
+statement ok
+DELETE FROM arm_b WHERE id=101;
+
+statement ok
+INSERT INTO arm_b VALUES(101,2);
+
+statement ok
+PRAGMA refresh('arm_full_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_full_mv) EXCEPT ALL (SELECT * FROM arm_full_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_full_expected) EXCEPT ALL (SELECT * FROM arm_full_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('arm_left_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_left_mv) EXCEPT ALL (SELECT * FROM arm_left_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_left_expected) EXCEPT ALL (SELECT * FROM arm_left_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('arm_right_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_right_mv) EXCEPT ALL (SELECT * FROM arm_right_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_right_expected) EXCEPT ALL (SELECT * FROM arm_right_mv));
+----
+0
+
+# Changed rows sharing an inner key do not widen to other final lookup keys.
+
+statement ok
+CREATE TABLE bucket_a(id INT,k INT,v INT,payload VARCHAR);
+
+statement ok
+CREATE TABLE bucket_b(k INT,v INT);
+
+statement ok
+CREATE TABLE bucket_d(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO bucket_a VALUES(1,1,1,'a');
+
+statement ok
+INSERT INTO bucket_a SELECT i,1,i,'unchanged' FROM range(100,1100)t(i);
+
+statement ok
+INSERT INTO bucket_d VALUES(0,'default'),(1,'one'),(42,'forty-two');
+
+statement ok
+INSERT INTO bucket_d SELECT i,'unchanged' FROM range(100,1100)t(i);
+
+statement ok
+CREATE VIEW bucket_expected AS WITH p AS (SELECT a.id,a.payload,COALESCE(a.v,b.v,0) AS lookup_key FROM bucket_a a FULL JOIN bucket_b b ON a.k=b.k) SELECT p.id,p.payload,d.label FROM p FULL JOIN bucket_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW bucket_mv AS WITH p AS (SELECT a.id,a.payload,COALESCE(a.v,b.v,0) AS lookup_key FROM bucket_a a FULL JOIN bucket_b b ON a.k=b.k) SELECT p.id,p.payload,d.label FROM p FULL JOIN bucket_d d ON p.lookup_key=d.k;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='bucket_mv';
+----
+2
+
+statement ok rowid_snapshot
+BEGIN;
+
+statement ok rowid_snapshot
+SELECT COUNT(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_;
+
+statement ok
+CREATE OR REPLACE TABLE bucket_untouched AS SELECT rowid AS old_rowid,id FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_ WHERE id>=100;
+
+statement ok
+UPDATE bucket_a SET payload='temporary' WHERE id=1;
+
+statement ok
+INSERT INTO bucket_a VALUES(2,1,1,'transient');
+
+statement ok
+DELETE FROM bucket_a WHERE id=2;
+
+statement ok
+UPDATE bucket_a SET payload='new' WHERE id=1;
+
+statement ok
+PRAGMA refresh('bucket_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_mv) EXCEPT ALL (SELECT * FROM bucket_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_expected) EXCEPT ALL (SELECT * FROM bucket_mv));
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM bucket_untouched EXCEPT ALL SELECT rowid,id FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_ WHERE id>=100);
+----
+0
+
+statement ok rowid_snapshot
+COMMIT;
+
+statement ok rowid_snapshot
+BEGIN;
+
+statement ok rowid_snapshot
+SELECT COUNT(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_;
+
+statement ok
+CREATE OR REPLACE TABLE bucket_untouched AS SELECT rowid AS old_rowid,id FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_ WHERE id>=100;
+
+statement ok
+UPDATE bucket_a SET v=99 WHERE id=1;
+
+statement ok
+INSERT INTO bucket_a VALUES(2,1,99,'transient');
+
+statement ok
+DELETE FROM bucket_a WHERE id=2;
+
+statement ok
+UPDATE bucket_a SET v=42 WHERE id=1;
+
+statement ok
+PRAGMA refresh('bucket_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_mv) EXCEPT ALL (SELECT * FROM bucket_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_expected) EXCEPT ALL (SELECT * FROM bucket_mv));
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM bucket_untouched EXCEPT ALL SELECT rowid,id FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_ WHERE id>=100);
+----
+0
+
+statement ok rowid_snapshot
+COMMIT;
