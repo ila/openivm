@@ -1321,6 +1321,8 @@ bool RefreshMetadata::GetLeftJoinKeySource(const string &view_name, LeftJoinKeyS
 		return false;
 	}
 	out.cardinality_transition_check_safe = false;
+	out.cast_type.clear();
+	MetadataJson::ExtractJsonString(json, "cast_type", out.cast_type);
 	string cardinality_transition_check_safe;
 	if (MetadataJson::ExtractJsonString(json, "cardinality_transition_check_safe", cardinality_transition_check_safe)) {
 		out.cardinality_transition_check_safe = StringUtil::CIEquals(cardinality_transition_check_safe, "true");
@@ -1332,8 +1334,62 @@ bool RefreshMetadata::GetLeftJoinKeySource(const string &view_name, LeftJoinKeyS
 string RefreshMetadata::LeftJoinKeySourceToJson(const LeftJoinKeySource &source) {
 	return "{\"k\":\"left_join_key_source\",\"table\":" + SqlUtils::JsonQuote(source.table) +
 	       ",\"occ\":" + SqlUtils::JsonQuote(to_string(source.occurrence)) +
-	       ",\"column\":" + SqlUtils::JsonQuote(source.column) + ",\"cardinality_transition_check_safe\":" +
+	       ",\"column\":" + SqlUtils::JsonQuote(source.column) +
+	       ",\"cast_type\":" + SqlUtils::JsonQuote(source.cast_type) + ",\"cardinality_transition_check_safe\":" +
 	       SqlUtils::JsonQuote(source.cardinality_transition_check_safe ? "true" : "false") + "}";
+}
+
+vector<RefreshMetadata::FullOuterScope> RefreshMetadata::GetFullOuterScopes(const string &view_name) {
+	vector<FullOuterScope> scopes;
+	string json;
+	if (!ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "full_outer_scopes", json)) {
+		return scopes;
+	}
+	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "scopes")) {
+		FullOuterScope scope;
+		bool complete = true;
+		for (idx_t side = 0; side < 2; side++) {
+			auto &source = side == 0 ? scope.left : scope.right;
+			string prefix = side == 0 ? "left_" : "right_";
+			complete = complete && MetadataJson::ExtractJsonString(object, prefix + "key", source.key_column) &&
+			           MetadataJson::ExtractJsonString(object, prefix + "presence", source.presence_column);
+			for (auto &input_json : MetadataJson::ExtractJsonObjectsFromArray(object, prefix + "inputs")) {
+				FullOuterScopeInput input;
+				complete = complete && MetadataJson::ExtractJsonString(input_json, "table", input.table) &&
+				           ParseJsonIndex(input_json, "occ", input.occurrence) &&
+				           ParseJsonIndex(input_json, "presence_index", input.presence_index);
+				source.inputs.push_back(std::move(input));
+			}
+			complete = complete && !source.inputs.empty();
+		}
+		if (complete) {
+			scopes.push_back(std::move(scope));
+		}
+	}
+	return scopes;
+}
+
+string RefreshMetadata::FullOuterScopesToJson(const vector<FullOuterScope> &scopes) {
+	vector<string> objects;
+	for (auto &scope : scopes) {
+		vector<string> fields;
+		for (idx_t side = 0; side < 2; side++) {
+			auto &source = side == 0 ? scope.left : scope.right;
+			string prefix = side == 0 ? "left_" : "right_";
+			fields.push_back(SqlUtils::JsonQuote(prefix + "key") + ":" + SqlUtils::JsonQuote(source.key_column));
+			fields.push_back(SqlUtils::JsonQuote(prefix + "presence") + ":" +
+			                 SqlUtils::JsonQuote(source.presence_column));
+			vector<string> inputs;
+			for (auto &input : source.inputs) {
+				inputs.push_back("{\"table\":" + SqlUtils::JsonQuote(input.table) +
+				                 ",\"occ\":" + SqlUtils::JsonQuote(to_string(input.occurrence)) +
+				                 ",\"presence_index\":" + SqlUtils::JsonQuote(to_string(input.presence_index)) + "}");
+			}
+			fields.push_back(SqlUtils::JsonQuote(prefix + "inputs") + ":[" + StringUtil::Join(inputs, ",") + "]");
+		}
+		objects.push_back("{" + StringUtil::Join(fields, ",") + "}");
+	}
+	return "{\"k\":\"full_outer_scopes\",\"scopes\":[" + StringUtil::Join(objects, ",") + "]}";
 }
 
 string RefreshMetadata::LeftJoinNullableSourcesToJson(const LeftJoinNullableSources &src) {

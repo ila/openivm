@@ -9,7 +9,12 @@ namespace duckdb {
 
 struct CreateMVPlanFacts;
 class BoundWindowExpression;
+class LogicalComparisonJoin;
 bool IsRunningWindowCandidate(const BoundWindowExpression &window);
+
+/// Keep the first usable projection refresh key whose lineage stays on
+/// preserved inputs; search its preserved subtree when that key is unsafe.
+LogicalComparisonJoin *FindProjectionKeyJoin(LogicalOperator &plan);
 
 struct PlanRewriteNeeds {
 	bool inline_cte_refs = false;
