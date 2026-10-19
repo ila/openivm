@@ -1,0 +1,613 @@
+# name: test/sql/cost_model.test
+# description: Cost model internals — the refresh executes the plan the cost model costed
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_adaptive_refresh=true;
+
+# ==========================================
+# Test 1: aggregate view, mixed DML in one batch
+#
+# With adaptive refresh on, the delta plan is built before the strategy decision and reused for
+# SQL generation. This exercises that path end to end: a single refresh consolidating inserts,
+# deletes and updates that all land in the same groups.
+# ==========================================
+
+statement ok
+CREATE TABLE cm_sales (id INT, region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO cm_sales SELECT i, 'r' || (i % 5)::VARCHAR, i FROM range(1, 501) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW cm_mv_agg AS
+  SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM cm_sales GROUP BY region;
+
+query I
+SELECT count(*) FROM cm_mv_agg;
+----
+5
+
+# Batch conflicting DML on overlapping rows before a single refresh, so the refresh has to
+# consolidate them rather than see one operation at a time.
+statement ok
+INSERT INTO cm_sales SELECT i, 'r' || (i % 5)::VARCHAR, i FROM range(501, 601) t(i);
+
+statement ok
+DELETE FROM cm_sales WHERE id BETWEEN 100 AND 150;
+
+statement ok
+UPDATE cm_sales SET amount = amount * 2 WHERE id BETWEEN 200 AND 260;
+
+statement ok
+UPDATE cm_sales SET region = 'r9' WHERE id BETWEEN 300 AND 320;
+
+statement ok
+PRAGMA refresh('cm_mv_agg');
+
+# Full bag equality against the base query, both directions.
+query I
+SELECT count(*) FROM ((SELECT * FROM cm_mv_agg)
+  EXCEPT ALL
+  (SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM cm_sales GROUP BY region)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM cm_sales GROUP BY region)
+  EXCEPT ALL
+  (SELECT * FROM cm_mv_agg)) x;
+----
+0
+
+# ==========================================
+# Test 2: join view — the delta plan is where plan reuse matters most, because the rewrite
+# expands a join into inclusion-exclusion terms.
+# ==========================================
+
+statement ok
+CREATE TABLE cm_cust (c_id INT, c_region VARCHAR);
+
+statement ok
+CREATE TABLE cm_ord (o_id INT, o_c_id INT, o_amount INT);
+
+statement ok
+INSERT INTO cm_cust SELECT i, 'reg' || (i % 4)::VARCHAR FROM range(1, 201) t(i);
+
+statement ok
+INSERT INTO cm_ord SELECT i, (i % 200) + 1, i * 3 FROM range(1, 1001) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW cm_mv_join AS
+  SELECT c.c_region, SUM(o.o_amount) AS revenue
+  FROM cm_cust c JOIN cm_ord o ON c.c_id = o.o_c_id
+  GROUP BY c.c_region;
+
+# Both sides of the join change in the same batch, so every inclusion-exclusion term is live.
+statement ok
+INSERT INTO cm_cust SELECT i, 'reg' || (i % 4)::VARCHAR FROM range(201, 231) t(i);
+
+statement ok
+INSERT INTO cm_ord SELECT i, (i % 230) + 1, i * 3 FROM range(1001, 1101) t(i);
+
+statement ok
+DELETE FROM cm_ord WHERE o_id BETWEEN 50 AND 90;
+
+statement ok
+UPDATE cm_ord SET o_amount = o_amount + 7 WHERE o_id BETWEEN 400 AND 450;
+
+statement ok
+PRAGMA refresh('cm_mv_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cm_mv_join)
+  EXCEPT ALL
+  (SELECT c.c_region, SUM(o.o_amount) AS revenue
+     FROM cm_cust c JOIN cm_ord o ON c.c_id = o.o_c_id GROUP BY c.c_region)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT c.c_region, SUM(o.o_amount) AS revenue
+     FROM cm_cust c JOIN cm_ord o ON c.c_id = o.o_c_id GROUP BY c.c_region)
+  EXCEPT ALL
+  (SELECT * FROM cm_mv_join)) x;
+----
+0
+
+# ==========================================
+# Test 3: the same views refresh correctly with adaptive refresh off, where no plan is
+# pre-built and the delta plan is constructed at its original point.
+# ==========================================
+
+statement ok
+SET openivm_adaptive_refresh=false;
+
+statement ok
+INSERT INTO cm_ord SELECT i, (i % 230) + 1, i FROM range(1101, 1151) t(i);
+
+statement ok
+DELETE FROM cm_cust WHERE c_id BETWEEN 210 AND 220;
+
+statement ok
+PRAGMA refresh('cm_mv_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cm_mv_join)
+  EXCEPT ALL
+  (SELECT c.c_region, SUM(o.o_amount) AS revenue
+     FROM cm_cust c JOIN cm_ord o ON c.c_id = o.o_c_id GROUP BY c.c_region)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT c.c_region, SUM(o.o_amount) AS revenue
+     FROM cm_cust c JOIN cm_ord o ON c.c_id = o.o_c_id GROUP BY c.c_region)
+  EXCEPT ALL
+  (SELECT * FROM cm_mv_join)) x;
+----
+0
+
+# ==========================================
+# Test 4: projection view under adaptive refresh, empty delta then a real delta.
+# ==========================================
+
+statement ok
+SET openivm_adaptive_refresh=true;
+
+statement ok
+CREATE TABLE cm_events (id INT, kind VARCHAR, val INT);
+
+statement ok
+INSERT INTO cm_events SELECT i, 'k' || (i % 3)::VARCHAR, i FROM range(1, 301) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW cm_mv_proj AS SELECT id, kind, val FROM cm_events WHERE val > 10;
+
+# Refresh with nothing pending must be a no-op that still leaves the view correct.
+statement ok
+PRAGMA refresh('cm_mv_proj');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cm_mv_proj)
+  EXCEPT ALL
+  (SELECT id, kind, val FROM cm_events WHERE val > 10)) x;
+----
+0
+
+statement ok
+INSERT INTO cm_events SELECT i, 'k' || (i % 3)::VARCHAR, i FROM range(301, 351) t(i);
+
+statement ok
+DELETE FROM cm_events WHERE id BETWEEN 20 AND 40;
+
+statement ok
+UPDATE cm_events SET val = 5 WHERE id BETWEEN 100 AND 120;
+
+statement ok
+PRAGMA refresh('cm_mv_proj');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cm_mv_proj)
+  EXCEPT ALL
+  (SELECT id, kind, val FROM cm_events WHERE val > 10)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id, kind, val FROM cm_events WHERE val > 10)
+  EXCEPT ALL
+  (SELECT * FROM cm_mv_proj)) x;
+----
+0
+
+# ==========================================
+# Test 5: every adaptive refresh reaches a decision and records it, which is what the learned
+# model later calibrates against. The specific strategy is data dependent, so assert that a
+# valid one was chosen rather than pinning which.
+# ==========================================
+
+query I
+SELECT count(*) > 0 FROM openivm_refresh_history
+  WHERE view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'cm_mv_agg') AND method IN ('incremental', 'full');
+----
+true
+
+query I
+SELECT count(*) > 0 FROM openivm_refresh_history
+  WHERE view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'cm_mv_join') AND method IN ('incremental', 'full');
+----
+true
+
+# No refresh may record a duration that is negative or absent.
+query I
+SELECT count(*) FROM openivm_refresh_history WHERE actual_duration_ms IS NULL OR actual_duration_ms < 0;
+----
+0
+
+# ==========================================
+# Test 6: the learned per-operator cost model
+#
+# Every refresh records the row estimate per operator class for the plan that ran, paired with how
+# long it took. Once enough of those accumulate, weights are fitted over them and replace the
+# hand-tuned millisecond constants. The constants under-predicted both strategies by roughly a
+# factor of two across a 2,520-case sweep, which is what the fit exists to correct.
+# ==========================================
+
+statement ok
+SET openivm_adaptive_refresh=true;
+
+statement ok
+CREATE TABLE fm_base (g INT, v INT);
+
+statement ok
+INSERT INTO fm_base SELECT i % 8, i FROM range(1, 401) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW fm_mv AS SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GROUP BY g;
+
+# Forty-eight cycles guarantee at least 24 samples for one of the two strategies,
+# regardless of timing-dependent choices or exploration. Keep the fitter's evidence
+# threshold independent of which strategy happens to win on this machine.
+loop i 0 48
+
+statement ok
+INSERT INTO fm_base VALUES (${i} % 8, ${i});
+
+statement ok
+PRAGMA refresh('fm_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM fm_mv EXCEPT ALL SELECT g,SUM(v),COUNT(*) FROM fm_base GROUP BY g)
+  UNION ALL (SELECT g,SUM(v),COUNT(*) FROM fm_base GROUP BY g EXCEPT ALL SELECT * FROM fm_mv));
+----
+0
+
+endloop
+
+# Features are recorded, and every vector has the width the current layout declares.
+query I
+SELECT count(*) > 0 FROM openivm_refresh_history WHERE view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'fm_mv') AND plan_features IS NOT NULL;
+----
+true
+
+query I
+SELECT count(DISTINCT len(plan_features)) FROM openivm_refresh_history WHERE plan_features IS NOT NULL;
+----
+1
+
+# Recorded under the current layout, so a later layout change does not silently reinterpret them.
+query I
+SELECT count(*) FROM openivm_refresh_history WHERE plan_features IS NOT NULL AND feature_schema <> 1;
+----
+0
+
+# No feature is negative: these are row counts.
+query I
+SELECT count(*) FROM (SELECT unnest(plan_features) AS f FROM openivm_refresh_history
+                        WHERE plan_features IS NOT NULL) x WHERE f < 0;
+----
+0
+
+# Enough samples under the current layout for the fitter to engage. Thirteen parameters need more
+# evidence than the two-term fallback, so this threshold is what decides whether the learned weights
+# are used at all; asserting it keeps a silent fall-through to the fallback from passing as success.
+#
+# Weights are fitted per strategy. The view records whichever strategy ran, so
+# allow both choices while requiring one to have enough real execution samples.
+query I
+SELECT max(c) >= 24 FROM (SELECT method, count(*) AS c FROM openivm_refresh_history
+                            WHERE plan_features IS NOT NULL AND feature_schema = 1
+                            GROUP BY method) x;
+----
+true
+
+# Why the requirement scales rather than sitting at the worst case: a grouped aggregate over one
+# table exercises only a handful of the twelve feature slots. The rest are flat zero — no join, no
+# window, no set operation — and a column that never varies contributes nothing but dimensionality.
+# Asserting this keeps the sizing rule honest if the feature set grows.
+query I
+SELECT count(*) < 8 FROM (
+  SELECT idx FROM (SELECT unnest(plan_features) AS val, generate_subscripts(plan_features, 1) AS idx
+                     FROM openivm_refresh_history
+                     WHERE view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'fm_mv') AND plan_features IS NOT NULL) f
+  GROUP BY idx HAVING count(DISTINCT val) > 1) x;
+----
+true
+
+# The view still refreshes correctly while all of this is being recorded.
+statement ok
+INSERT INTO fm_base VALUES (3, 9999);
+
+statement ok
+DELETE FROM fm_base WHERE v = 1;
+
+statement ok
+PRAGMA refresh('fm_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM fm_mv)
+  EXCEPT ALL
+  (SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GROUP BY g)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GROUP BY g)
+  EXCEPT ALL
+  (SELECT * FROM fm_mv)) x;
+----
+0
+
+# ==========================================
+# Test 7: exploration breaks the feedback loop
+#
+# Weights are learned from executions, so a strategy the model stops choosing stops producing the
+# samples that would show it was right. A view can repeatedly choose full recompute
+# and leave the incremental side untrained. Exploration spends a bounded amount of
+# runtime measuring the neglected strategy so the estimate that sidelined it can be corrected.
+# ==========================================
+
+statement ok
+SET openivm_adaptive_refresh=true;
+
+statement ok
+SET openivm_adaptive_explore=true;
+
+# Exploration counts samples across views. Start with untrained history so Test 6
+# cannot satisfy both strategy quotas before this scenario begins.
+statement ok
+DELETE FROM openivm_refresh_history;
+
+statement ok
+CREATE TABLE ex_base (g INT, v INT);
+
+statement ok
+INSERT INTO ex_base SELECT i % 4, i FROM range(1, 201) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW ex_mv AS SELECT g, SUM(v) AS total FROM ex_base GROUP BY g;
+
+loop i 0 30
+
+statement ok
+INSERT INTO ex_base VALUES (${i} % 4, ${i});
+
+statement ok
+PRAGMA refresh('ex_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ex_mv EXCEPT ALL SELECT g,SUM(v) FROM ex_base GROUP BY g)
+  UNION ALL (SELECT g,SUM(v) FROM ex_base GROUP BY g EXCEPT ALL SELECT * FROM ex_mv));
+----
+0
+
+endloop
+
+# Refreshes that ran the strategy the model expected to lose are marked as such. Counting distinct
+# methods would not prove anything here: the model flips between them on its own as the view grows,
+# so that assertion passes with exploration disabled. The flag is the only signal that isolates it.
+query I
+SELECT count(*) > 0 FROM openivm_refresh_history WHERE view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'ex_mv') AND exploratory;
+----
+true
+
+# Exploration stays a small minority: it is there to gather evidence, not to override the model.
+# One refresh in ten is the cap, so at 30 refreshes it must be well under a third.
+query I
+SELECT count(*) FILTER (WHERE exploratory) * 3 < count(*) FROM openivm_refresh_history
+  WHERE view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'ex_mv');
+----
+true
+
+# Every refresh stayed correct, including the explored ones, which take the strategy the model
+# expected to be slower rather than a different answer.
+query I
+SELECT count(*) FROM ((SELECT * FROM ex_mv)
+  EXCEPT ALL
+  (SELECT g, SUM(v) AS total FROM ex_base GROUP BY g)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT g, SUM(v) AS total FROM ex_base GROUP BY g)
+  EXCEPT ALL
+  (SELECT * FROM ex_mv)) x;
+----
+0
+
+# Turning it off is respected: no refresh after this point is marked exploratory.
+statement ok
+SET openivm_adaptive_explore=false;
+
+statement ok
+CREATE TABLE ex_off (g INT, v INT);
+
+statement ok
+INSERT INTO ex_off SELECT i % 4, i FROM range(1, 201) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW ex_off_mv AS SELECT g, SUM(v) AS total FROM ex_off GROUP BY g;
+
+loop i 0 25
+
+statement ok
+INSERT INTO ex_off VALUES (${i} % 4, ${i});
+
+statement ok
+PRAGMA refresh('ex_off_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ex_off_mv EXCEPT ALL SELECT g,SUM(v) FROM ex_off GROUP BY g)
+  UNION ALL (SELECT g,SUM(v) FROM ex_off GROUP BY g EXCEPT ALL SELECT * FROM ex_off_mv));
+----
+0
+
+endloop
+
+query I
+SELECT count(*) FROM openivm_refresh_history WHERE view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'ex_off_mv') AND exploratory;
+----
+0
+
+statement ok
+INSERT INTO ex_base VALUES (1, 77777);
+
+statement ok
+PRAGMA refresh('ex_mv');
+
+query I
+SELECT count(*) FROM ((SELECT g, SUM(v) AS total FROM ex_base GROUP BY g)
+  EXCEPT ALL
+  (SELECT * FROM ex_mv)) x;
+----
+0
+
+# Sparse calibration learns an intercept after three observations, without fitting
+# three independent coefficients to three samples. Synthetic durations make the
+# decision deterministic; the refresh and mixed-DML correctness checks are real.
+statement ok
+SET openivm_adaptive_explore=false;
+
+statement ok
+CREATE TABLE early_base(id INTEGER, g INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO early_base SELECT i, i % 4, i FROM range(100) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW early_mv AS SELECT g, SUM(v) AS total, COUNT(*) AS n FROM early_base GROUP BY g;
+
+loop samples 2 4
+
+statement ok
+DELETE FROM openivm_refresh_history;
+
+# The competitor already has enough evidence for its full regression.
+statement ok
+INSERT INTO openivm_refresh_history
+(view_name, refresh_timestamp, method, recompute_compute_est, recompute_replace_est, actual_duration_ms)
+SELECT (SELECT view_name FROM openivm_views WHERE view_sql_name = 'early_mv'), TIMESTAMP '2020-01-01' + i * INTERVAL '1 second', 'full', 0, 0, 1000
+FROM range(9) t(i);
+
+statement ok
+INSERT INTO openivm_refresh_history
+(view_name, refresh_timestamp, method, incremental_compute_est, incremental_upsert_est, actual_duration_ms)
+SELECT (SELECT view_name FROM openivm_views WHERE view_sql_name = 'early_mv'), TIMESTAMP '2020-01-02' + i * INTERVAL '1 second', 'incremental', 1, 1, 1000000000
+FROM range(${samples}) t(i);
+
+statement ok
+INSERT INTO early_base VALUES (100, 1, 10), (101, 2, 20);
+
+statement ok
+UPDATE early_base SET v = v + 5 WHERE id IN (0, 100, 101);
+
+statement ok
+DELETE FROM early_base WHERE id IN (100, 101);
+
+statement ok
+PRAGMA refresh('early_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM early_mv EXCEPT ALL SELECT g,SUM(v),COUNT(*) FROM early_base GROUP BY g)
+UNION ALL (SELECT g,SUM(v),COUNT(*) FROM early_base GROUP BY g EXCEPT ALL SELECT * FROM early_mv));
+----
+0
+
+query I
+SELECT method = CASE WHEN ${samples} = 2 THEN 'incremental' ELSE 'full' END
+FROM openivm_refresh_history WHERE view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'early_mv') ORDER BY refresh_timestamp DESC LIMIT 1;
+----
+true
+
+endloop
+
+# A bounded history window must retain the newest observations. The old twenty
+# samples say incremental is slow; the new twenty say it is fast. Neither set has
+# feature vectors, so this isolates the per-view fallback from the pooled fit.
+# With decay zero, only the very newest sample is fast: this also checks that the
+# selected window is returned in chronological order before weighting.
+loop decay 0 2
+
+statement ok
+SET openivm_cost_decay=${decay};
+
+statement ok
+DELETE FROM openivm_refresh_history;
+
+statement ok
+INSERT INTO openivm_refresh_history
+(view_name, refresh_timestamp, method, recompute_compute_est, recompute_replace_est, actual_duration_ms)
+SELECT (SELECT view_name FROM openivm_views WHERE view_sql_name = 'early_mv'), TIMESTAMP '2020-01-01' + i * INTERVAL '1 second', 'full', 0, 0, 1000
+FROM range(9) t(i);
+
+statement ok
+INSERT INTO openivm_refresh_history
+(view_name, refresh_timestamp, method, incremental_compute_est, incremental_upsert_est, actual_duration_ms)
+SELECT (SELECT view_name FROM openivm_views WHERE view_sql_name = 'early_mv'), TIMESTAMP '2020-01-02' + i * INTERVAL '1 second', 'incremental', 1000000, 1000000,
+       CASE WHEN i < CASE WHEN ${decay} = 0 THEN 39 ELSE 20 END THEN 1000000000 ELSE 1 END
+FROM range(40) t(i);
+
+statement ok
+INSERT INTO early_base VALUES (100, 1, 10), (101, 2, 20);
+
+statement ok
+UPDATE early_base SET v = v + 5 WHERE id IN (0, 100, 101);
+
+statement ok
+DELETE FROM early_base WHERE id IN (100, 101);
+
+statement ok
+PRAGMA refresh('early_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM early_mv EXCEPT ALL SELECT g,SUM(v),COUNT(*) FROM early_base GROUP BY g)
+UNION ALL (SELECT g,SUM(v),COUNT(*) FROM early_base GROUP BY g EXCEPT ALL SELECT * FROM early_mv));
+----
+0
+
+query T
+SELECT method FROM openivm_refresh_history WHERE view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'early_mv') ORDER BY refresh_timestamp DESC LIMIT 1;
+----
+incremental
+
+endloop
+
+# With only three observations, learn their level without inventing a per-row
+# slope: the same fixed duration was observed at three different work estimates.
+statement ok
+DELETE FROM openivm_refresh_history;
+
+statement ok
+INSERT INTO openivm_refresh_history
+(view_name, refresh_timestamp, method, recompute_compute_est, recompute_replace_est, actual_duration_ms)
+SELECT (SELECT view_name FROM openivm_views WHERE view_sql_name = 'early_mv'), TIMESTAMP '2020-01-01' + i * INTERVAL '1 second', 'full', 0, 0, 1000
+FROM range(9) t(i);
+
+statement ok
+INSERT INTO openivm_refresh_history
+(view_name, refresh_timestamp, method, incremental_compute_est, incremental_upsert_est, actual_duration_ms)
+SELECT (SELECT view_name FROM openivm_views WHERE view_sql_name = 'early_mv'), TIMESTAMP '2020-01-02' + i * INTERVAL '1 second', 'incremental', i + 1, 0, 100
+FROM range(3) t(i);
+
+statement ok
+INSERT INTO early_base VALUES (102, 1, 20);
+
+query TTTTTT
+PRAGMA refresh_cost('early_mv');
+----
+incremental	<REGEX>:.*	<REGEX>:.*	<REGEX>:100(\.0+)?	<REGEX>:.*	true
+
+statement ok
+PRAGMA refresh('early_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM early_mv EXCEPT ALL SELECT g,SUM(v),COUNT(*) FROM early_base GROUP BY g)
+UNION ALL (SELECT g,SUM(v),COUNT(*) FROM early_base GROUP BY g EXCEPT ALL SELECT * FROM early_mv));
+----
+0
