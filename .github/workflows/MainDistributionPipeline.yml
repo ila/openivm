@@ -12,12 +12,12 @@ jobs:
     timeout-minutes: 360
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: '4'
-      OPENIVM_CANDIDATE: a488b2dcd27de230071bf0f04c64408045b6e2be
+      OPENIVM_CANDIDATE: 06f14dc2b3f79c571afa4bb718527da2d0c0fa7c
     steps:
       - name: Checkout exact rebased candidate
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
         with:
-          ref: a488b2dcd27de230071bf0f04c64408045b6e2be
+          ref: 06f14dc2b3f79c571afa4bb718527da2d0c0fa7c
       - name: Initialize pinned build dependencies
         run: git submodule update --init --recursive duckdb extension-ci-tools third_party/lpts
       - name: Configure and build the rewriter benchmark
