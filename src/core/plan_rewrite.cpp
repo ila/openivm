@@ -2086,6 +2086,9 @@ bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &p
 	unordered_map<uint64_t, string> binding_to_column;
 	auto bindings = plan.GetColumnBindings();
 	for (idx_t i = 0; i < bindings.size() && i < output_names.size(); i++) {
+		// Computed outputs are already available by their published aliases.
+		// Only pass-through lineage can also expose an input under that alias.
+		binding_to_column[DerivedOutputBindingKey(bindings[i])] = output_names[i];
 		BoundColumnRefExpression output(LogicalType::SQLNULL, bindings[i]);
 		vector<uint64_t> path;
 		auto resolved = ResolveDerivedOutputPassThrough(output, projections, &path);
