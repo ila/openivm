@@ -892,7 +892,7 @@ SELECT * FROM publication_expr_top;
 2	20
 
 query I
-SELECT count(*) FROM openivm_views WHERE view_sql_name IN ('publication_expr_mv','publication_expr_top') AND refresh_type=2;
+SELECT count(*) FROM openivm_views WHERE view_sql_name IN ('publication_expr_mv','publication_expr_top') AND type=2;
 ----
 2
 
