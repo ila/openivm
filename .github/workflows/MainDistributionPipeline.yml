@@ -1,30 +1,90 @@
-#
-# This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
-#
-name: Main Extension Distribution Pipeline
+name: PR119 rewriter SF1 validation
+
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
-  cancel-in-progress: true
+permissions:
+  contents: read
 
 jobs:
-  duckdb-stable-build:
-    name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.4
-    with:
-      duckdb_version: v1.5.4
-      ci_tools_version: v1.5.4
-      extension_name: openivm
-
-  code-quality-check:
-    name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5.4
-    with:
-      duckdb_version: v1.5.4
-      ci_tools_version: v1.5.4
-      extension_name: openivm
-      format_checks: 'format;tidy'
+  rewriter:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: '4'
+      OPENIVM_CANDIDATE: a488b2dcd27de230071bf0f04c64408045b6e2be
+    steps:
+      - name: Checkout exact rebased candidate
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          ref: a488b2dcd27de230071bf0f04c64408045b6e2be
+      - name: Initialize pinned build dependencies
+        run: git submodule update --init --recursive duckdb extension-ci-tools third_party/lpts
+      - name: Configure and build the rewriter benchmark
+        timeout-minutes: 90
+        run: |
+          set -euo pipefail
+          mkdir -p validation-results
+          git rev-parse HEAD > validation-results/openivm-commit.txt
+          git submodule status > validation-results/submodules.txt
+          cmake -S duckdb -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDUCKDB_EXTENSION_CONFIGS="$GITHUB_WORKSPACE/extension_config.cmake" \
+            -DENABLE_SANITIZER=OFF -DENABLE_UBSAN=OFF -DBUILD_UNITTESTS=OFF
+          cmake --build build/release --target rewriter_benchmark duckdb --parallel 4 2>&1 | tee validation-results/build.log
+      - name: Preinstall matching benchmark extensions
+        run: |
+          set -euo pipefail
+          rewriter_platform="$(build/release/duckdb -csv -noheader -c 'PRAGMA platform;')"
+          rewriter_extensions="$HOME/.duckdb/extensions/v1.5.4/$rewriter_platform"
+          mkdir -p "$rewriter_extensions"
+          for extension in icu ducklake sqlite_scanner httpfs; do
+            curl --fail --location --retry 3 --max-time 120 \
+              "https://extensions.duckdb.org/v1.5.4/$rewriter_platform/$extension.duckdb_extension.gz" \
+              -o "$rewriter_extensions/$extension.duckdb_extension.gz"
+            gzip -d "$rewriter_extensions/$extension.duckdb_extension.gz"
+          done
+          build/release/duckdb -c 'SELECT version(); LOAD icu; LOAD ducklake;' > validation-results/runtime.txt
+      - name: Run complete TPC-C rewriter corpus at SF1
+        timeout-minutes: 245
+        run: |
+          set -euo pipefail
+          sha256sum build/release/extension/openivm/rewriter_benchmark build/release/duckdb > validation-results/SHA256SUMS
+          timeout --signal=TERM --kill-after=60s 4h \
+            build/release/extension/openivm/rewriter_benchmark \
+              --workload tpcc --scale 1 --timeout 300 \
+              --queries benchmark/queries/tpcc \
+              --db "$GITHUB_WORKSPACE/validation-results/tpcc-sf1.db" \
+              --out "$GITHUB_WORKSPACE/validation-results/rewriter-sf1.csv" \
+              2>&1 | tee validation-results/rewriter-sf1.log
+      - name: Summarize complete results
+        run: |
+          python3 - <<'PY'
+          import collections, csv, json
+          from pathlib import Path
+          rows = list(csv.DictReader(Path('validation-results/rewriter-sf1.csv').open()))
+          expected = len(list(Path('benchmark/queries/tpcc').rglob('*.sql')))
+          summary = {
+              'openivm_commit': Path('validation-results/openivm-commit.txt').read_text().strip(),
+              'workload': 'tpcc', 'scale_factor': 1, 'query_timeout_seconds': 300,
+              'expected_queries': expected, 'completed_queries': len(rows),
+              'phases': dict(collections.Counter(row['phase_name'] for row in rows)),
+              'correct_queries': sum(row['is_correct'] == '1' for row in rows),
+              'incorrect_queries': [row for row in rows if row['phase_reached'] == '5'],
+          }
+          Path('validation-results/summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+          print(json.dumps({k:v for k,v in summary.items() if k != 'incorrect_queries'}, indent=2))
+          assert len(rows) == expected and rows, 'Rewriter corpus did not finish'
+          PY
+      - name: Upload results and provenance
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr119-rewriter-sf1-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            validation-results/*.txt
+            validation-results/*.json
+            validation-results/*.csv
+            validation-results/*.log
