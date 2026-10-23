@@ -5,7 +5,6 @@
 #include "core/vector_utils.hpp"
 #include "rules/column_hider.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 
@@ -37,17 +36,6 @@ static void DeduplicateGroupColumns(vector<string> &group_columns) {
 		seen_group.insert(candidate);
 		name = candidate;
 	}
-}
-
-static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr) {
-	while (expr && expr->expression_class == ExpressionClass::BOUND_CAST) {
-		auto &cast = expr->Cast<BoundCastExpression>();
-		expr = cast.child.get();
-	}
-	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
-		return nullptr;
-	}
-	return &expr->Cast<BoundColumnRefExpression>();
 }
 
 static bool ResolvesToAggregateValueBinding(idx_t table_index, idx_t column_index, const CreateMVPlanFacts &facts) {
@@ -572,7 +560,11 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	} else if (model.union_distinct_over_agg && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_union_distinct && !analysis.found_aggregation && !model.group_columns.empty()) {
-		model.type = RefreshType::GROUP_RECOMPUTE;
+		// A descendant UNION DISTINCT does not aggregate the outer projection.
+		// FULL JOIN projections need both hidden key scopes to recover old and
+		// new NULL-padding keys; source-group recompute loses those transitions.
+		model.type = analysis.found_full_outer && !model.distinct_at_top ? RefreshType::SIMPLE_PROJECTION
+		                                                                 : RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_distinct && model.distinct_at_top && !model.group_columns.empty()) {
 		model.type = RefreshType::AGGREGATE_GROUP;
 	} else if (!model.strategy_reasons.empty() && !model.group_columns.empty()) {
@@ -859,6 +851,9 @@ idx_t DeltaViewModel::LineageEntryCount() const {
 		count++;
 	}
 	if (has_left_join_key_source) {
+		count++;
+	}
+	if (!full_outer_scopes.empty()) {
 		count++;
 	}
 	return count;

@@ -1,0 +1,1072 @@
+# name: test/sql/left_join_nullable_lookup_key.test
+# description: Optional lookup changes preserve the projection refresh key across CTEs and expressions
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+# A DISTINCT window over an outer join can propagate an integer refresh key
+# through an aggregate. Only Boolean scope-presence markers use BOOL_OR.
+statement ok
+CREATE TABLE distinct_window_left(g INTEGER, id INTEGER);
+
+statement ok
+CREATE TABLE distinct_window_right(g INTEGER, id INTEGER);
+
+statement ok
+INSERT INTO distinct_window_left VALUES (1,1),(1,2),(2,3);
+
+statement ok
+INSERT INTO distinct_window_right VALUES (1,1);
+
+statement ok
+CREATE VIEW expected_distinct_window AS SELECT DISTINCT l.g, COUNT(r.id) OVER (PARTITION BY l.g) AS n FROM distinct_window_left l LEFT JOIN distinct_window_right r ON l.g=r.g AND l.id=r.id;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_window_mv AS SELECT DISTINCT l.g, COUNT(r.id) OVER (PARTITION BY l.g) AS n FROM distinct_window_left l LEFT JOIN distinct_window_right r ON l.g=r.g AND l.id=r.id;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='distinct_window_mv';
+----
+5
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_window_mv) EXCEPT ALL (SELECT * FROM expected_distinct_window));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_distinct_window) EXCEPT ALL (SELECT * FROM distinct_window_mv));
+----
+0
+
+statement ok
+INSERT INTO distinct_window_right VALUES (1,1),(2,3);
+
+statement ok
+PRAGMA refresh('distinct_window_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_window_mv) EXCEPT ALL (SELECT * FROM expected_distinct_window));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_distinct_window) EXCEPT ALL (SELECT * FROM distinct_window_mv));
+----
+0
+
+statement ok
+DELETE FROM distinct_window_right WHERE g=1;
+
+statement ok
+PRAGMA refresh('distinct_window_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_window_mv) EXCEPT ALL (SELECT * FROM expected_distinct_window));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_distinct_window) EXCEPT ALL (SELECT * FROM distinct_window_mv));
+----
+0
+
+statement ok
+CREATE TABLE events(id INTEGER, customer VARCHAR, amount INTEGER);
+
+statement ok
+CREATE TABLE profile(customer VARCHAR, platform VARCHAR);
+
+statement ok
+CREATE TABLE platform_dim(platform VARCHAR, platform_key INTEGER);
+
+statement ok
+INSERT INTO events VALUES (1,'a',10),(2,'b',20),(3,'b',20),(4,'z',40);
+
+statement ok
+INSERT INTO profile VALUES ('a','Retail'),('b','Retail');
+
+statement ok
+INSERT INTO platform_dim VALUES ('Retail',2),('N/A',1),('Web',3);
+
+statement ok
+CREATE VIEW expected_lookup_cte AS
+WITH base AS (
+    SELECT e.id, e.customer, e.amount, COALESCE(p.platform,'N/A') AS platform
+    FROM events e LEFT JOIN profile p ON e.customer=p.customer
+)
+SELECT b.customer, b.amount, COALESCE(d.platform_key,1) AS platform_key
+FROM base b LEFT JOIN platform_dim d ON b.platform=d.platform;
+
+statement ok
+CREATE MATERIALIZED VIEW lookup_cte AS
+WITH base AS (
+    SELECT e.id, e.customer, e.amount, COALESCE(p.platform,'N/A') AS platform
+    FROM events e LEFT JOIN profile p ON e.customer=p.customer
+)
+SELECT b.customer, b.amount, COALESCE(d.platform_key,1) AS platform_key
+FROM base b LEFT JOIN platform_dim d ON b.platform=d.platform;
+
+statement ok
+CREATE VIEW expected_lookup_expression AS
+SELECT e.customer, e.amount, COALESCE(d.platform_key,1) AS platform_key
+FROM events e LEFT JOIN profile p ON e.customer=p.customer
+LEFT JOIN platform_dim d ON COALESCE(p.platform,'N/A')=d.platform;
+
+statement ok
+CREATE MATERIALIZED VIEW lookup_expression AS
+SELECT e.customer, e.amount, COALESCE(d.platform_key,1) AS platform_key
+FROM events e LEFT JOIN profile p ON e.customer=p.customer
+LEFT JOIN platform_dim d ON COALESCE(p.platform,'N/A')=d.platform;
+
+statement ok
+CREATE VIEW expected_lookup_right AS
+SELECT e.customer, e.amount, COALESCE(d.platform_key,1) AS platform_key
+FROM platform_dim d RIGHT JOIN (
+    profile p RIGHT JOIN events e ON p.customer=e.customer
+) ON d.platform=COALESCE(p.platform,'N/A');
+
+statement ok
+CREATE MATERIALIZED VIEW lookup_right AS
+SELECT e.customer, e.amount, COALESCE(d.platform_key,1) AS platform_key
+FROM platform_dim d RIGHT JOIN (
+    profile p RIGHT JOIN events e ON p.customer=e.customer
+) ON d.platform=COALESCE(p.platform,'N/A');
+
+
+# A forwarded column alias is still unsafe when its source is nullable.
+
+statement ok
+CREATE VIEW expected_lookup_nullable_column AS
+WITH base AS (
+    SELECT e.customer,e.amount,p.platform
+    FROM events e LEFT JOIN profile p ON e.customer=p.customer
+)
+SELECT b.customer,b.amount,COALESCE(d.platform_key,1) AS platform_key
+FROM base b LEFT JOIN platform_dim d ON b.platform=d.platform;
+
+statement ok
+CREATE MATERIALIZED VIEW lookup_nullable_column AS
+WITH base AS (
+    SELECT e.customer,e.amount,p.platform
+    FROM events e LEFT JOIN profile p ON e.customer=p.customer
+)
+SELECT b.customer,b.amount,COALESCE(d.platform_key,1) AS platform_key
+FROM base b LEFT JOIN platform_dim d ON b.platform=d.platform;
+
+statement ok
+CREATE MATERIALIZED VIEW lookup_child AS SELECT customer, SUM(amount) AS total, COUNT(*) AS n FROM lookup_cte GROUP BY customer;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='lookup_cte';
+----
+2
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='lookup_expression';
+----
+2
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='lookup_right';
+----
+2
+
+# Removing the last profile changes the downstream lookup key to N/A.
+# The two identical b events must survive with default values; hidden refresh
+# keys must refer to the preserved customer, not the optional platform.
+
+statement ok
+UPDATE profile SET platform='Web' WHERE customer='b';
+
+statement ok
+DELETE FROM profile WHERE customer='b';
+
+statement ok
+UPDATE profile SET platform='Web' WHERE customer='a';
+
+statement ok
+INSERT INTO profile VALUES ('c','Retail');
+
+statement ok
+UPDATE profile SET platform='Web' WHERE customer='c';
+
+statement ok
+DELETE FROM profile WHERE customer='c';
+
+statement ok
+INSERT INTO events VALUES (5,'b',20),(6,'c',60),(7,'a',70);
+
+statement ok
+UPDATE events SET amount=amount+1 WHERE id IN (1,4,7);
+
+statement ok
+DELETE FROM events WHERE id IN (4,7);
+
+statement ok
+PRAGMA refresh('lookup_cte');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_cte) EXCEPT ALL (SELECT * FROM expected_lookup_cte));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_cte) EXCEPT ALL (SELECT * FROM lookup_cte));
+----
+0
+
+statement ok
+PRAGMA refresh('lookup_expression');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_expression) EXCEPT ALL (SELECT * FROM expected_lookup_expression));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_expression) EXCEPT ALL (SELECT * FROM lookup_expression));
+----
+0
+
+statement ok
+PRAGMA refresh('lookup_right');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_right) EXCEPT ALL (SELECT * FROM expected_lookup_right));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_right) EXCEPT ALL (SELECT * FROM lookup_right));
+----
+0
+
+statement ok
+PRAGMA refresh('lookup_nullable_column');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_nullable_column) EXCEPT ALL (SELECT * FROM expected_lookup_nullable_column));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_nullable_column) EXCEPT ALL (SELECT * FROM lookup_nullable_column));
+----
+0
+
+statement ok
+PRAGMA refresh('lookup_child');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_child) EXCEPT ALL (SELECT customer, SUM(amount) AS total, COUNT(*) AS n FROM expected_lookup_cte GROUP BY customer));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT customer, SUM(amount) AS total, COUNT(*) AS n FROM expected_lookup_cte GROUP BY customer) EXCEPT ALL (SELECT * FROM lookup_child));
+----
+0
+
+# Reintroduce the profile, remove a different last match, and mix conflicting
+# source changes before a second refresh.
+
+statement ok
+INSERT INTO profile VALUES ('b','Retail');
+
+statement ok
+UPDATE profile SET platform='Web' WHERE customer='b';
+
+statement ok
+DELETE FROM profile WHERE customer='a';
+
+statement ok
+UPDATE events SET amount=21 WHERE customer='b';
+
+statement ok
+DELETE FROM events WHERE id=2;
+
+statement ok
+INSERT INTO events VALUES (8,'a',80),(9,'b',21),(10,'c',100);
+
+statement ok
+UPDATE events SET amount=101 WHERE id=10;
+
+statement ok
+DELETE FROM events WHERE id=10;
+
+statement ok
+PRAGMA refresh('lookup_cte');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_cte) EXCEPT ALL (SELECT * FROM expected_lookup_cte));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_cte) EXCEPT ALL (SELECT * FROM lookup_cte));
+----
+0
+
+statement ok
+PRAGMA refresh('lookup_expression');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_expression) EXCEPT ALL (SELECT * FROM expected_lookup_expression));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_expression) EXCEPT ALL (SELECT * FROM lookup_expression));
+----
+0
+
+statement ok
+PRAGMA refresh('lookup_right');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_right) EXCEPT ALL (SELECT * FROM expected_lookup_right));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_right) EXCEPT ALL (SELECT * FROM lookup_right));
+----
+0
+
+statement ok
+PRAGMA refresh('lookup_nullable_column');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_nullable_column) EXCEPT ALL (SELECT * FROM expected_lookup_nullable_column));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_nullable_column) EXCEPT ALL (SELECT * FROM lookup_nullable_column));
+----
+0
+
+statement ok
+PRAGMA refresh('lookup_child');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_child) EXCEPT ALL (SELECT customer, SUM(amount) AS total, COUNT(*) AS n FROM expected_lookup_cte GROUP BY customer));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT customer, SUM(amount) AS total, COUNT(*) AS n FROM expected_lookup_cte GROUP BY customer) EXCEPT ALL (SELECT * FROM lookup_child));
+----
+0
+
+# A computed inner predicate must not displace a usable outer key.
+
+statement ok
+CREATE TABLE computed_a(id INTEGER,k INTEGER);
+
+statement ok
+CREATE TABLE computed_b(k INTEGER,label VARCHAR);
+
+statement ok
+CREATE TABLE computed_d(id INTEGER,label VARCHAR);
+
+statement ok
+INSERT INTO computed_a VALUES (1,NULL),(1,NULL),(2,2);
+
+statement ok
+INSERT INTO computed_b VALUES (0,'first'),(2,'second');
+
+statement ok
+INSERT INTO computed_d VALUES (1,'d1'),(2,'d2');
+
+statement ok
+CREATE MATERIALIZED VIEW computed_mv AS SELECT a.id,COALESCE(b.label,'default') AS b_label,d.label AS d_label FROM computed_a a LEFT JOIN computed_b b ON COALESCE(a.k,0)=b.k LEFT JOIN computed_d d ON a.id=d.id;
+
+statement ok
+UPDATE computed_b SET label='temporary' WHERE k=0;
+
+statement ok
+DELETE FROM computed_b WHERE k=0;
+
+statement ok
+UPDATE computed_b SET label='second_new' WHERE k=2;
+
+statement ok
+DELETE FROM computed_d WHERE id=2;
+
+statement ok
+INSERT INTO computed_d VALUES (2,'d2_new');
+
+statement ok
+PRAGMA refresh('computed_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM computed_mv) EXCEPT ALL (SELECT a.id,COALESCE(b.label,'default') AS b_label,d.label AS d_label FROM computed_a a LEFT JOIN computed_b b ON COALESCE(a.k,0)=b.k LEFT JOIN computed_d d ON a.id=d.id));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT a.id,COALESCE(b.label,'default') AS b_label,d.label AS d_label FROM computed_a a LEFT JOIN computed_b b ON COALESCE(a.k,0)=b.k LEFT JOIN computed_d d ON a.id=d.id) EXCEPT ALL (SELECT * FROM computed_mv));
+----
+0
+
+statement ok
+INSERT INTO computed_b VALUES (0,'restored');
+
+statement ok
+UPDATE computed_a SET k=0 WHERE id=2;
+
+statement ok
+DELETE FROM computed_b WHERE k=2;
+
+statement ok
+INSERT INTO computed_d VALUES (3,'d3');
+
+statement ok
+INSERT INTO computed_a VALUES (3,NULL);
+
+statement ok
+UPDATE computed_a SET k=2 WHERE id=3;
+
+statement ok
+DELETE FROM computed_a WHERE id=3;
+
+statement ok
+PRAGMA refresh('computed_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM computed_mv) EXCEPT ALL (SELECT a.id,COALESCE(b.label,'default') AS b_label,d.label AS d_label FROM computed_a a LEFT JOIN computed_b b ON COALESCE(a.k,0)=b.k LEFT JOIN computed_d d ON a.id=d.id));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT a.id,COALESCE(b.label,'default') AS b_label,d.label AS d_label FROM computed_a a LEFT JOIN computed_b b ON COALESCE(a.k,0)=b.k LEFT JOIN computed_d d ON a.id=d.id) EXCEPT ALL (SELECT * FROM computed_mv));
+----
+0
+
+# Keep the selective fact ID when the inner category key is also preserved.
+# One changed detail must replace one backing row, not all 1,000 category rows.
+
+statement ok
+CREATE TABLE scope_fact AS SELECT i AS id,1 AS category FROM range(1000) t(i);
+
+statement ok
+CREATE TABLE scope_category AS SELECT 1 AS category,'C' AS label;
+
+statement ok
+CREATE TABLE scope_detail AS SELECT i AS id,'D' AS label FROM range(1000) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW scope_mv AS SELECT f.id,c.label AS category_label,d.label AS detail_label FROM scope_fact f LEFT JOIN scope_category c ON f.category=c.category LEFT JOIN scope_detail d ON f.id=d.id;
+
+statement ok
+CREATE TEMP TABLE scope_previous AS SELECT id,rowid AS previous_rowid FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_73636f70655f6d76_;
+
+statement ok
+UPDATE scope_detail SET label='temporary' WHERE id=0;
+
+statement ok
+DELETE FROM scope_detail WHERE id=0;
+
+statement ok
+INSERT INTO scope_detail VALUES (0,'changed');
+
+statement ok
+PRAGMA refresh('scope_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_mv) EXCEPT ALL (SELECT f.id,c.label AS category_label,d.label AS detail_label FROM scope_fact f LEFT JOIN scope_category c ON f.category=c.category LEFT JOIN scope_detail d ON f.id=d.id));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT f.id,c.label AS category_label,d.label AS detail_label FROM scope_fact f LEFT JOIN scope_category c ON f.category=c.category LEFT JOIN scope_detail d ON f.id=d.id) EXCEPT ALL (SELECT * FROM scope_mv));
+----
+0
+
+query I
+SELECT COUNT(*) FROM scope_previous p JOIN openivm_data___openivm_mv_6d656d6f7279_6d61696e_73636f70655f6d76_ m ON p.id=m.id WHERE p.previous_rowid<>m.rowid;
+----
+1
+
+# Casts of preserved columns remain usable keys. Keep the same cast chain
+# when pushing affected keys into the source, including lossy/TRY casts.
+
+statement ok
+CREATE TABLE cast_a(id INTEGER,k INTEGER);
+
+statement ok
+CREATE TABLE cast_b(k INTEGER,label VARCHAR);
+
+statement ok
+CREATE TABLE cast_d(sid VARCHAR,label VARCHAR);
+
+statement ok
+CREATE TABLE cast_flags(flag BOOLEAN,label VARCHAR);
+
+statement ok
+CREATE TABLE cast_raw(raw_id VARCHAR,k INTEGER);
+
+statement ok
+CREATE TABLE cast_numbers(tid INTEGER,label VARCHAR);
+
+statement ok
+INSERT INTO cast_a VALUES (1,NULL),(2,NULL);
+
+statement ok
+INSERT INTO cast_b VALUES (0,'first'),(2,'second');
+
+statement ok
+INSERT INTO cast_d VALUES ('1','d1'),('2','d2');
+
+statement ok
+INSERT INTO cast_flags VALUES (TRUE,'flag');
+
+statement ok
+INSERT INTO cast_raw VALUES ('1',NULL),('bad',NULL),(NULL,NULL);
+
+statement ok
+INSERT INTO cast_numbers VALUES (1,'one'),(2,'two'),(NULL,'none');
+
+statement ok
+CREATE MATERIALIZED VIEW cast_mv AS WITH p AS (SELECT a.id,CAST(CAST(a.id AS BIGINT) AS VARCHAR) AS sid,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_d d ON p.sid=d.sid;
+
+statement ok
+CREATE MATERIALIZED VIEW cast_bool_mv AS WITH p AS (SELECT a.id,CAST(a.id AS BOOLEAN) AS flag,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_flags d ON p.flag=d.flag;
+
+statement ok
+CREATE MATERIALIZED VIEW cast_try_mv AS WITH p AS (SELECT a.raw_id,TRY_CAST(CAST(a.raw_id AS VARCHAR) AS INTEGER) AS tid,COALESCE(b.label,'default') AS b_label FROM cast_raw a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.raw_id,p.b_label,d.label FROM p LEFT JOIN cast_numbers d ON p.tid IS NOT DISTINCT FROM d.tid;
+
+statement ok
+UPDATE cast_b SET label='temporary' WHERE k=0;
+
+statement ok
+DELETE FROM cast_b WHERE k=0;
+
+statement ok
+UPDATE cast_d SET label='new_d2' WHERE sid='2';
+
+statement ok
+UPDATE cast_flags SET label='new_flag' WHERE flag;
+
+statement ok
+INSERT INTO cast_a VALUES (4,NULL);
+
+statement ok
+UPDATE cast_a SET k=2 WHERE id=4;
+
+statement ok
+DELETE FROM cast_a WHERE id=4;
+
+statement ok
+PRAGMA refresh('cast_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM cast_mv) EXCEPT ALL (WITH p AS (SELECT a.id,CAST(CAST(a.id AS BIGINT) AS VARCHAR) AS sid,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_d d ON p.sid=d.sid));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((WITH p AS (SELECT a.id,CAST(CAST(a.id AS BIGINT) AS VARCHAR) AS sid,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_d d ON p.sid=d.sid) EXCEPT ALL (SELECT * FROM cast_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('cast_bool_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM cast_bool_mv) EXCEPT ALL (WITH p AS (SELECT a.id,CAST(a.id AS BOOLEAN) AS flag,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_flags d ON p.flag=d.flag));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((WITH p AS (SELECT a.id,CAST(a.id AS BOOLEAN) AS flag,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_flags d ON p.flag=d.flag) EXCEPT ALL (SELECT * FROM cast_bool_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('cast_try_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM cast_try_mv) EXCEPT ALL (WITH p AS (SELECT a.raw_id,TRY_CAST(CAST(a.raw_id AS VARCHAR) AS INTEGER) AS tid,COALESCE(b.label,'default') AS b_label FROM cast_raw a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.raw_id,p.b_label,d.label FROM p LEFT JOIN cast_numbers d ON p.tid IS NOT DISTINCT FROM d.tid));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((WITH p AS (SELECT a.raw_id,TRY_CAST(CAST(a.raw_id AS VARCHAR) AS INTEGER) AS tid,COALESCE(b.label,'default') AS b_label FROM cast_raw a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.raw_id,p.b_label,d.label FROM p LEFT JOIN cast_numbers d ON p.tid IS NOT DISTINCT FROM d.tid) EXCEPT ALL (SELECT * FROM cast_try_mv));
+----
+0
+
+statement ok
+INSERT INTO cast_b VALUES (0,'restored'),(0,'restored');
+
+statement ok
+INSERT INTO cast_a VALUES (3,NULL);
+
+statement ok
+INSERT INTO cast_raw VALUES ('2',NULL);
+
+statement ok
+UPDATE cast_numbers SET label='new_none' WHERE tid IS NULL;
+
+statement ok
+DELETE FROM cast_d WHERE sid='1';
+
+statement ok
+INSERT INTO cast_d VALUES ('1','restored_d1');
+
+statement ok
+PRAGMA refresh('cast_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM cast_mv) EXCEPT ALL (WITH p AS (SELECT a.id,CAST(CAST(a.id AS BIGINT) AS VARCHAR) AS sid,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_d d ON p.sid=d.sid));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((WITH p AS (SELECT a.id,CAST(CAST(a.id AS BIGINT) AS VARCHAR) AS sid,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_d d ON p.sid=d.sid) EXCEPT ALL (SELECT * FROM cast_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('cast_bool_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM cast_bool_mv) EXCEPT ALL (WITH p AS (SELECT a.id,CAST(a.id AS BOOLEAN) AS flag,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_flags d ON p.flag=d.flag));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((WITH p AS (SELECT a.id,CAST(a.id AS BOOLEAN) AS flag,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_flags d ON p.flag=d.flag) EXCEPT ALL (SELECT * FROM cast_bool_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('cast_try_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM cast_try_mv) EXCEPT ALL (WITH p AS (SELECT a.raw_id,TRY_CAST(CAST(a.raw_id AS VARCHAR) AS INTEGER) AS tid,COALESCE(b.label,'default') AS b_label FROM cast_raw a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.raw_id,p.b_label,d.label FROM p LEFT JOIN cast_numbers d ON p.tid IS NOT DISTINCT FROM d.tid));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((WITH p AS (SELECT a.raw_id,TRY_CAST(CAST(a.raw_id AS VARCHAR) AS INTEGER) AS tid,COALESCE(b.label,'default') AS b_label FROM cast_raw a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.raw_id,p.b_label,d.label FROM p LEFT JOIN cast_numbers d ON p.tid IS NOT DISTINCT FROM d.tid) EXCEPT ALL (SELECT * FROM cast_try_mv));
+----
+0
+
+# Scalar expressions over preserved columns retain their outer refresh key.
+# CASE conditions and all branches must also exclude optional dependencies.
+statement ok
+CREATE TABLE expr_a(id INTEGER,k INTEGER,offset_key INTEGER);
+
+statement ok
+CREATE TABLE expr_b(k INTEGER,label VARCHAR);
+
+statement ok
+CREATE TABLE expr_d(id INTEGER,label VARCHAR);
+
+statement ok
+INSERT INTO expr_a VALUES (1,NULL,1),(1,NULL,1),(2,2,2),(NULL,NULL,5),(5,0,1);
+
+statement ok
+INSERT INTO expr_b VALUES (0,'first'),(2,'second');
+
+statement ok
+INSERT INTO expr_d VALUES (0,'d0'),(1,'d1'),(2,'d2'),(3,'d3'),(4,'d4'),(5,'d5'),(6,'d6');
+
+statement ok
+CREATE VIEW expected_expr_add AS WITH projected AS (SELECT a.id,a.id+1 AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW expr_add AS WITH projected AS (SELECT a.id,a.id+1 AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE VIEW expected_expr_coalesce AS WITH projected AS (SELECT a.id,COALESCE(a.id,0) AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW expr_coalesce AS WITH projected AS (SELECT a.id,COALESCE(a.id,0) AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE VIEW expected_expr_abs AS WITH projected AS (SELECT a.id,ABS(a.id) AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW expr_abs AS WITH projected AS (SELECT a.id,ABS(a.id) AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE VIEW expected_expr_multiply AS WITH projected AS (SELECT a.id,a.id*2 AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW expr_multiply AS WITH projected AS (SELECT a.id,a.id*2 AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE VIEW expected_expr_case AS WITH projected AS (SELECT a.id,CASE WHEN a.id IS NULL THEN 0 ELSE a.id END AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW expr_case AS WITH projected AS (SELECT a.id,CASE WHEN a.id IS NULL THEN 0 ELSE a.id END AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE VIEW expected_expr_multi_input AS WITH projected AS (SELECT a.id,a.id+a.offset_key AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW expr_multi_input AS WITH projected AS (SELECT a.id,a.id+a.offset_key AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE VIEW expected_expr_nullable_case AS WITH p AS (SELECT a.id,CASE WHEN b.label='first' THEN a.id ELSE a.id+1 END AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON a.k=b.k) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW expr_nullable_case AS WITH p AS (SELECT a.id,CASE WHEN b.label='first' THEN a.id ELSE a.id+1 END AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON a.k=b.k) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_sql_name LIKE 'expr_%' AND type=2;
+----
+7
+
+statement ok
+UPDATE expr_b SET label='temporary' WHERE k=0;
+
+statement ok
+DELETE FROM expr_b WHERE k=0;
+
+statement ok
+UPDATE expr_d SET label='new_d2' WHERE id=2;
+
+statement ok
+INSERT INTO expr_a VALUES (4,NULL,1);
+
+statement ok
+UPDATE expr_a SET k=2 WHERE id=4;
+
+statement ok
+DELETE FROM expr_a WHERE id=4;
+
+statement ok
+PRAGMA refresh('expr_add');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_add) EXCEPT ALL (SELECT * FROM expected_expr_add));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_add) EXCEPT ALL (SELECT * FROM expr_add));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_coalesce');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_coalesce) EXCEPT ALL (SELECT * FROM expected_expr_coalesce));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_coalesce) EXCEPT ALL (SELECT * FROM expr_coalesce));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_abs');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_abs) EXCEPT ALL (SELECT * FROM expected_expr_abs));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_abs) EXCEPT ALL (SELECT * FROM expr_abs));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_multiply');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_multiply) EXCEPT ALL (SELECT * FROM expected_expr_multiply));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_multiply) EXCEPT ALL (SELECT * FROM expr_multiply));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_case');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_case) EXCEPT ALL (SELECT * FROM expected_expr_case));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_case) EXCEPT ALL (SELECT * FROM expr_case));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_multi_input');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_multi_input) EXCEPT ALL (SELECT * FROM expected_expr_multi_input));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_multi_input) EXCEPT ALL (SELECT * FROM expr_multi_input));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_nullable_case');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_nullable_case) EXCEPT ALL (SELECT * FROM expected_expr_nullable_case));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_nullable_case) EXCEPT ALL (SELECT * FROM expr_nullable_case));
+----
+0
+
+# Reintroduce duplicate optional matches and change preserved expressions.
+
+statement ok
+INSERT INTO expr_b VALUES (0,'restored'),(0,'restored');
+
+statement ok
+UPDATE expr_a SET offset_key=3 WHERE id=2;
+
+statement ok
+UPDATE expr_a SET id=3 WHERE id=2;
+
+statement ok
+INSERT INTO expr_a VALUES (4,NULL,2);
+
+statement ok
+DELETE FROM expr_a WHERE id IS NULL;
+
+statement ok
+INSERT INTO expr_a VALUES (NULL,NULL,5);
+
+statement ok
+DELETE FROM expr_d WHERE id=3;
+
+statement ok
+INSERT INTO expr_d VALUES (3,'restored_d3');
+
+statement ok
+PRAGMA refresh('expr_add');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_add) EXCEPT ALL (SELECT * FROM expected_expr_add));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_add) EXCEPT ALL (SELECT * FROM expr_add));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_coalesce');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_coalesce) EXCEPT ALL (SELECT * FROM expected_expr_coalesce));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_coalesce) EXCEPT ALL (SELECT * FROM expr_coalesce));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_abs');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_abs) EXCEPT ALL (SELECT * FROM expected_expr_abs));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_abs) EXCEPT ALL (SELECT * FROM expr_abs));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_multiply');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_multiply) EXCEPT ALL (SELECT * FROM expected_expr_multiply));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_multiply) EXCEPT ALL (SELECT * FROM expr_multiply));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_case');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_case) EXCEPT ALL (SELECT * FROM expected_expr_case));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_case) EXCEPT ALL (SELECT * FROM expr_case));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_multi_input');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_multi_input) EXCEPT ALL (SELECT * FROM expected_expr_multi_input));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_multi_input) EXCEPT ALL (SELECT * FROM expr_multi_input));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_nullable_case');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_nullable_case) EXCEPT ALL (SELECT * FROM expected_expr_nullable_case));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_nullable_case) EXCEPT ALL (SELECT * FROM expr_nullable_case));
+----
+0
+
+# Repeated references form a small projection DAG, not an exponentially
+# expanded lineage tree. Keep this workload deterministic without timing gates.
+
+statement ok
+CREATE TABLE deep_key_a(id BIGINT,k INTEGER);
+
+statement ok
+CREATE TABLE deep_key_b(k INTEGER,label VARCHAR);
+
+statement ok
+CREATE TABLE deep_key_d(id BIGINT,label VARCHAR);
+
+statement ok
+INSERT INTO deep_key_a VALUES (1,NULL),(1,NULL),(2,2);
+
+statement ok
+INSERT INTO deep_key_b VALUES (0,'first'),(2,'second');
+
+statement ok
+INSERT INTO deep_key_d VALUES (67108864,'d1'),(134217728,'d2');
+
+statement ok
+CREATE VIEW expected_deep_key AS WITH deep0 AS (SELECT a.id,a.id AS sid,COALESCE(b.label,'default') AS b_label FROM deep_key_a a LEFT JOIN deep_key_b b ON COALESCE(a.k,0)=b.k),
+deep1 AS (SELECT id,sid+sid AS sid,b_label FROM deep0),
+deep2 AS (SELECT id,sid+sid AS sid,b_label FROM deep1),
+deep3 AS (SELECT id,sid+sid AS sid,b_label FROM deep2),
+deep4 AS (SELECT id,sid+sid AS sid,b_label FROM deep3),
+deep5 AS (SELECT id,sid+sid AS sid,b_label FROM deep4),
+deep6 AS (SELECT id,sid+sid AS sid,b_label FROM deep5),
+deep7 AS (SELECT id,sid+sid AS sid,b_label FROM deep6),
+deep8 AS (SELECT id,sid+sid AS sid,b_label FROM deep7),
+deep9 AS (SELECT id,sid+sid AS sid,b_label FROM deep8),
+deep10 AS (SELECT id,sid+sid AS sid,b_label FROM deep9),
+deep11 AS (SELECT id,sid+sid AS sid,b_label FROM deep10),
+deep12 AS (SELECT id,sid+sid AS sid,b_label FROM deep11),
+deep13 AS (SELECT id,sid+sid AS sid,b_label FROM deep12),
+deep14 AS (SELECT id,sid+sid AS sid,b_label FROM deep13),
+deep15 AS (SELECT id,sid+sid AS sid,b_label FROM deep14),
+deep16 AS (SELECT id,sid+sid AS sid,b_label FROM deep15),
+deep17 AS (SELECT id,sid+sid AS sid,b_label FROM deep16),
+deep18 AS (SELECT id,sid+sid AS sid,b_label FROM deep17),
+deep19 AS (SELECT id,sid+sid AS sid,b_label FROM deep18),
+deep20 AS (SELECT id,sid+sid AS sid,b_label FROM deep19),
+deep21 AS (SELECT id,sid+sid AS sid,b_label FROM deep20),
+deep22 AS (SELECT id,sid+sid AS sid,b_label FROM deep21),
+deep23 AS (SELECT id,sid+sid AS sid,b_label FROM deep22),
+deep24 AS (SELECT id,sid+sid AS sid,b_label FROM deep23),
+deep25 AS (SELECT id,sid+sid AS sid,b_label FROM deep24),
+deep26 AS (SELECT id,sid+sid AS sid,b_label FROM deep25)
+SELECT p.id,p.b_label,d.label FROM deep26 p LEFT JOIN deep_key_d d ON p.sid=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW deep_key_mv AS WITH deep0 AS (SELECT a.id,a.id AS sid,COALESCE(b.label,'default') AS b_label FROM deep_key_a a LEFT JOIN deep_key_b b ON COALESCE(a.k,0)=b.k),
+deep1 AS (SELECT id,sid+sid AS sid,b_label FROM deep0),
+deep2 AS (SELECT id,sid+sid AS sid,b_label FROM deep1),
+deep3 AS (SELECT id,sid+sid AS sid,b_label FROM deep2),
+deep4 AS (SELECT id,sid+sid AS sid,b_label FROM deep3),
+deep5 AS (SELECT id,sid+sid AS sid,b_label FROM deep4),
+deep6 AS (SELECT id,sid+sid AS sid,b_label FROM deep5),
+deep7 AS (SELECT id,sid+sid AS sid,b_label FROM deep6),
+deep8 AS (SELECT id,sid+sid AS sid,b_label FROM deep7),
+deep9 AS (SELECT id,sid+sid AS sid,b_label FROM deep8),
+deep10 AS (SELECT id,sid+sid AS sid,b_label FROM deep9),
+deep11 AS (SELECT id,sid+sid AS sid,b_label FROM deep10),
+deep12 AS (SELECT id,sid+sid AS sid,b_label FROM deep11),
+deep13 AS (SELECT id,sid+sid AS sid,b_label FROM deep12),
+deep14 AS (SELECT id,sid+sid AS sid,b_label FROM deep13),
+deep15 AS (SELECT id,sid+sid AS sid,b_label FROM deep14),
+deep16 AS (SELECT id,sid+sid AS sid,b_label FROM deep15),
+deep17 AS (SELECT id,sid+sid AS sid,b_label FROM deep16),
+deep18 AS (SELECT id,sid+sid AS sid,b_label FROM deep17),
+deep19 AS (SELECT id,sid+sid AS sid,b_label FROM deep18),
+deep20 AS (SELECT id,sid+sid AS sid,b_label FROM deep19),
+deep21 AS (SELECT id,sid+sid AS sid,b_label FROM deep20),
+deep22 AS (SELECT id,sid+sid AS sid,b_label FROM deep21),
+deep23 AS (SELECT id,sid+sid AS sid,b_label FROM deep22),
+deep24 AS (SELECT id,sid+sid AS sid,b_label FROM deep23),
+deep25 AS (SELECT id,sid+sid AS sid,b_label FROM deep24),
+deep26 AS (SELECT id,sid+sid AS sid,b_label FROM deep25)
+SELECT p.id,p.b_label,d.label FROM deep26 p LEFT JOIN deep_key_d d ON p.sid=d.id;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='deep_key_mv';
+----
+2
+
+statement ok
+UPDATE deep_key_b SET label='temporary' WHERE k=0;
+
+statement ok
+DELETE FROM deep_key_b WHERE k=0;
+
+statement ok
+INSERT INTO deep_key_a VALUES (4,NULL);
+
+statement ok
+UPDATE deep_key_a SET k=2 WHERE id=4;
+
+statement ok
+DELETE FROM deep_key_a WHERE id=4;
+
+statement ok
+UPDATE deep_key_d SET label='new_d1' WHERE id=67108864;
+
+statement ok
+PRAGMA refresh('deep_key_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM deep_key_mv) EXCEPT ALL (SELECT * FROM expected_deep_key));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_deep_key) EXCEPT ALL (SELECT * FROM deep_key_mv));
+----
+0

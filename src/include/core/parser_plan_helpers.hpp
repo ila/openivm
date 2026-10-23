@@ -24,6 +24,8 @@ class Planner;
 void PlanWithSourceColumns(Planner &planner, unique_ptr<SQLStatement> statement);
 TableFunction SourceColumnsFunction();
 
+BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr, string *cast_type = nullptr);
+
 struct DuckLakeSourceTableInfo {
 	string table_name;
 	string catalog_name;
@@ -162,6 +164,7 @@ bool PlanNeedsOriginalSqlForLpts(const CreateMVPlanFacts &facts);
 void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts, vector<string> &aggregate_columns,
                                                  const vector<string> &output_names);
 string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts);
+vector<RefreshMetadata::FullOuterScope> BuildFullOuterScopes(const CreateMVPlanFacts &facts);
 vector<string> PrepareOutputNames(LogicalOperator *select_plan, const vector<string> &planner_names);
 bool IsPacLoaded(ClientContext &context);
 void ForwardPacSettingsIfLoaded(ClientContext &context, Connection &con);

@@ -21,6 +21,9 @@ unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, co
 
 void DemoteLeftJoins(LogicalOperator *node);
 
+void DemoteOuterJoinsForMask(LogicalOperator *node, const vector<JoinLeafInfo> &leaves, uint64_t mask,
+                             RefreshType refresh_type);
+
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf,
                                const ColumnBinding &mul_binding);
 

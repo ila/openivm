@@ -60,6 +60,10 @@ Bidirectional key-based partial recompute using hidden `openivm_left_key` and `o
 
 The match predicate is **NULL-safe** — `EXISTS (SELECT 1 FROM openivm_affected WHERE _k IS NOT DISTINCT FROM openivm_left_key OR _k IS NOT DISTINCT FROM openivm_right_key)` rather than `IN`, so NULL keys on either side are still matched.
 
+Nested outer joins also contribute replacement keys when their inputs become NULL-padded. Source-presence markers exclude unrelated input rows and UNION arms. Across a rewritten DISTINCT, markers use `BOOL_OR` without changing the grouping keys, so duplicates shared by UNION arms remain one group. The DISTINCT aggregate owns duplicate elimination over UNION ALL; its child UNION no longer retains a second DISTINCT flag. A FULL JOIN projection with a descendant UNION DISTINCT uses the same bidirectional key refresh as other FULL JOIN projections. A scope containing an aggregate uses the bag difference between its old and current input states to discover changed rows; this scans those input states, while the MV update remains restricted to affected keys.
+
+An unchanged opposite-side row contributes a padding key only if it has no match at one endpoint and a real match at the other. Inserting, updating, and deleting an optional match before a refresh therefore leaves unrelated backing rows untouched.
+
 ### Aggregate views (with GROUP BY)
 
 Two modes are available, controlled by `openivm_full_outer_merge` (default: on):

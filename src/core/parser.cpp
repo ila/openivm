@@ -520,6 +520,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	bool has_hidden_minmax_having = false;
 	bool has_computed_minmax_aggregate_projection = false;
 	DerivedAggregateOutputInfo derived_aggregate_outputs;
+	vector<RefreshMetadata::FullOuterScope> full_outer_scopes;
 	bool has_computed_sum_aggregate_projection = false;
 	{
 		auto select_parse_plan_start = create_profile_now();
@@ -557,6 +558,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		output_names = PrepareOutputNames(select_plan.get(), select_planner.names);
 
 		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
+		full_outer_scopes = BuildFullOuterScopes(post_rewrite_facts);
 		stored_query_has_aggregate_filter = post_rewrite_facts.has_filter_above_aggregate;
 		has_hidden_minmax_having = post_rewrite_facts.has_hidden_minmax_having_column;
 		has_computed_minmax_aggregate_projection = post_rewrite_facts.has_computed_minmax_aggregate_projection;
@@ -1025,6 +1027,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		model_input.semi_anti_aux_candidate = &semi_anti_aux_candidate;
 	}
 	auto view_model = BuildDeltaViewModel(model_input);
+	view_model.full_outer_scopes = std::move(full_outer_scopes);
 	string leftjoin_secondary_sql;
 	vector<string> leftjoin_preserved_cols;
 	vector<string> leftjoin_inner_tables, leftjoin_inner_keys, leftjoin_pres_tables, leftjoin_pres_keys;

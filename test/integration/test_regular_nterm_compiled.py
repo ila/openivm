@@ -256,6 +256,373 @@ SELECT p.id, d2.label
 FROM projected p LEFT JOIN left_two d2 ON p.k2 = d2.k""",
         )
 
+        run_scenario(
+            binary,
+            root,
+            "nullable_lookup_cte_mixed",
+            """
+CREATE TABLE arcm_msf(id INT, coll_key INT);
+CREATE TABLE arcm_acd(coll_key INT, sub_id INT, arm_id VARCHAR);
+CREATE TABLE arcm_hw(arm_id VARCHAR, provider VARCHAR);
+CREATE TABLE arcm_tpid(sub_id INT, tp_id INT);
+CREATE TABLE arcm_cust(tp_id INT, cust_key INT);
+INSERT INTO arcm_msf VALUES (1,100),(2,100);
+INSERT INTO arcm_acd VALUES (100,10,'arm-1');
+INSERT INTO arcm_hw VALUES ('arm-1','provider');
+INSERT INTO arcm_tpid VALUES (10,200);
+INSERT INTO arcm_cust VALUES (200,21);
+CREATE MATERIALIZED VIEW arcm_mv AS
+WITH bff AS (
+    SELECT msf.id,acd.sub_id,COALESCE(hw.provider,'N/A') AS provider
+    FROM arcm_msf msf JOIN arcm_acd acd ON msf.coll_key=acd.coll_key
+    LEFT JOIN arcm_hw hw ON acd.arm_id=hw.arm_id
+)
+SELECT bff.id,COALESCE(cust.cust_key,1) AS cust_key FROM bff
+LEFT JOIN arcm_tpid tpid ON bff.sub_id=tpid.sub_id
+LEFT JOIN arcm_cust cust ON COALESCE(tpid.tp_id,-1)=cust.tp_id;
+UPDATE arcm_tpid SET tp_id=300 WHERE sub_id=10;
+DELETE FROM arcm_tpid WHERE sub_id=10;
+UPDATE arcm_cust SET cust_key=99 WHERE tp_id=200;
+DELETE FROM arcm_msf WHERE id=2;
+INSERT INTO arcm_msf VALUES (3,100),(4,300);
+INSERT INTO arcm_acd VALUES (300,30,'arm-2');
+INSERT INTO arcm_hw VALUES ('arm-2','new_provider');
+INSERT INTO arcm_tpid VALUES (30,400);
+INSERT INTO arcm_cust VALUES (400,42);
+""",
+            "arcm_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+            },
+            """WITH bff AS (
+    SELECT msf.id,acd.sub_id,COALESCE(hw.provider,'N/A') AS provider
+    FROM arcm_msf msf JOIN arcm_acd acd ON msf.coll_key=acd.coll_key
+    LEFT JOIN arcm_hw hw ON acd.arm_id=hw.arm_id
+)
+SELECT bff.id,COALESCE(cust.cust_key,1) AS cust_key FROM bff
+LEFT JOIN arcm_tpid tpid ON bff.sub_id=tpid.sub_id
+LEFT JOIN arcm_cust cust ON COALESCE(tpid.tp_id,-1)=cust.tp_id""",
+        )
+
+        run_scenario(
+            binary,
+            root,
+            "preserved_scalar_key_mixed",
+            """
+CREATE TABLE scalar_a(id INT,k INT,offset_key INT);
+CREATE TABLE scalar_b(k INT,label VARCHAR);
+CREATE TABLE scalar_d(id INT,label VARCHAR);
+INSERT INTO scalar_a VALUES (1,NULL,1),(1,NULL,1),(2,2,2),(NULL,NULL,5);
+INSERT INTO scalar_b VALUES (0,'first'),(2,'second');
+INSERT INTO scalar_d VALUES (0,'d0'),(3,'d3'),(6,'d6');
+CREATE MATERIALIZED VIEW scalar_mv AS
+WITH p AS (
+    SELECT a.id,
+           CASE WHEN a.id IS NULL THEN 0 ELSE COALESCE(ABS(a.id*2)+a.offset_key,0) END AS sid,
+           COALESCE(b.label,'default') AS b_label
+    FROM scalar_a a LEFT JOIN scalar_b b ON COALESCE(a.k,0)=b.k
+)
+SELECT p.id,p.b_label,d.label FROM p LEFT JOIN scalar_d d ON p.sid=d.id;
+UPDATE scalar_b SET label='temporary' WHERE k=0;
+DELETE FROM scalar_b WHERE k=0;
+INSERT INTO scalar_a VALUES (4,NULL,1);
+UPDATE scalar_a SET k=2 WHERE id=4;
+DELETE FROM scalar_a WHERE id=4;
+UPDATE scalar_d SET label='new_d3' WHERE id=3;
+""",
+            "scalar_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+            },
+            """WITH p AS (
+    SELECT a.id,
+           CASE WHEN a.id IS NULL THEN 0 ELSE COALESCE(ABS(a.id*2)+a.offset_key,0) END AS sid,
+           COALESCE(b.label,'default') AS b_label
+    FROM scalar_a a LEFT JOIN scalar_b b ON COALESCE(a.k,0)=b.k
+)
+SELECT p.id,p.b_label,d.label FROM p LEFT JOIN scalar_d d ON p.sid=d.id""",
+        )
+
+        run_scenario(
+            binary,
+            root,
+            "nested_full_lookup_mixed",
+            """
+CREATE TABLE full_a(id INT,k INT);
+CREATE TABLE full_b(k INT,label VARCHAR);
+CREATE TABLE full_d(k INT,label VARCHAR);
+INSERT INTO full_a VALUES (1,1),(2,2),(3,3);
+INSERT INTO full_b VALUES (1,'one'),(2,'two'),(4,'four');
+INSERT INTO full_d VALUES (1,'d1'),(2,'d2'),(3,'d3'),(4,'d4');
+CREATE MATERIALIZED VIEW full_lookup_mv AS
+WITH p AS (
+    SELECT a.id,COALESCE(a.k,b.k) AS lookup_key,b.label AS b_label
+    FROM full_a a FULL JOIN full_b b ON a.k=b.k
+)
+SELECT p.id,p.b_label,d.label FROM p LEFT JOIN full_d d ON p.lookup_key=d.k;
+UPDATE full_d SET label='temporary' WHERE k=1;
+DELETE FROM full_d WHERE k=1;
+INSERT INTO full_d VALUES (1,'replaced');
+UPDATE full_d SET label='updated' WHERE k=2;
+""",
+            "full_lookup_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+            },
+            """WITH p AS (
+    SELECT a.id,COALESCE(a.k,b.k) AS lookup_key,b.label AS b_label
+    FROM full_a a FULL JOIN full_b b ON a.k=b.k
+)
+SELECT p.id,p.b_label,d.label FROM p LEFT JOIN full_d d ON p.lookup_key=d.k""",
+        )
+
+        run_scenario(
+            binary,
+            root,
+            "full_join_chain_unmatched_delta",
+            """
+CREATE TABLE chain_a(id INT,k INT);
+CREATE TABLE chain_b(k INT,v INT);
+CREATE TABLE chain_d(id INT,v INT);
+INSERT INTO chain_a VALUES (1,1);
+INSERT INTO chain_d VALUES (2,12),(3,13);
+CREATE MATERIALIZED VIEW chain_mv AS
+WITH p AS (
+    SELECT a.id,COALESCE(a.k,b.k) AS k,b.v
+    FROM chain_a a FULL JOIN chain_b b ON a.k=b.k
+)
+SELECT p.id,p.v,d.v AS dv FROM p FULL JOIN chain_d d ON p.k=d.id;
+INSERT INTO chain_b VALUES (2,99),(3,30),(3,30),(4,40);
+UPDATE chain_b SET v=0 WHERE k=2;
+DELETE FROM chain_b WHERE k=4;
+""",
+            "chain_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+                "delta_shape": {"chain_a": "UNCHANGED", "chain_b": "MIXED", "chain_d": "UNCHANGED"},
+            },
+            """WITH p AS (
+    SELECT a.id,COALESCE(a.k,b.k) AS k,b.v
+    FROM chain_a a FULL JOIN chain_b b ON a.k=b.k
+)
+SELECT p.id,p.v,d.v AS dv FROM p FULL JOIN chain_d d ON p.k=d.id""",
+        )
+
+        run_scenario(
+            binary,
+            root,
+            "full_join_computed_replacement_key",
+            """
+CREATE TABLE pad_a(id INT,k INT);
+CREATE TABLE pad_b(k INT,v INT);
+CREATE TABLE pad_d(k INT,label VARCHAR);
+INSERT INTO pad_a VALUES (1,1);
+INSERT INTO pad_b VALUES (1,2);
+INSERT INTO pad_d VALUES (0,'default'),(2,'old'),(99,'unrelated');
+CREATE MATERIALIZED VIEW pad_mv AS
+WITH p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM pad_a a FULL JOIN pad_b b ON a.k=b.k)
+SELECT p.id,d.label FROM p FULL JOIN pad_d d ON p.lookup_key=d.k;
+UPDATE pad_b SET v=9 WHERE k=1;
+INSERT INTO pad_b VALUES (1,9);
+DELETE FROM pad_b WHERE k=1;
+""",
+            "pad_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+            },
+            """WITH p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM pad_a a FULL JOIN pad_b b ON a.k=b.k)
+SELECT p.id,d.label FROM p FULL JOIN pad_d d ON p.lookup_key=d.k""",
+        )
+
+        run_scenario(
+            binary,
+            root,
+            "full_join_coalesced_inner_key",
+            """
+CREATE TABLE scalar_pad_a(id INT,k INT);
+CREATE TABLE scalar_pad_b(k INT,v INT);
+CREATE TABLE scalar_pad_d(k INT,label VARCHAR);
+INSERT INTO scalar_pad_a VALUES (1,NULL),(2,0);
+INSERT INTO scalar_pad_b VALUES (0,2);
+INSERT INTO scalar_pad_d VALUES (0,'default'),(2,'old'),(99,'unrelated');
+CREATE MATERIALIZED VIEW scalar_pad_mv AS
+WITH normalized AS (SELECT id,COALESCE(k,0) AS nk FROM scalar_pad_a),
+p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM normalized a FULL JOIN scalar_pad_b b ON a.nk=b.k)
+SELECT p.id,d.label FROM p FULL JOIN scalar_pad_d d ON p.lookup_key=d.k;
+UPDATE scalar_pad_b SET v=9 WHERE k=0;
+INSERT INTO scalar_pad_b VALUES (0,9);
+DELETE FROM scalar_pad_b WHERE k=0;
+""",
+            "scalar_pad_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+            },
+            """WITH normalized AS (SELECT id,COALESCE(k,0) AS nk FROM scalar_pad_a),
+p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM normalized a FULL JOIN scalar_pad_b b ON a.nk=b.k)
+SELECT p.id,d.label FROM p FULL JOIN scalar_pad_d d ON p.lookup_key=d.k""",
+        )
+
+        run_scenario(
+            binary,
+            root,
+            "full_join_multisource_replacement_key",
+            """
+CREATE TABLE rel_a(id INT,k INT);
+CREATE TABLE rel_b(k INT);
+CREATE TABLE rel_d(k INT,v INT);
+CREATE TABLE rel_e(k INT,label VARCHAR);
+INSERT INTO rel_a VALUES (1,1),(2,2);
+INSERT INTO rel_b VALUES (1),(2);
+INSERT INTO rel_d VALUES (1,2),(2,3);
+INSERT INTO rel_e VALUES (0,'default'),(2,'old'),(3,'kept');
+CREATE MATERIALIZED VIEW scoped_mv AS
+WITH p AS (SELECT a.id,COALESCE(a.k,b.k) AS k FROM rel_a a FULL JOIN rel_b b ON a.k=b.k),
+q AS (SELECT p.id,COALESCE(d.v,0) AS next_key FROM p FULL JOIN rel_d d ON p.k=d.k)
+SELECT q.id,e.label FROM q FULL JOIN rel_e e ON q.next_key=e.k;
+UPDATE rel_d SET v=9 WHERE k=1;
+INSERT INTO rel_d VALUES (1,9);
+DELETE FROM rel_d WHERE k=1;
+""",
+            "scoped_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+            },
+            """WITH p AS (SELECT a.id,COALESCE(a.k,b.k) AS k FROM rel_a a FULL JOIN rel_b b ON a.k=b.k),
+q AS (SELECT p.id,COALESCE(d.v,0) AS next_key FROM p FULL JOIN rel_d d ON p.k=d.k)
+SELECT q.id,e.label FROM q FULL JOIN rel_e e ON q.next_key=e.k""",
+        )
+
+        run_scenario(
+            binary,
+            root,
+            "full_join_string_operator_scope",
+            """
+CREATE TABLE concat_a(id INT,s VARCHAR);
+CREATE TABLE concat_b(k VARCHAR,v INT);
+CREATE TABLE concat_d(k INT,label VARCHAR);
+INSERT INTO concat_a VALUES (1,'a');
+INSERT INTO concat_b VALUES ('ax',2);
+INSERT INTO concat_d VALUES (0,'default'),(2,'old'),(3,'new');
+CREATE MATERIALIZED VIEW scoped_mv AS
+WITH n AS (SELECT id,COALESCE(s,'') || 'x' AS nk FROM concat_a),
+p AS (SELECT n.id,COALESCE(b.v,0) AS lookup_key FROM n FULL JOIN concat_b b ON n.nk=b.k)
+SELECT p.id,d.label FROM p FULL JOIN concat_d d ON p.lookup_key=d.k;
+UPDATE concat_b SET v=9;
+INSERT INTO concat_b VALUES ('ax',9);
+DELETE FROM concat_b WHERE v=9;
+INSERT INTO concat_b VALUES ('ax',3);
+""",
+            "scoped_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+            },
+            """WITH n AS (SELECT id,COALESCE(s,'') || 'x' AS nk FROM concat_a),
+p AS (SELECT n.id,COALESCE(b.v,0) AS lookup_key FROM n FULL JOIN concat_b b ON n.nk=b.k)
+SELECT p.id,d.label FROM p FULL JOIN concat_d d ON p.lookup_key=d.k""",
+        )
+
+        for join_type in ("FULL", "LEFT", "RIGHT"):
+            first_arm = (
+                f"arm_a a {join_type} JOIN arm_d d ON a.k=d.k"
+                if join_type != "RIGHT"
+                else "arm_d d RIGHT JOIN arm_a a ON d.k=a.k"
+            )
+            base_query = f"""WITH p AS (
+    SELECT a.id,a.k,d.v FROM {first_arm}
+    UNION ALL SELECT b.id,b.k,dx.v FROM arm_b b LEFT JOIN arm_d dx ON b.k=dx.k
+) SELECT p.id,p.v,e.label FROM p FULL JOIN arm_e e ON p.k=e.k"""
+            run_scenario(
+                binary,
+                root,
+                f"outer_join_in_union_{join_type.lower()}",
+                f"""
+CREATE TABLE arm_a(id INT,k INT);
+CREATE TABLE arm_b(id INT,k INT);
+CREATE TABLE arm_d(k INT,v INT);
+CREATE TABLE arm_e(k INT,label VARCHAR);
+INSERT INTO arm_a VALUES(1,1),(1,1),(2,2),(NULL,NULL);
+INSERT INTO arm_b VALUES(100,100);
+INSERT INTO arm_d VALUES(1,2),(2,3),(NULL,9);
+INSERT INTO arm_e VALUES(0,'default'),(1,'one'),(2,'two'),(3,'three'),(100,'hundred');
+CREATE MATERIALIZED VIEW arm_mv AS {base_query};
+UPDATE arm_e SET label='temporary' WHERE k=2;
+INSERT INTO arm_e VALUES(2,'transient');
+DELETE FROM arm_e WHERE label='transient';
+UPDATE arm_e SET label='new' WHERE k=2;
+UPDATE arm_d SET v=99 WHERE k=1;
+INSERT INTO arm_d VALUES(1,99);
+DELETE FROM arm_d WHERE v=99;
+INSERT INTO arm_d VALUES(1,4);
+INSERT INTO arm_a VALUES(3,1);
+UPDATE arm_a SET k=2 WHERE id=3;
+DELETE FROM arm_a WHERE id=3;
+""",
+                "arm_mv",
+                {
+                    "target_dialect": "duckdb",
+                    "compile_only": True,
+                    "force_view_delta_cascade": True,
+                },
+                base_query,
+            )
+
+        for name, source in (
+            ("distinct_nested_outer_input", "SELECT DISTINCT id,k FROM distinct_a"),
+            ("union_distinct_nested_outer_input", "SELECT id,k FROM distinct_a UNION SELECT id,k FROM distinct_c"),
+        ):
+            base_query = f"""WITH n AS ({source}),
+    p AS (SELECT n.id,COALESCE(b.v,n.k,0) AS lookup_key,b.v FROM n FULL JOIN distinct_b b ON n.k=b.k)
+    SELECT p.id,p.v,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k"""
+            run_scenario(
+                binary,
+                root,
+                name,
+                f"""
+    CREATE TABLE distinct_a(id INT,k INT);
+    CREATE TABLE distinct_c(id INT,k INT);
+    CREATE TABLE distinct_b(k INT,v INT);
+    CREATE TABLE distinct_d(k INT,label VARCHAR);
+    INSERT INTO distinct_a VALUES(1,1),(1,1),(2,2),(3,3);
+    INSERT INTO distinct_c VALUES(1,1),(2,2);
+    INSERT INTO distinct_b VALUES(1,2),(2,3);
+    INSERT INTO distinct_d VALUES(0,'default'),(1,'one'),(2,'two'),(3,'three');
+    CREATE MATERIALIZED VIEW distinct_mv AS {base_query};
+    DELETE FROM distinct_c WHERE id=1;
+    DELETE FROM distinct_a WHERE id=1;
+    INSERT INTO distinct_a VALUES(1,1),(4,4),(5,5);
+    UPDATE distinct_a SET k=6 WHERE id=5;
+    DELETE FROM distinct_a WHERE id=5;
+    UPDATE distinct_a SET k=2 WHERE id=4;
+    UPDATE distinct_b SET v=99 WHERE k=1;
+    DELETE FROM distinct_b WHERE k=1;
+    INSERT INTO distinct_b VALUES(4,4);
+    UPDATE distinct_d SET label='new' WHERE k=2;
+    """,
+                "distinct_mv",
+                {
+                    "target_dialect": "duckdb",
+                    "compile_only": True,
+                    "force_view_delta_cascade": True,
+                },
+                base_query,
+            )
+
     print("regular N-term compiled SQL integration tests passed")
 
 
