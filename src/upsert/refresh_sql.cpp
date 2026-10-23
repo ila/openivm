@@ -47,8 +47,8 @@ static string SparkPortableRefreshSQL(string sql) {
 	for (idx_t i = tokens.size(); i > 1; i--) {
 		auto &token = tokens[i - 1];
 		// Native old-state reconstruction expands signed weights with a
-		// correlated range. Spark's range requires constant bounds; use the
-		// same per-row generator as snapshot publication instead.
+		// correlated range. Scope construction still needs DuckDB-parseable
+		// SQL; render the shared per-row generator at this final dialect boundary.
 		if (token.type == SimplifiedTokenType::SIMPLIFIED_TOKEN_KEYWORD &&
 		    StringUtil::CIEquals(sql.substr(token.start, 5), "CROSS") && i + 2 < tokens.size() &&
 		    StringUtil::CIEquals(sql.substr(tokens[i].start, 4), "JOIN") && sql[tokens[i + 2].start] == '(') {
@@ -59,9 +59,13 @@ static string SparkPortableRefreshSQL(string sql) {
 			}
 			auto close = i + 3;
 			idx_t depth = 1;
+			bool single_bound = true;
 			for (; close < tokens.size(); close++) {
 				if (tokens[close].type == SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR) {
 					auto op = sql[tokens[close].start];
+					if (op == ',' && depth == 1) {
+						single_bound = false;
+					}
 					if (op == '(') {
 						depth++;
 					} else if (op == ')' && --depth == 0) {
@@ -73,15 +77,21 @@ static string SparkPortableRefreshSQL(string sql) {
 			if (alias < tokens.size() && StringUtil::CIEquals(sql.substr(tokens[alias].start, 2), "AS")) {
 				alias++;
 			}
-			const string scope_alias = "openivm_scope_weights";
-			if (alias < tokens.size() && sql.compare(tokens[alias].start, scope_alias.size(), scope_alias) == 0) {
-				auto argument_start = tokens[i + 2].start + 1;
-				auto argument = sql.substr(argument_start, tokens[close].start - argument_start);
-				auto replacement = "LATERAL VIEW explode(sequence(CAST(1 AS BIGINT), CAST(" + argument +
-				                   " AS BIGINT))) " + scope_alias + " AS openivm_scope_weight";
-				sql.replace(token.start, tokens[alias].start + scope_alias.size() - token.start, replacement);
+			if (!single_bound || alias >= tokens.size() ||
+			    tokens[alias].type != SimplifiedTokenType::SIMPLIFIED_TOKEN_IDENTIFIER) {
 				continue;
 			}
+			idx_t alias_end;
+			auto names = SqlUtils::ReadQualifiedIdentifier(sql, tokens[alias].start, alias_end);
+			// An explicit output-column alias list is not this helper's shape.
+			if (names.size() != 1 || (alias + 1 < tokens.size() && sql[tokens[alias + 1].start] == '(')) {
+				continue;
+			}
+			auto argument_start = tokens[i + 2].start + 1;
+			auto argument = sql.substr(argument_start, tokens[close].start - argument_start);
+			auto replacement = SqlUtils::BuildRowRepetitionSQL(argument, names[0], SqlDialect::SPARK);
+			sql.replace(token.start, alias_end - token.start, SqlUtils::TrimSQLFragment(replacement));
+			continue;
 		}
 		if (token.type != SimplifiedTokenType::SIMPLIFIED_TOKEN_KEYWORD ||
 		    !StringUtil::CIEquals(sql.substr(token.start, 7), "EXCLUDE")) {

@@ -485,8 +485,8 @@ query I
 SELECT CASE WHEN regexp_matches(string_agg(sql, ' ' ORDER BY stmt_order), '\*\s+EXCEPT\s*\([^)]*openivm_multiplicity')
              AND NOT regexp_matches(string_agg(sql, ' ' ORDER BY stmt_order), '\*\s+EXCLUDE\s*\([^)]*openivm_multiplicity')
              AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%* EXCLUDE (literal)%'
-             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%LATERAL VIEW explode(sequence(%'
-             AND NOT regexp_matches(string_agg(sql, ' ' ORDER BY stmt_order), 'CROSS JOIN ["`]?range["`]?\(abs\(openivm_scope_delta\.')
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%LATERAL VIEW explode(CASE WHEN%'
+             AND NOT regexp_matches(string_agg(sql, ' ' ORDER BY stmt_order), 'CROSS JOIN ["`]?range["`]?\((CAST\()?abs\(openivm_scope_delta\.')
              AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CROSS JOIN range(abs(x)) openivm_scope_weights%'
              AND min(refresh_type)=2
             THEN 1 ELSE 0 END

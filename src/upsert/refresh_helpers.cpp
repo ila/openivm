@@ -1034,9 +1034,9 @@ static FullOuterScopeRows ReadScopeRows(RefreshMetadata &metadata, const string 
 	auto delta = metadata.ResolveDeltaQualifiedName(view_name, name);
 	auto weighted_delta = [&](const string &comparison) {
 		return "SELECT openivm_scope_delta.* EXCLUDE (" + string(openivm::MULTIPLICITY_COL) + ", " +
-		       string(openivm::TIMESTAMP_COL) + ") FROM " + delta +
-		       " openivm_scope_delta CROSS JOIN range(abs(openivm_scope_delta." + openivm::MULTIPLICITY_COL +
-		       ")) openivm_scope_weights" +
+		       string(openivm::TIMESTAMP_COL) + ") FROM " + delta + " openivm_scope_delta" +
+		       SqlUtils::BuildRowRepetitionSQL("abs(openivm_scope_delta." + string(openivm::MULTIPLICITY_COL) + ")",
+		                                       "openivm_scope_weights", SqlDialect::DUCKDB) +
 		       BuildGuardedDeltaWhere(delta_ts_filter, string(openivm::MULTIPLICITY_COL) + comparison);
 	};
 	// Add deletions before subtracting insertions: conflicting DML can insert
