@@ -132,7 +132,8 @@ if(NOT EMSCRIPTEN)
         duckdb_static)
 
     # extension_config.cmake loads ICU statically, so the generated loader needs it.
-    if(TARGET icu_extension)
+    # The target is defined after this subdirectory is processed, so TARGET cannot be used.
+    if(DUCKDB_EXTENSION_ICU_SHOULD_LINK)
         list(APPEND OPENIVM_LINK_LIBS icu_extension)
     endif()
 
