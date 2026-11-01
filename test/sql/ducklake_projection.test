@@ -963,7 +963,7 @@ WITH s AS (
 )
 SELECT count(*) FILTER (WHERE is_publish),
        count(*) FILTER (WHERE starts_with(sql, 'create table if not exists ') AND contains(sql, 'openivm_delta_')
-           AND ends_with(sql, 'openivm_multiplicity INTEGER DEFAULT 1, openivm_timestamp TIMESTAMP DEFAULT now())')),
+           AND ends_with(sql, 'openivm_multiplicity INTEGER DEFAULT 1, openivm_timestamp TIMESTAMP DEFAULT make_timestamp(epoch_us(now())))')),
        count(*) FILTER (WHERE starts_with(sql, '--') OR starts_with(sql, 'openivm_')),
        min(stmt_order) FILTER (WHERE is_publish)
            < min(stmt_order) FILTER (WHERE starts_with(sql, 'create table if not exists ') AND contains(sql, 'openivm_delta_openivm_visible_'))
