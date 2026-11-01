@@ -294,8 +294,11 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 	bool has_derived = false;
 	for (auto &expr : agg.expressions) {
 		if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
-			auto &name = expr->Cast<BoundAggregateExpression>().function.name;
-			if (name == "avg" || IsStddevOrVariance(name)) {
+			auto &bound_agg = expr->Cast<BoundAggregateExpression>();
+			auto &name = bound_agg.function.name;
+			// DISTINCT aggregates are not decomposable into SUM/COUNT; they stay intact
+			// and the checker routes the view to group-recompute.
+			if ((name == "avg" || IsStddevOrVariance(name)) && !bound_agg.IsDistinct()) {
 				has_derived = true;
 				break;
 			}
@@ -338,7 +341,7 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 
 		bool is_avg = (bound.function.name == "avg");
 		bool is_stddev = IsStddevOrVariance(bound.function.name);
-		if (!is_avg && !is_stddev) {
+		if ((!is_avg && !is_stddev) || bound.IsDistinct()) {
 			nondecomposed_remap[i] = new_exprs.size();
 			new_exprs.push_back(std::move(expr));
 			continue;
