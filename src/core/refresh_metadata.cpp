@@ -1935,8 +1935,9 @@ string RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(const string &view_name,
                                                         const string &delta_metadata_table) {
 	auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;
 	return "UPDATE " + metadata_table + " SET last_snapshot_id = " + snapshot_expr +
-	       ", last_update = now(), last_refresh_ts = now() WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
-	       "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "';\n";
+	       ", last_update = " + string(openivm::UTC_NOW_SQL) + ", last_refresh_ts = " + string(openivm::UTC_NOW_SQL) +
+	       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
+	       SqlUtils::EscapeValue(table_name) + "';\n";
 }
 
 void RefreshMetadata::UpdateDuckLakeRefreshMetadata(const string &view_name, const string &table_name,

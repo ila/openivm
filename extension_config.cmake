@@ -6,5 +6,9 @@ duckdb_extension_load(openivm
     LOAD_TESTS
 )
 
+# ICU is linked into the test binary so `require icu` time zone tests
+# (refresh_timezone*.test) run in CI instead of being silently skipped.
+duckdb_extension_load(icu)
+
 # Any extra extensions that should be built
 # e.g.: duckdb_extension_load(json)

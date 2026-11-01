@@ -131,6 +131,12 @@ if(NOT EMSCRIPTEN)
         parquet_extension
         duckdb_static)
 
+    # extension_config.cmake loads ICU statically, so the generated loader needs it.
+    # The target is defined after this subdirectory is processed, so TARGET cannot be used.
+    if(DUCKDB_EXTENSION_ICU_SHOULD_LINK)
+        list(APPEND OPENIVM_LINK_LIBS icu_extension)
+    endif()
+
     if(DUCKDB_EXTENSION_JEMALLOC_SHOULD_LINK)
         list(APPEND OPENIVM_LINK_LIBS jemalloc_extension)
     endif()
