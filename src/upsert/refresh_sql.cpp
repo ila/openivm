@@ -104,6 +104,8 @@ string SparkPortableRefreshSQL(string sql) {
 	}
 	sql = std::regex_replace(sql, quoted_cast_regex, "CAST($1 AS $2)");
 	sql = std::regex_replace(sql, bigint_cast_regex, "CAST($1 AS BIGINT)");
+	// UTC_NOW_SQL is DuckDB-only (epoch_us); Spark's current_timestamp() is already an absolute instant.
+	sql = SqlUtils::ReplaceAllOccurrences(sql, openivm::UTC_NOW_SQL, "current_timestamp()");
 	sql = std::regex_replace(sql, now_regex, "current_timestamp()");
 	sql = std::regex_replace(sql, null_safe_regex, " <=> ");
 	return sql;
