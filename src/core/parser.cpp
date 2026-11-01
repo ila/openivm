@@ -428,26 +428,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		    !pending_drop && (RelationExists(context, view_target_catalog, view_target_schema, view_name) ||
 		                      RelationExists(context, view_target_catalog, view_target_schema, sql_view_name) ||
 		                      RelationExists(context, internal_target_catalog, internal_target_schema, data_table));
-		if (!pending_drop && !already_exists && context.transaction.IsAutoCommit()) {
-			// This statement's snapshot can predate a concurrent CREATE of the same name that committed
-			// while we waited for the mutation gate. The helper connection reads the latest committed
-			// catalog, so the loser reports a duplicate instead of a write-write conflict on the
-			// internal data table.
-			auto committed =
-			    con.Query("SELECT count(*) FROM (SELECT table_name FROM duckdb_tables() WHERE database_name = " +
-			              Value(view_target_catalog).ToSQLString() +
-			              " AND schema_name = " + Value(view_target_schema).ToSQLString() +
-			              " AND table_name = " + Value(sql_view_name).ToSQLString() +
-			              " UNION ALL SELECT view_name FROM duckdb_views() WHERE database_name = " +
-			              Value(view_target_catalog).ToSQLString() +
-			              " AND schema_name = " + Value(view_target_schema).ToSQLString() +
-			              " AND view_name = " + Value(sql_view_name).ToSQLString() +
-			              " UNION ALL SELECT table_name FROM duckdb_tables() WHERE database_name = " +
-			              Value(internal_target_catalog).ToSQLString() +
-			              " AND schema_name = " + Value(internal_target_schema).ToSQLString() +
-			              " AND table_name = " + Value(data_table).ToSQLString() + ")");
-			already_exists = !committed->HasError() && committed->GetValue(0, 0).GetValue<int64_t>() > 0;
-		}
+		// The mutation gate is held and an autocommit snapshot was renewed after admission, so a CREATE
+		// that committed earlier is visible here. Name the user's view, not its internal key. A
+		// write-write conflict that still reaches the physical CREATE is translated by the lifecycle
+		// executor (parser_ddl.cpp).
 		if (already_exists) {
 			throw CatalogException("materialized view \"%s\" already exists in \"%s\".\"%s\"", sql_view_name,
 			                       view_target_catalog, view_target_schema);
