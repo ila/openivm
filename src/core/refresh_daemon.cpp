@@ -1,5 +1,6 @@
 #include "core/refresh_daemon.hpp"
 
+#include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
@@ -125,8 +126,8 @@ void RefreshDaemon::Run() {
 
 				// Check if the view is due for refresh
 				if (!sv.last_update.empty()) {
-					auto elapsed_result = con.Query("SELECT EXTRACT(EPOCH FROM (now()::TIMESTAMP - '" + sv.last_update +
-					                                "'::TIMESTAMP))");
+					auto elapsed_result = con.Query("SELECT EXTRACT(EPOCH FROM (" + string(openivm::UTC_NOW_SQL) +
+					                                " - '" + sv.last_update + "'::TIMESTAMP))");
 					if (!elapsed_result->HasError() && elapsed_result->RowCount() > 0 &&
 					    !elapsed_result->GetValue(0, 0).IsNull()) {
 						auto elapsed_seconds = elapsed_result->GetValue(0, 0).GetValue<double>();

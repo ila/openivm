@@ -447,9 +447,9 @@ string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool 
 
 string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source, const string &new_source,
                                          const string &statement_prefix) {
-	return statement_prefix + "INSERT INTO " + delta_table +
-	       "\nSELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM " + old_source +
-	       "\nUNION ALL\nSELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM " + new_source + ";\n";
+	return statement_prefix + "INSERT INTO " + delta_table + "\nSELECT *, CAST(-1 AS INTEGER), " +
+	       string(openivm::UTC_NOW_SQL) + " FROM " + old_source + "\nUNION ALL\nSELECT *, CAST(1 AS INTEGER), " +
+	       string(openivm::UTC_NOW_SQL) + " FROM " + new_source + ";\n";
 }
 
 SignedRowLists BuildSignedRowLists(const vector<string> &columns, const string &old_alias, const string &new_alias,
