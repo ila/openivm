@@ -1120,3 +1120,56 @@ query I
 SELECT count(*) FROM source_gc.openivm_delta_gc_source;
 ----
 0
+
+# Concurrent duplicate CREATE: one winner; every loser names the user's view, not an internal key.
+statement ok
+SET openivm_disable_daemon = true;
+
+statement ok
+CREATE TABLE dup_src (k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO dup_src SELECT i % 7, i FROM range(1000) t(i);
+
+concurrentloop threadid 0 2
+
+statement maybe
+CREATE MATERIALIZED VIEW dup_mv AS SELECT k, SUM(v) AS total, COUNT(*) AS cnt FROM dup_src GROUP BY k;
+----
+<REGEX>:.*materialized view "dup_mv" already exists.*
+
+endloop
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_sql_name = 'dup_mv';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name = 'dup_mv';
+----
+1
+
+statement ok
+INSERT INTO dup_src VALUES (1, 5), (100, 1);
+
+statement ok
+DELETE FROM dup_src WHERE k = 3;
+
+statement ok
+PRAGMA refresh('dup_mv');
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM dup_mv EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dup_src GROUP BY k)
+ UNION ALL
+ (SELECT k, SUM(v), COUNT(*) FROM dup_src GROUP BY k EXCEPT ALL SELECT * FROM dup_mv)
+);
+----
+0
+
+# Sequential duplicate reports the user-facing name.
+statement error
+CREATE MATERIALIZED VIEW dup_mv AS SELECT k, SUM(v) AS total FROM dup_src GROUP BY k;
+----
+<REGEX>:.*materialized view "dup_mv" already exists.*
