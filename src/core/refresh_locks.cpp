@@ -120,19 +120,39 @@ bool MutationGate::HasSourceCommitAfter(const string &source, idx_t catalog_oid,
 void MutationGate::UnlockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication,
                                 VisibilityBound oldest_snapshot) {
 	std::lock_guard<mutex> guard(lock);
-	auto &catalog_sources = sources.at(catalog_oid);
-	auto &admission = *catalog_sources.at(source);
+	auto catalog_it = sources.find(catalog_oid);
+	D_ASSERT(catalog_it != sources.end());
+	if (catalog_it == sources.end()) {
+		return;
+	}
+	auto &catalog_sources = catalog_it->second;
+	auto source_it = catalog_sources.find(source);
+	D_ASSERT(source_it != catalog_sources.end());
+	if (source_it == catalog_sources.end()) {
+		return;
+	}
+	auto &admission = *source_it->second;
 	if (publication) {
 		D_ASSERT(admission.publisher == owner && admission.publication_depth > 0);
 		if (--admission.publication_depth == 0) {
 			admission.publisher = nullptr;
 		}
 	} else {
-		auto &readers = admission.readers.at(owner);
+		auto reader_it = admission.readers.find(owner);
+		D_ASSERT(reader_it != admission.readers.end());
+		if (reader_it == admission.readers.end()) {
+			return;
+		}
+		auto writer_it = admitted_writers.find(owner);
+		D_ASSERT(writer_it != admitted_writers.end());
+		if (writer_it == admitted_writers.end()) {
+			return;
+		}
+		auto &readers = reader_it->second;
 		if (--readers == 0) {
 			admission.readers.erase(owner);
 		}
-		if (--admitted_writers.at(owner) == 0) {
+		if (--writer_it->second == 0) {
 			admitted_writers.erase(owner);
 		}
 	}

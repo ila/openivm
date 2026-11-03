@@ -324,7 +324,7 @@ template <class BuildSQL>
 static void EnsureAuxState(RefreshMetadata &metadata, Connection &con, const string &view_name, const string &aux_table,
                            const vector<string> &expected_columns, const string &internal_catalog_name,
                            const string &internal_schema_name, const vector<string> &pending_delta_tables,
-                           const string &view_catalog_name, const string &view_schema_name, BuildSQL build_sql) {
+                           const string &view_catalog_name, const string &view_schema_name, const BuildSQL &build_sql) {
 	if (metadata.TableColumnsMatch(internal_catalog_name, internal_schema_name, aux_table, expected_columns)) {
 		return;
 	}

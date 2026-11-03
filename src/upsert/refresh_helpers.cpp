@@ -1705,7 +1705,7 @@ ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connec
 	auto session = SqlUtils::SessionDefaultLocation(context);
 	resolved.view_catalog_name = session.catalog;
 	resolved.view_schema_name = session.schema;
-	auto name = parts.back();
+	const auto &name = parts.back();
 	if (parts.size() == 3) {
 		resolved.view_catalog_name = parts[0];
 		resolved.view_schema_name = parts[1];
