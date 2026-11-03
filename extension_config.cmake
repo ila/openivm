@@ -7,9 +7,9 @@ duckdb_extension_load(openivm
 )
 
 # DuckLake tests install from this build's repository, including in CI where
-# no previously installed extension is available. The tidy configure only
-# needs OpenIVM's compile commands and has no vcpkg toolchain for DuckLake.
-if(NOT CLANG_TIDY)
+# no previously installed extension is available. Only vcpkg-enabled builds
+# have DuckLake's roaring dependency; the PostgreSQL and tidy jobs do not.
+if(VCPKG_BUILD AND NOT CLANG_TIDY)
     duckdb_extension_load(ducklake
         SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/third_party/lpts/third_party/ducklake
     )
