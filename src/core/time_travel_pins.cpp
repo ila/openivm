@@ -22,12 +22,12 @@ using BaseTableRefCallback = std::function<void(BaseTableRef &)>;
 // Resolve without the AT clause; DuckDB owns lookup errors for unresolved relations.
 static optional_ptr<CatalogEntry> LookupPinRelation(ClientContext &context, BaseTableRef &ref) {
 	QueryErrorContext error_context;
-	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, ref.Table(), error_context);
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, QualifiedName(ref.Table()), error_context);
 	try {
 		auto catalog = ref.GetQualifiedName().Catalog();
 		auto schema = ref.GetQualifiedName().Schema();
 		Binder::BindSchemaOrCatalog(context, catalog, schema);
-		return Catalog::GetEntry(context, Identifier(catalog), Identifier(schema), lookup,
+		return Catalog::GetEntry(context, SqlUtils::QualifyLookup(lookup, Identifier(catalog), Identifier(schema)),
 		                         OnEntryNotFound::RETURN_NULL);
 	} catch (const std::exception &) {
 		return nullptr;

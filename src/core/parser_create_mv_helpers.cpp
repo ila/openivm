@@ -257,8 +257,9 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 		// Inspect this transaction's catalog, not a process-wide initialization flag: older
 		// databases and other attached catalogs must still receive missing columns. A missing
 		// table is created above with every column.
-		auto existing = Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(schema),
-		                                                     Identifier(table), OnEntryNotFound::RETURN_NULL);
+		auto existing = Catalog::GetEntry<TableCatalogEntry>(
+		    context, QualifiedName(Identifier(catalog), Identifier(schema), Identifier(table)),
+		    OnEntryNotFound::RETURN_NULL);
 		if (existing) {
 			AppendMetadataMigrationSQL(ddl, table, existing, remote);
 		}
@@ -400,9 +401,9 @@ void AppendCreateMVSystemTablesDDL(ClientContext &context, const string &catalog
 		// a DuckDB file lock after writing metadata but before creating the physical
 		// DuckLake/default-catalog objects, a retry should clean that stale row rather
 		// than report a misleading duplicate MV.
-		auto views =
-		    Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(schema),
-		                                         Identifier(openivm::VIEWS_TABLE), OnEntryNotFound::RETURN_NULL);
+		auto views = Catalog::GetEntry<TableCatalogEntry>(
+		    context, QualifiedName(Identifier(catalog), Identifier(schema), Identifier(openivm::VIEWS_TABLE)),
+		    OnEntryNotFound::RETURN_NULL);
 		// Remote catalogs have no DuckDB storage to scan; the guarded DELETE is harmless.
 		if (views && (remote || HasViewMetadata(context, *views, view_name))) {
 			ddl.push_back("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE " + stale_mv_condition);

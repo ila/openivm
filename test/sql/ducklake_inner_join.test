@@ -1333,3 +1333,631 @@ DROP SCHEMA dl.source_a CASCADE;
 
 statement ok
 DROP SCHEMA dl.source_b CASCADE;
+
+# Chained FULL JOINs retain unmatched changed rows in DuckLake's telescoping
+# terms too, so a B-only row can replace a downstream D-only row.
+statement ok
+CREATE TABLE dl.chain_a(id INT,k INT);
+
+statement ok
+CREATE TABLE dl.chain_b(k INT,v INT);
+
+statement ok
+CREATE TABLE dl.chain_d(id INT,v INT);
+
+statement ok
+INSERT INTO dl.chain_a VALUES (1,1),(3,3),(NULL,NULL);
+
+statement ok
+INSERT INTO dl.chain_d VALUES (2,12),(3,13),(NULL,15);
+
+statement ok
+CREATE VIEW expected_dl_full_chain AS
+WITH p AS (
+    SELECT a.id,COALESCE(a.k,b.k) AS k,b.v
+    FROM dl.chain_a a FULL JOIN dl.chain_b b ON a.k=b.k
+)
+SELECT p.id,p.v,d.v AS dv FROM p FULL JOIN dl.chain_d d ON p.k=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.full_chain AS
+WITH p AS (
+    SELECT a.id,COALESCE(a.k,b.k) AS k,b.v
+    FROM dl.chain_a a FULL JOIN dl.chain_b b ON a.k=b.k
+)
+SELECT p.id,p.v,d.v AS dv FROM p FULL JOIN dl.chain_d d ON p.k=d.id;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='full_chain';
+----
+2
+
+statement ok
+INSERT INTO dl.chain_b VALUES (2,99),(3,30),(3,30),(NULL,60);
+
+statement ok
+UPDATE dl.chain_b SET v=0 WHERE k=2;
+
+statement ok
+INSERT INTO dl.chain_b VALUES (4,40);
+
+statement ok
+DELETE FROM dl.chain_b WHERE k=4;
+
+statement ok
+PRAGMA refresh('dl.full_chain');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.full_chain) EXCEPT ALL (SELECT * FROM expected_dl_full_chain));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_dl_full_chain) EXCEPT ALL (SELECT * FROM dl.full_chain));
+----
+0
+
+statement ok
+UPDATE dl.chain_a SET k=2 WHERE id=1;
+
+statement ok
+INSERT INTO dl.chain_a VALUES (4,4);
+
+statement ok
+UPDATE dl.chain_b SET v=-1 WHERE k=3;
+
+statement ok
+DELETE FROM dl.chain_b WHERE k=3;
+
+statement ok
+INSERT INTO dl.chain_b VALUES (5,50),(5,50);
+
+statement ok
+UPDATE dl.chain_d SET v=55 WHERE id=2;
+
+statement ok
+DELETE FROM dl.chain_d WHERE id=3;
+
+statement ok
+INSERT INTO dl.chain_d VALUES (5,15);
+
+statement ok
+PRAGMA refresh('dl.full_chain');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.full_chain) EXCEPT ALL (SELECT * FROM expected_dl_full_chain));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_dl_full_chain) EXCEPT ALL (SELECT * FROM dl.full_chain));
+----
+0
+
+# DuckLake replacement scopes for computed keys and renamed aliases.
+# A downstream FULL JOIN key changes when an inner FULL JOIN loses its last
+# match. Both the old key and the NULL-extended replacement key need refresh.
+statement ok
+CREATE TABLE dl.padding_a(id INT,k INT);
+
+statement ok
+CREATE TABLE dl.padding_b(k INT,v INT);
+
+statement ok
+CREATE TABLE dl.padding_d(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO dl.padding_a VALUES (1,1),(3,3),(NULL,NULL);
+
+statement ok
+INSERT INTO dl.padding_b VALUES (1,2),(3,3),(NULL,4);
+
+statement ok
+INSERT INTO dl.padding_d VALUES (0,'default'),(2,'old'),(3,'kept'),(99,'unrelated');
+
+statement ok
+CREATE VIEW expected_padding_full AS
+WITH p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM dl.padding_a a FULL JOIN dl.padding_b b ON a.k=b.k)
+SELECT p.id,d.label FROM p FULL JOIN dl.padding_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.padding_full AS
+WITH p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM dl.padding_a a FULL JOIN dl.padding_b b ON a.k=b.k)
+SELECT p.id,d.label FROM p FULL JOIN dl.padding_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.padding_full_mirror AS
+WITH p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM dl.padding_b b FULL JOIN dl.padding_a a ON b.k=a.k)
+SELECT p.id,d.label FROM dl.padding_d d FULL JOIN p ON d.k=p.lookup_key;
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_sql_name IN ('padding_full','padding_full_mirror') AND type=2;
+----
+2
+
+statement ok
+UPDATE dl.padding_b SET v=9 WHERE k=1;
+
+statement ok
+INSERT INTO dl.padding_b VALUES (1,9);
+
+statement ok
+DELETE FROM dl.padding_b WHERE k=1;
+
+statement ok
+PRAGMA refresh('dl.padding_full');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.padding_full) EXCEPT ALL (SELECT * FROM expected_padding_full));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_padding_full) EXCEPT ALL (SELECT * FROM dl.padding_full));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.padding_full_mirror');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.padding_full_mirror) EXCEPT ALL (SELECT * FROM expected_padding_full));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_padding_full) EXCEPT ALL (SELECT * FROM dl.padding_full_mirror));
+----
+0
+
+statement ok
+INSERT INTO dl.padding_b VALUES (1,2),(1,2),(NULL,7);
+
+statement ok
+UPDATE dl.padding_a SET k=1 WHERE id=3;
+
+statement ok
+UPDATE dl.padding_d SET label='new_default' WHERE k=0;
+
+statement ok
+DELETE FROM dl.padding_d WHERE k=3;
+
+statement ok
+INSERT INTO dl.padding_d VALUES (7,'seven');
+
+statement ok
+PRAGMA refresh('dl.padding_full');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.padding_full) EXCEPT ALL (SELECT * FROM expected_padding_full));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_padding_full) EXCEPT ALL (SELECT * FROM dl.padding_full));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.padding_full_mirror');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.padding_full_mirror) EXCEPT ALL (SELECT * FROM expected_padding_full));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_padding_full) EXCEPT ALL (SELECT * FROM dl.padding_full_mirror));
+----
+0
+
+# Computed inner join keys must survive source-lineage discovery. Both aliases
+# and COALESCE on either input retain NULL-padding replacement keys.
+
+statement ok
+CREATE TABLE dl.scalar_padding_a(id INT,k INT);
+
+statement ok
+CREATE TABLE dl.scalar_padding_b(k INT,v INT);
+
+statement ok
+CREATE TABLE dl.scalar_padding_d(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO dl.scalar_padding_a VALUES (1,NULL),(2,0),(3,3),(4,1),(5,1);
+
+statement ok
+INSERT INTO dl.scalar_padding_b VALUES (0,2),(NULL,2),(3,3),(1,6);
+
+statement ok
+INSERT INTO dl.scalar_padding_d VALUES (0,'default'),(2,'old'),(3,'kept'),(6,'six'),(99,'unrelated');
+
+statement ok
+CREATE VIEW expected_scalar_padding AS
+WITH normalized AS (SELECT id,COALESCE(k,0) AS nk FROM dl.scalar_padding_a), p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM normalized a FULL JOIN dl.scalar_padding_b b ON a.nk=b.k) SELECT p.id,d.label FROM p FULL JOIN dl.scalar_padding_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.scalar_padding AS
+WITH normalized AS (SELECT id,COALESCE(k,0) AS nk FROM dl.scalar_padding_a), p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM normalized a FULL JOIN dl.scalar_padding_b b ON a.nk=b.k) SELECT p.id,d.label FROM p FULL JOIN dl.scalar_padding_d d ON p.lookup_key=d.k;
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.scalar_padding) EXCEPT ALL (SELECT * FROM expected_scalar_padding));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding) EXCEPT ALL (SELECT * FROM dl.scalar_padding));
+----
+0
+
+statement ok
+CREATE VIEW expected_scalar_padding_mirror AS
+WITH normalized AS (SELECT id,COALESCE(k,0) AS nk FROM dl.scalar_padding_a), normalized_b AS (SELECT COALESCE(k,0) AS nk,v FROM dl.scalar_padding_b), p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM normalized_b b FULL JOIN normalized a ON b.nk=a.nk) SELECT p.id,d.label FROM dl.scalar_padding_d d FULL JOIN p ON d.k=p.lookup_key;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.scalar_padding_mirror AS
+WITH normalized AS (SELECT id,COALESCE(k,0) AS nk FROM dl.scalar_padding_a), normalized_b AS (SELECT COALESCE(k,0) AS nk,v FROM dl.scalar_padding_b), p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM normalized_b b FULL JOIN normalized a ON b.nk=a.nk) SELECT p.id,d.label FROM dl.scalar_padding_d d FULL JOIN p ON d.k=p.lookup_key;
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.scalar_padding_mirror) EXCEPT ALL (SELECT * FROM expected_scalar_padding_mirror));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding_mirror) EXCEPT ALL (SELECT * FROM dl.scalar_padding_mirror));
+----
+0
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_sql_name IN ('scalar_padding','scalar_padding_mirror') AND type=2;
+----
+2
+
+statement ok
+UPDATE dl.scalar_padding_b SET v=9 WHERE k=0;
+
+statement ok
+INSERT INTO dl.scalar_padding_b VALUES (0,9);
+
+statement ok
+DELETE FROM dl.scalar_padding_b WHERE k=0 OR k IS NULL;
+
+statement ok
+PRAGMA refresh('dl.scalar_padding');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.scalar_padding) EXCEPT ALL (SELECT * FROM expected_scalar_padding));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding) EXCEPT ALL (SELECT * FROM dl.scalar_padding));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.scalar_padding_mirror');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.scalar_padding_mirror) EXCEPT ALL (SELECT * FROM expected_scalar_padding_mirror));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding_mirror) EXCEPT ALL (SELECT * FROM dl.scalar_padding_mirror));
+----
+0
+
+statement ok
+INSERT INTO dl.scalar_padding_b VALUES (0,2),(0,2),(NULL,7);
+
+statement ok
+UPDATE dl.scalar_padding_a SET k=0 WHERE id=3;
+
+statement ok
+UPDATE dl.scalar_padding_d SET label='new_default' WHERE k=0;
+
+statement ok
+INSERT INTO dl.scalar_padding_b VALUES (4,9);
+
+statement ok
+DELETE FROM dl.scalar_padding_b WHERE k=4;
+
+statement ok
+PRAGMA refresh('dl.scalar_padding');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.scalar_padding) EXCEPT ALL (SELECT * FROM expected_scalar_padding));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding) EXCEPT ALL (SELECT * FROM dl.scalar_padding));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.scalar_padding_mirror');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.scalar_padding_mirror) EXCEPT ALL (SELECT * FROM expected_scalar_padding_mirror));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding_mirror) EXCEPT ALL (SELECT * FROM dl.scalar_padding_mirror));
+----
+0
+
+statement ok
+UPDATE dl.scalar_padding_b SET v=8 WHERE k=0;
+
+statement ok
+DELETE FROM dl.scalar_padding_b WHERE k=0;
+
+statement ok
+INSERT INTO dl.scalar_padding_b VALUES (0,4);
+
+statement ok
+DELETE FROM dl.scalar_padding_a WHERE id=2;
+
+statement ok
+INSERT INTO dl.scalar_padding_a VALUES (2,NULL);
+
+statement ok
+INSERT INTO dl.scalar_padding_d VALUES (4,'four'),(7,'seven');
+
+statement ok
+PRAGMA refresh('dl.scalar_padding');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.scalar_padding) EXCEPT ALL (SELECT * FROM expected_scalar_padding));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding) EXCEPT ALL (SELECT * FROM dl.scalar_padding));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.scalar_padding_mirror');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.scalar_padding_mirror) EXCEPT ALL (SELECT * FROM expected_scalar_padding_mirror));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding_mirror) EXCEPT ALL (SELECT * FROM dl.scalar_padding_mirror));
+----
+0
+
+# Replacement scopes evaluate whole join inputs, including keys spanning
+# multiple sources and SQL operators in normalized string keys.
+
+statement ok
+CREATE TABLE dl.rel_scope_a(id INT,k INT);
+
+statement ok
+CREATE TABLE dl.rel_scope_b(k INT);
+
+statement ok
+CREATE TABLE dl.rel_scope_d(k INT,v INT);
+
+statement ok
+CREATE TABLE dl.rel_scope_e(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO dl.rel_scope_a VALUES (1,1),(2,2),(3,3);
+
+statement ok
+INSERT INTO dl.rel_scope_b VALUES (1),(2),(4);
+
+statement ok
+INSERT INTO dl.rel_scope_d VALUES (1,2),(2,3),(4,4);
+
+statement ok
+INSERT INTO dl.rel_scope_e VALUES (0,'default'),(2,'old'),(3,'kept'),(4,'four'),(99,'unrelated');
+
+statement ok
+CREATE VIEW expected_rel_scope AS WITH p AS (SELECT a.id,COALESCE(a.k,b.k) AS k FROM dl.rel_scope_a a FULL JOIN dl.rel_scope_b b ON a.k=b.k), q AS (SELECT p.id,COALESCE(d.v,0) AS next_key FROM p FULL JOIN dl.rel_scope_d d ON p.k=d.k) SELECT q.id,e.label FROM q FULL JOIN dl.rel_scope_e e ON q.next_key=e.k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.rel_scope AS WITH p AS (SELECT a.id,COALESCE(a.k,b.k) AS k FROM dl.rel_scope_a a FULL JOIN dl.rel_scope_b b ON a.k=b.k), q AS (SELECT p.id,COALESCE(d.v,0) AS next_key FROM p FULL JOIN dl.rel_scope_d d ON p.k=d.k) SELECT q.id,e.label FROM q FULL JOIN dl.rel_scope_e e ON q.next_key=e.k;
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.rel_scope) EXCEPT ALL (SELECT * FROM expected_rel_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_rel_scope) EXCEPT ALL (SELECT * FROM dl.rel_scope));
+----
+0
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='rel_scope';
+----
+2
+
+statement ok
+UPDATE dl.rel_scope_d SET v=9 WHERE k=1;
+
+statement ok
+INSERT INTO dl.rel_scope_d VALUES (1,9);
+
+statement ok
+DELETE FROM dl.rel_scope_d WHERE k=1;
+
+statement ok
+PRAGMA refresh('dl.rel_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.rel_scope) EXCEPT ALL (SELECT * FROM expected_rel_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_rel_scope) EXCEPT ALL (SELECT * FROM dl.rel_scope));
+----
+0
+
+statement ok
+INSERT INTO dl.rel_scope_d VALUES (1,4),(1,4);
+
+statement ok
+UPDATE dl.rel_scope_b SET k=5 WHERE k=2;
+
+statement ok
+INSERT INTO dl.rel_scope_b VALUES (2);
+
+statement ok
+UPDATE dl.rel_scope_a SET k=4 WHERE id=3;
+
+statement ok
+UPDATE dl.rel_scope_e SET label='new_default' WHERE k=0;
+
+statement ok
+PRAGMA refresh('dl.rel_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.rel_scope) EXCEPT ALL (SELECT * FROM expected_rel_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_rel_scope) EXCEPT ALL (SELECT * FROM dl.rel_scope));
+----
+0
+
+statement ok
+UPDATE dl.rel_scope_d SET v=8 WHERE k=1;
+
+statement ok
+DELETE FROM dl.rel_scope_d WHERE k=1 OR k=4;
+
+statement ok
+DELETE FROM dl.rel_scope_a WHERE id=1;
+
+statement ok
+INSERT INTO dl.rel_scope_a VALUES (1,5);
+
+statement ok
+INSERT INTO dl.rel_scope_d VALUES (5,2);
+
+statement ok
+PRAGMA refresh('dl.rel_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.rel_scope) EXCEPT ALL (SELECT * FROM expected_rel_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_rel_scope) EXCEPT ALL (SELECT * FROM dl.rel_scope));
+----
+0
+
+statement ok
+CREATE TABLE dl.concat_scope_a(id INT,s VARCHAR);
+
+statement ok
+CREATE TABLE dl.concat_scope_b(k VARCHAR,v INT);
+
+statement ok
+CREATE TABLE dl.concat_scope_d(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO dl.concat_scope_a VALUES (1,'a'),(2,NULL);
+
+statement ok
+INSERT INTO dl.concat_scope_b VALUES ('ax',2),('x',3);
+
+statement ok
+INSERT INTO dl.concat_scope_d VALUES (0,'default'),(2,'old'),(3,'new');
+
+statement ok
+CREATE VIEW expected_concat_scope AS WITH n AS (SELECT id,COALESCE(s,'') || 'x' AS nk FROM dl.concat_scope_a), p AS (SELECT n.id,COALESCE(b.v,0) AS lookup_key FROM n FULL JOIN dl.concat_scope_b b ON n.nk=b.k) SELECT p.id,d.label FROM p FULL JOIN dl.concat_scope_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.concat_scope AS WITH n AS (SELECT id,COALESCE(s,'') || 'x' AS nk FROM dl.concat_scope_a), p AS (SELECT n.id,COALESCE(b.v,0) AS lookup_key FROM n FULL JOIN dl.concat_scope_b b ON n.nk=b.k) SELECT p.id,d.label FROM p FULL JOIN dl.concat_scope_d d ON p.lookup_key=d.k;
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.concat_scope) EXCEPT ALL (SELECT * FROM expected_concat_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_concat_scope) EXCEPT ALL (SELECT * FROM dl.concat_scope));
+----
+0
+
+statement ok
+UPDATE dl.concat_scope_b SET v=9 WHERE k='ax';
+
+statement ok
+INSERT INTO dl.concat_scope_b VALUES ('ax',9);
+
+statement ok
+DELETE FROM dl.concat_scope_b WHERE v=9;
+
+statement ok
+INSERT INTO dl.concat_scope_b VALUES ('ax',3);
+
+statement ok
+PRAGMA refresh('dl.concat_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.concat_scope) EXCEPT ALL (SELECT * FROM expected_concat_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_concat_scope) EXCEPT ALL (SELECT * FROM dl.concat_scope));
+----
+0
+
+statement ok
+UPDATE dl.concat_scope_b SET v=9 WHERE k='ax';
+
+statement ok
+INSERT INTO dl.concat_scope_b VALUES ('ax',9);
+
+statement ok
+DELETE FROM dl.concat_scope_b WHERE k='ax';
+
+statement ok
+PRAGMA refresh('dl.concat_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.concat_scope) EXCEPT ALL (SELECT * FROM expected_concat_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_concat_scope) EXCEPT ALL (SELECT * FROM dl.concat_scope));
+----
+0
+
+statement ok
+INSERT INTO dl.concat_scope_b VALUES ('ax',2),('ax',2);
+
+statement ok
+UPDATE dl.concat_scope_a SET s='a' WHERE id=2;
+
+statement ok
+UPDATE dl.concat_scope_d SET label='changed' WHERE k=2;
+
+statement ok
+PRAGMA refresh('dl.concat_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM dl.concat_scope) EXCEPT ALL (SELECT * FROM expected_concat_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_concat_scope) EXCEPT ALL (SELECT * FROM dl.concat_scope));
+----
+0

@@ -426,11 +426,29 @@ public:
 		string table;
 		idx_t occurrence = 0;
 		string column;
+		string cast_type;
 		bool cardinality_transition_check_safe = false;
 	};
 
 	bool GetLeftJoinKeySource(const string &view_name, LeftJoinKeySource &out);
 	static string LeftJoinKeySourceToJson(const LeftJoinKeySource &source);
+
+	// Nested outer-join inputs used to discover NULL-padding keys of a FULL projection.
+	struct FullOuterScopeInput {
+		string table;
+		idx_t occurrence = 0;
+		idx_t presence_index = 0;
+	};
+	struct FullOuterScopeSource {
+		string key_column;
+		string presence_column;
+		vector<FullOuterScopeInput> inputs;
+	};
+	struct FullOuterScope {
+		FullOuterScopeSource left, right;
+	};
+	vector<FullOuterScope> GetFullOuterScopes(const string &view_name);
+	static string FullOuterScopesToJson(const vector<FullOuterScope> &scopes);
 
 	struct LeftJoinNullableSources {
 		vector<string> tables;

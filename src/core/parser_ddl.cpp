@@ -719,8 +719,8 @@ void DDLExecutorExecuteFunction(ClientContext &context, TableFunctionInput &data
 		return;
 	}
 	ExecuteDDL(context, bind_data.ddl);
-	output.SetValue(0, 0, Value::BOOLEAN(bind_data.result));
-	output.SetCardinality(1);
+	output.data[0].SetValue(0, Value::BOOLEAN(bind_data.result));
+	output.SetCardinalityUnsafe(1);
 	gdata.offset++;
 }
 
@@ -1169,8 +1169,8 @@ public:
 		if (staged) {
 			MutationLockGuard guard(client);
 			ExecuteStagedDDL(client, {Value(program)});
-			chunk.SetValue(0, 0, Value::BOOLEAN(true));
-			chunk.SetCardinality(1);
+			chunk.data[0].SetValue(0, Value::BOOLEAN(true));
+			chunk.SetCardinalityUnsafe(1);
 			state.finished = true;
 			return SourceResultType::FINISHED;
 		}
@@ -1260,8 +1260,8 @@ public:
 			throw;
 		}
 		state.metrics.reset();
-		chunk.SetValue(0, 0, Value::BOOLEAN(true));
-		chunk.SetCardinality(1);
+		chunk.data[0].SetValue(0, Value::BOOLEAN(true));
+		chunk.SetCardinalityUnsafe(1);
 		state.finished = true;
 		return SourceResultType::FINISHED;
 	}
@@ -1435,10 +1435,12 @@ static void ExecuteDropView(ClientContext &context, TableFunctionInput &input, D
 	    info.type == CatalogType::TABLE_ENTRY &&
 	    SqlUtils::IsDelta(info.GetQualifiedName().Name().GetIdentifierName()) &&
 	    Catalog::GetEntry(
-	        context, Identifier(info.GetQualifiedName().Catalog().GetIdentifierName()),
-	        Identifier(info.GetQualifiedName().Schema().GetIdentifierName()),
-	        EntryLookupInfo(CatalogType::TABLE_ENTRY,
-	                        QualifiedName(Identifier(info.GetQualifiedName().Name().GetIdentifierName()))),
+	        context,
+	        SqlUtils::QualifyLookup(
+	            EntryLookupInfo(CatalogType::TABLE_ENTRY,
+	                            QualifiedName(Identifier(info.GetQualifiedName().Name().GetIdentifierName()))),
+	            Identifier(info.GetQualifiedName().Catalog().GetIdentifierName()),
+	            Identifier(info.GetQualifiedName().Schema().GetIdentifierName())),
 	        OnEntryNotFound::RETURN_NULL);
 	vector<reference<TableCatalogEntry>> schema_tables;
 	if (info.type == CatalogType::SCHEMA_ENTRY && info.cascade && catalog.IsDuckCatalog()) {
@@ -1496,8 +1498,8 @@ static void ExecuteDropView(ClientContext &context, TableFunctionInput &input, D
 		                                       info.GetQualifiedName().Name())
 		                        .c_str());
 	}
-	output.SetValue(0, 0, Value::BOOLEAN(true));
-	output.SetCardinality(1);
+	output.data[0].SetValue(0, Value::BOOLEAN(true));
+	output.SetCardinalityUnsafe(1);
 	state.finished = true;
 }
 
@@ -1550,8 +1552,8 @@ TableFunction CreateDeltaFromDataFunction() {
 		Identifier catalog(parts.size() == 3 ? parts[0] : string());
 		Identifier schema(parts.size() >= 2 ? parts[parts.size() - 2] : string());
 		Binder::BindSchemaOrCatalog(context, catalog, schema);
-		auto &table = Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(schema),
-		                                                   Identifier(parts.back()));
+		auto &table = Catalog::GetEntry<TableCatalogEntry>(
+		    context, QualifiedName(Identifier(catalog), Identifier(schema), Identifier(parts.back())));
 		vector<pair<string, string>> columns;
 		for (auto &column : table.GetColumns().Logical()) {
 			columns.emplace_back(column.Name(), column.Type().ToString());

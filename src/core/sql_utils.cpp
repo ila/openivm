@@ -235,7 +235,7 @@ static bool IsIdentifierChar(char c) {
 }
 
 // Trim whitespace without stripping non-ASCII identifier bytes on signed-char builds.
-static string TrimSQLFragment(const string &input) {
+string SqlUtils::TrimSQLFragment(const string &input) {
 	idx_t start = 0;
 	while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
 		start++;
@@ -672,6 +672,17 @@ string SqlUtils::BuildAllNullPredicate(const vector<string> &columns) {
 
 string SqlUtils::BuildAnyNullPredicate(const vector<string> &columns, const string &prefix) {
 	return JoinEach(columns, " OR ", [&](const string &c) { return prefix + QuoteIdentifier(c) + " IS NULL"; });
+}
+
+string SqlUtils::BuildRowRepetitionSQL(const string &count, const string &alias, SqlDialect dialect) {
+	auto quoted_alias = DialectQuoteIdent(alias, dialect);
+	auto bound = "CAST(" + count + " AS BIGINT)";
+	if (dialect == SqlDialect::SPARK) {
+		// sequence(1, 0) descends instead of returning an empty array.
+		return " LATERAL VIEW explode(CASE WHEN " + bound + " > 0 THEN sequence(CAST(1 AS BIGINT), " + bound +
+		       ") ELSE array() END) " + quoted_alias + " AS `range`";
+	}
+	return " CROSS JOIN range(" + bound + ") " + quoted_alias;
 }
 
 string SqlUtils::BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias) {

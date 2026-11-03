@@ -22,8 +22,9 @@ static optional_ptr<TableCatalogEntry> ResolveSource(ClientContext &context, con
 	Identifier catalog(parts.size() == 3 ? parts[0] : INVALID_CATALOG);
 	Identifier schema(parts.size() >= 2 ? parts[parts.size() - 2] : INVALID_SCHEMA);
 	Binder::BindSchemaOrCatalog(context, catalog, schema);
-	return Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(schema),
-	                                            Identifier(parts.back()), OnEntryNotFound::RETURN_NULL);
+	return Catalog::GetEntry<TableCatalogEntry>(
+	    context, QualifiedName(Identifier(catalog), Identifier(schema), Identifier(parts.back())),
+	    OnEntryNotFound::RETURN_NULL);
 }
 
 static string Generation(ClientContext &context, TableCatalogEntry &table) {
@@ -80,8 +81,10 @@ static unique_ptr<LogicalOperator> BindDeclaration(ClientContext &context, Table
 			Connection committed(*context.db);
 			committed.context->RunFunctionInTransaction([&]() {
 				auto fresh = Catalog::GetEntry<TableCatalogEntry>(
-				    *committed.context, Identifier(table->catalog.GetName().GetIdentifierName()),
-				    Identifier(table->schema.name.GetIdentifierName()), Identifier(table->name.GetIdentifierName()),
+				    *committed.context,
+				    QualifiedName(Identifier(table->catalog.GetName().GetIdentifierName()),
+				                  Identifier(table->schema.name.GetIdentifierName()),
+				                  Identifier(table->name.GetIdentifierName())),
 				    OnEntryNotFound::RETURN_NULL);
 				if ((!fresh || fresh->oid != table->oid) &&
 				    table->timestamp != DuckTransaction::Get(context, table->catalog).GetTransactionId()) {

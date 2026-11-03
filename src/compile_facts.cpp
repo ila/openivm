@@ -239,15 +239,15 @@ void OpenIvmCompileWithFactsExecute(ClientContext &context, TableFunctionInput &
 	idx_t total = bd.stmt_sqls.size();
 	idx_t emitted = 0;
 	while (state.offset < total && emitted < STANDARD_VECTOR_SIZE) {
-		output.SetValue(0, emitted, Value::INTEGER(bd.refresh_type_int));
-		output.SetValue(1, emitted, Value(bd.refresh_type_name));
-		output.SetValue(2, emitted, Value::INTEGER(static_cast<int32_t>(state.offset)));
-		output.SetValue(3, emitted, Value(bd.stmt_kinds[state.offset]));
-		output.SetValue(4, emitted, Value(bd.stmt_sqls[state.offset]));
+		output.data[0].SetValue(emitted, Value::INTEGER(bd.refresh_type_int));
+		output.data[1].SetValue(emitted, Value(bd.refresh_type_name));
+		output.data[2].SetValue(emitted, Value::INTEGER(static_cast<int32_t>(state.offset)));
+		output.data[3].SetValue(emitted, Value(bd.stmt_kinds[state.offset]));
+		output.data[4].SetValue(emitted, Value(bd.stmt_sqls[state.offset]));
 		state.offset++;
 		emitted++;
 	}
-	output.SetCardinality(emitted);
+	output.SetCardinalityUnsafe(emitted);
 }
 
 } // namespace openivm

@@ -20,8 +20,10 @@ bool IsSnapshotPublication(ClientContext &context, const string &catalog, const 
 	bool snapshot_publication = false;
 	auto lookup = [&]() {
 		auto entry = Catalog::GetEntry(
-		    context, Identifier(catalog), Identifier(schema),
-		    EntryLookupInfo(CatalogType::VIEW_ENTRY, QualifiedName(Identifier(PublishedViewName(view_name)))),
+		    context,
+		    SqlUtils::QualifyLookup(
+		        EntryLookupInfo(CatalogType::VIEW_ENTRY, QualifiedName(Identifier(PublishedViewName(view_name)))),
+		        Identifier(catalog), Identifier(schema)),
 		    OnEntryNotFound::RETURN_NULL);
 		snapshot_publication = entry && entry->type == CatalogType::VIEW_ENTRY;
 	};
@@ -197,10 +199,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 		for (auto &column : quoted_columns) {
 			delta_columns.push_back("c." + column);
 		}
-		auto expansion = dialect == SqlDialect::SPARK
-		                     ? " LATERAL VIEW explode(sequence(CAST(1 AS BIGINT), CAST(abs(c." + weight +
-		                           ") AS BIGINT))) repetitions AS repetition"
-		                     : " CROSS JOIN UNNEST(range(CAST(abs(c." + weight + ") AS BIGINT))) repetitions";
+		auto expansion = SqlUtils::BuildRowRepetitionSQL("abs(c." + weight + ")", "repetitions", dialect);
 		sql += "INSERT INTO " + delta + " (" + column_list + ", openivm_multiplicity, openivm_timestamp) SELECT " +
 		       StringUtil::Join(delta_columns, ", ") + ", CAST(sign(c." + weight + ") AS INTEGER), " + timestamp +
 		       " FROM " + changes + " c" + expansion + " WHERE EXISTS (" + consumers + ");\n";

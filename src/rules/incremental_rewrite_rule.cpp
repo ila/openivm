@@ -33,9 +33,11 @@ void IncrementalRewriteRule::AddInsertNode(ClientContext &context, Binder &binde
 	OPENIVM_DEBUG_PRINT("\n---end of insert node output---\n");
 #endif
 
-	auto table = Catalog::GetEntry<TableCatalogEntry>(
-	    context, Identifier(view_catalog_name), Identifier(view_schema_name),
-	    Identifier(SqlUtils::DeltaName(view_name)), OnEntryNotFound::THROW_EXCEPTION, QueryErrorContext());
+	auto table =
+	    Catalog::GetEntry<TableCatalogEntry>(context,
+	                                         QualifiedName(Identifier(view_catalog_name), Identifier(view_schema_name),
+	                                                       Identifier(SqlUtils::DeltaName(view_name))),
+	                                         OnEntryNotFound::THROW_EXCEPTION, QueryErrorContext());
 	auto insert_node = make_uniq<LogicalInsert>(*table, binder.GenerateTableIndex());
 
 	Value value;

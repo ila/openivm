@@ -344,9 +344,9 @@ static bool RewriteStoredViewQuery(ClientContext &context, Connection &con, Refr
 		return true;
 	}
 	auto internal_location = metadata.GetInternalLocation(view_name);
-	auto &data = Catalog::GetEntry<TableCatalogEntry>(context, Identifier(internal_location.catalog_name),
-	                                                  Identifier(internal_location.schema_name),
-	                                                  Identifier(IncrementalTableNames::DataTableName(view_name)));
+	auto &data = Catalog::GetEntry<TableCatalogEntry>(
+	    context, QualifiedName(Identifier(internal_location.catalog_name), Identifier(internal_location.schema_name),
+	                           Identifier(IncrementalTableNames::DataTableName(view_name))));
 	vector<string> output_columns;
 	for (auto &column : data.GetColumns().Physical()) {
 		output_columns.push_back(column.Name().GetIdentifierName());
@@ -619,8 +619,9 @@ string FirstMVReferencingColumn(ClientContext &context, Connection &con, const s
 // Running SQL on a helper would neither see those rows nor roll back with ALTER.
 static void UpdateCallerViewMetadata(ClientContext &context, const MetadataLocation &location, const string &view_name,
                                      const vector<string> &names, const vector<Value> &values) {
-	auto &entry = Catalog::GetEntry<TableCatalogEntry>(context, Identifier(location.catalog),
-	                                                   Identifier(location.schema), Identifier(openivm::VIEWS_TABLE));
+	auto &entry = Catalog::GetEntry<TableCatalogEntry>(
+	    context,
+	    QualifiedName(Identifier(location.catalog), Identifier(location.schema), Identifier(openivm::VIEWS_TABLE)));
 	MetaTransaction::Get(context).ModifyDatabase(entry.catalog.GetAttached(), DatabaseModificationType::UPDATE_DATA);
 	vector<PhysicalIndex> columns;
 	vector<LogicalType> types;
@@ -652,9 +653,9 @@ static void UpdateCallerViewMetadata(ClientContext &context, const MetadataLocat
 			row_ids.SetValue(0, rows.GetValue(1, row));
 			DataChunk updates;
 			updates.Initialize(Allocator::Get(context), types);
-			updates.SetCardinality(1);
+			updates.SetCardinalityUnsafe(1);
 			for (idx_t col = 0; col < values.size(); col++) {
-				updates.SetValue(col, 0, values[col]);
+				updates.data[col].SetValue(0, values[col]);
 			}
 			vector<unique_ptr<BoundConstraint>> constraints;
 			auto state = storage.InitializeUpdate(entry, context, constraints);

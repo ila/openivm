@@ -102,7 +102,8 @@ vector<string> FindMetadataSchemas(ClientContext &context, Catalog &catalog, con
 	}
 	vector<string> schemas;
 	for (auto &schema : CatalogSchemas(context, catalog)) {
-		if (catalog.GetEntry<TableCatalogEntry>(context, Identifier(schema), Identifier(table),
+		if (catalog.GetEntry<TableCatalogEntry>(context,
+		                                        QualifiedName(catalog.GetName(), Identifier(schema), Identifier(table)),
 		                                        OnEntryNotFound::RETURN_NULL)) {
 			schemas.push_back(schema);
 		}
@@ -504,8 +505,9 @@ void RefreshMetadata::SnapshotTransaction(ClientContext &context) {
 	}
 	for (auto name :
 	     {openivm::VIEWS_TABLE, openivm::DELTA_TABLES_TABLE, openivm::MV_DEPS_TABLE, "openivm_refresh_hooks"}) {
-		auto entry = Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(schema),
-		                                                  Identifier(name), OnEntryNotFound::RETURN_NULL);
+		auto entry = Catalog::GetEntry<TableCatalogEntry>(
+		    context, QualifiedName(Identifier(catalog), Identifier(schema), Identifier(name)),
+		    OnEntryNotFound::RETURN_NULL);
 		if (!entry) {
 			continue;
 		}
@@ -811,9 +813,9 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 	// OpenIVM's own companion deltas are created before dependency rows exist.
 	// They always stay beside their reserved internal relation.
 	if (IncrementalTableNames::IsMaintenanceTable(table)) {
-		return Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(schema),
-		                                            Identifier(SqlUtils::DeltaName(table)),
-		                                            OnEntryNotFound::RETURN_NULL);
+		return Catalog::GetEntry<TableCatalogEntry>(
+		    context, QualifiedName(Identifier(catalog), Identifier(schema), Identifier(SqlUtils::DeltaName(table))),
+		    OnEntryNotFound::RETURN_NULL);
 	}
 	const auto delta_key_name = SqlUtils::DeltaName(table);
 	const auto qualified_delta_key = SqlUtils::FullName(catalog, schema, delta_key_name);
@@ -838,8 +840,9 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 		    !StringUtil::CIEquals(delta_key, SqlUtils::DeltaName(table))) {
 			return;
 		}
-		auto candidate = Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(delta_schema),
-		                                                      Identifier(delta_name), OnEntryNotFound::RETURN_NULL);
+		auto candidate = Catalog::GetEntry<TableCatalogEntry>(
+		    context, QualifiedName(Identifier(catalog), Identifier(delta_schema), Identifier(delta_name)),
+		    OnEntryNotFound::RETURN_NULL);
 		if (candidate) {
 			if (delta && delta.get() != candidate.get()) {
 				throw CatalogException("OpenIVM found multiple internal deltas for source '%s'",
@@ -870,8 +873,9 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 	    lookup == SourceDeltaLookup::LOCAL ? openivm::SOURCE_DELTA_MAP_TABLE : openivm::DELTA_TABLES_TABLE;
 	for (auto &location : locations) {
 		auto &metadata_catalog = Catalog::GetCatalog(context, Identifier(location.catalog));
-		auto entry = metadata_catalog.GetEntry<TableCatalogEntry>(context, Identifier(location.schema),
-		                                                          Identifier(registry), OnEntryNotFound::RETURN_NULL);
+		auto entry = metadata_catalog.GetEntry<TableCatalogEntry>(
+		    context, QualifiedName(metadata_catalog.GetName(), Identifier(location.schema), Identifier(registry)),
+		    OnEntryNotFound::RETURN_NULL);
 		if (!entry) {
 			continue;
 		}
@@ -937,7 +941,7 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 			}
 			UnifiedVectorFormat names;
 			if (lookup == SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE) {
-				rows.data[positions[0].GetIndex()].ToUnifiedFormat(rows.size(), names);
+				rows.data[positions[0].GetIndex()].ToUnifiedFormat(names);
 			}
 			for (idx_t row = 0; row < rows.size(); row++) {
 				if (lookup == SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE) {
@@ -1003,9 +1007,10 @@ string RefreshMetadata::SourceGenerationDDL(const string &catalog, const string 
 
 string RefreshMetadata::SourceGeneration(ClientContext &context, const string &catalog, const string &schema,
                                          const string &table) {
-	auto registry = Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(DEFAULT_SCHEMA),
-	                                                     Identifier(openivm::SOURCE_GENERATIONS_TABLE),
-	                                                     OnEntryNotFound::RETURN_NULL);
+	auto registry = Catalog::GetEntry<TableCatalogEntry>(
+	    context,
+	    QualifiedName(Identifier(catalog), Identifier(DEFAULT_SCHEMA), Identifier(openivm::SOURCE_GENERATIONS_TABLE)),
+	    OnEntryNotFound::RETURN_NULL);
 	if (!registry) {
 		return "";
 	}
@@ -1058,7 +1063,7 @@ static void DeleteRegistryRows(ClientContext &context, TableCatalogEntry &entry,
 			if (matches(rows, row)) {
 				row_ids.SetValue(count, rows.GetValue(types.size() - 1, row));
 				for (idx_t column = 0; column + 1 < types.size(); column++) {
-					deleted.SetValue(column, count, rows.GetValue(column, row));
+					deleted.data[column].SetValue(count, rows.GetValue(column, row));
 				}
 				count++;
 			}
@@ -1068,7 +1073,7 @@ static void DeleteRegistryRows(ClientContext &context, TableCatalogEntry &entry,
 			                                             DatabaseModificationType::DELETE_DATA);
 			LocalAppendState append_state;
 			storage.InitializeLocalStorage(append_state, entry.Cast<DuckTableEntry>(), context, constraints);
-			deleted.SetCardinality(count);
+			deleted.SetCardinalityUnsafe(count);
 			LocalStorage::Get(context, entry.catalog).GetStorage(storage)->AppendToDeleteIndexes(row_ids, deleted);
 			storage.Delete(*state, context, entry.Cast<DuckTableEntry>(), row_ids, count);
 		}
@@ -1103,9 +1108,10 @@ void RefreshMetadata::InvalidateSourceGeneration(ClientContext &context, const s
 			}
 		}
 	}
-	auto registry = Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(DEFAULT_SCHEMA),
-	                                                     Identifier(openivm::SOURCE_GENERATIONS_TABLE),
-	                                                     OnEntryNotFound::RETURN_NULL);
+	auto registry = Catalog::GetEntry<TableCatalogEntry>(
+	    context,
+	    QualifiedName(Identifier(catalog), Identifier(DEFAULT_SCHEMA), Identifier(openivm::SOURCE_GENERATIONS_TABLE)),
+	    OnEntryNotFound::RETURN_NULL);
 	if (registry) {
 		DeleteRegistryRows(context, *registry, [&](DataChunk &rows, idx_t row) {
 			auto matches = StringUtil::CIEquals(rows.GetValue(0, row).ToString(), schema) &&
@@ -1134,9 +1140,10 @@ string RefreshMetadata::SourceDeltaMappingDDL(const string &catalog, const strin
 
 void RefreshMetadata::RemoveSourceDeltaMapping(ClientContext &context, const string &catalog, const string &schema,
                                                const string &name, bool drop_schema) {
-	auto mapping =
-	    Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(DEFAULT_SCHEMA),
-	                                         Identifier(openivm::SOURCE_DELTA_MAP_TABLE), OnEntryNotFound::RETURN_NULL);
+	auto mapping = Catalog::GetEntry<TableCatalogEntry>(
+	    context,
+	    QualifiedName(Identifier(catalog), Identifier(DEFAULT_SCHEMA), Identifier(openivm::SOURCE_DELTA_MAP_TABLE)),
+	    OnEntryNotFound::RETURN_NULL);
 	if (!mapping) {
 		return;
 	}
@@ -1194,8 +1201,9 @@ optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDeltaForMutation(Clie
 			                           SqlUtils::FullName(catalog, schema, table));
 		}
 		// Return an entry belonging to the caller's transaction, never the helper's.
-		delta = Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(existing->schema.name),
-		                                             Identifier(existing->name), OnEntryNotFound::RETURN_NULL);
+		delta = Catalog::GetEntry<TableCatalogEntry>(
+		    context, QualifiedName(Identifier(catalog), Identifier(existing->schema.name), Identifier(existing->name)),
+		    OnEntryNotFound::RETURN_NULL);
 		// A concurrent DROP/recreate may use the same physical name. Reject the
 		// old allocation, while retaining catalog changes made by this caller.
 		if (!delta || (delta->catalog.IsDuckCatalog() && delta->oid != existing->oid &&
@@ -1810,7 +1818,7 @@ string RefreshMetadata::BuildDeltaConsumersSQL(const string &target, const strin
                                                const string &delta_metadata_table,
                                                const vector<string> &delta_metadata_tables,
                                                const string &source_catalog, const string &source_schema) {
-	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
+	string qtarget = target.find('.') == string::npos ? SqlUtils::QuoteIdentifier(target) : target;
 	auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;
 	auto consumers = "SELECT last_update FROM " + metadata_table + " WHERE table_name = '" +
 	                 SqlUtils::EscapeValue(metadata_key) + "'";
@@ -1833,7 +1841,7 @@ string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string 
                                              const string &delta_metadata_table, vector<string> *deferred_cleanup,
                                              const vector<string> &delta_metadata_tables, const string &source_catalog,
                                              const string &source_schema, const string &data_catalog) {
-	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
+	string qtarget = target.find('.') == string::npos ? SqlUtils::QuoteIdentifier(target) : target;
 	auto consumers = BuildDeltaConsumersSQL(qtarget, metadata_key, delta_metadata_table, delta_metadata_tables,
 	                                        source_catalog, source_schema);
 	auto sql = "DELETE FROM " + qtarget + " WHERE NOT EXISTS (" + consumers + ") OR " + string(openivm::TIMESTAMP_COL) +
@@ -2149,7 +2157,15 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::LeftJoin
 	io.Str("table", m.table);
 	io.Index("occ", m.occurrence);
 	io.Str("column", m.column);
+	io.Str("cast_type", m.cast_type, Presence::OPTIONAL);
 	io.Bool("cardinality_transition_check_safe", m.cardinality_transition_check_safe, Presence::OPTIONAL);
+}
+
+template <class IO>
+static void Fields(IO &io, typename IO::template Field<RefreshMetadata::FullOuterScopeInput> &m) {
+	io.Str("table", m.table);
+	io.Index("occ", m.occurrence);
+	io.Index("presence_index", m.presence_index);
 }
 
 template <class IO>
@@ -2356,6 +2372,52 @@ bool RefreshMetadata::GetLeftJoinKeySource(const string &view_name, LeftJoinKeyS
 
 string RefreshMetadata::LeftJoinKeySourceToJson(const LeftJoinKeySource &source) {
 	return MetadataJson::Write(source);
+}
+
+vector<RefreshMetadata::FullOuterScope> RefreshMetadata::GetFullOuterScopes(const string &view_name) {
+	vector<FullOuterScope> scopes;
+	auto json = ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "full_outer_scopes");
+	if (json.empty()) {
+		return scopes;
+	}
+	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "scopes")) {
+		FullOuterScope scope;
+		bool complete = true;
+		for (idx_t side = 0; side < 2; side++) {
+			auto &source = side == 0 ? scope.left : scope.right;
+			string prefix = side == 0 ? "left_" : "right_";
+			complete = complete && MetadataJson::ExtractJsonString(object, prefix + "key", source.key_column) &&
+			           MetadataJson::ExtractJsonString(object, prefix + "presence", source.presence_column);
+			for (auto &input_json : MetadataJson::ExtractJsonObjectsFromArray(object, prefix + "inputs")) {
+				FullOuterScopeInput input;
+				complete = MetadataJson::Read(input_json, input) && complete;
+				source.inputs.push_back(std::move(input));
+			}
+			complete = complete && !source.inputs.empty();
+		}
+		if (complete) {
+			scopes.push_back(std::move(scope));
+		}
+	}
+	return scopes;
+}
+
+string RefreshMetadata::FullOuterScopesToJson(const vector<FullOuterScope> &scopes) {
+	vector<string> objects;
+	for (auto &scope : scopes) {
+		vector<string> fields;
+		for (idx_t side = 0; side < 2; side++) {
+			auto &source = side == 0 ? scope.left : scope.right;
+			string prefix = side == 0 ? "left_" : "right_";
+			fields.push_back(SqlUtils::JsonQuote(prefix + "key") + ":" + SqlUtils::JsonQuote(source.key_column));
+			fields.push_back(SqlUtils::JsonQuote(prefix + "presence") + ":" +
+			                 SqlUtils::JsonQuote(source.presence_column));
+			auto inputs = WriteEach(source.inputs);
+			fields.push_back(SqlUtils::JsonQuote(prefix + "inputs") + ":[" + StringUtil::Join(inputs, ",") + "]");
+		}
+		objects.push_back("{" + StringUtil::Join(fields, ",") + "}");
+	}
+	return "{\"k\":\"full_outer_scopes\",\"scopes\":[" + StringUtil::Join(objects, ",") + "]}";
 }
 
 bool RefreshMetadata::GetLeftJoinNullableSources(const string &view_name, LeftJoinNullableSources &out) {

@@ -94,6 +94,7 @@ struct DeltaViewModel {
 	vector<RefreshMetadata::WindowPartitionLineageOp> window_lineage_ops;
 	RefreshMetadata::ProjectionKeyLineage projection_lineage;
 	RefreshMetadata::LeftJoinKeySource left_join_key_source;
+	vector<RefreshMetadata::FullOuterScope> full_outer_scopes;
 	RefreshMetadata::LeftJoinNullableSources left_join_nullable_sources;
 	idx_t max_table_index = 0;
 	string full_outer_join_cols;

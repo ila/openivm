@@ -192,7 +192,7 @@ public:
 				}
 			}
 		}
-		delta_rows.SetCardinality(base_rows);
+		delta_rows.SetCardinalityUnsafe(base_rows.size());
 		auto &storage = delta_table.GetStorage();
 		if (!state.collection_index.IsValid()) {
 			lock_guard<mutex> guard(append_lock);
@@ -352,7 +352,7 @@ static idx_t SelectUnseenRows(DataChunk &input, idx_t row_id_index, array<RowIdD
                               array<vector<idx_t>, ROW_ID_DEDUP_SHARDS> &candidates, SelectionVector &selection,
                               DataChunk &selected_input) {
 	auto &row_ids = input.data[row_id_index];
-	row_ids.Flatten(input.size());
+	row_ids.Flatten();
 	auto row_id_data = FlatVector::GetDataMutable<row_t>(row_ids);
 	for (auto &candidate_rows : candidates) {
 		candidate_rows.clear();
@@ -378,7 +378,7 @@ static idx_t SelectUnseenRows(DataChunk &input, idx_t row_id_index, array<RowIdD
 	if (selected_count != input.size()) {
 		selected_input.Slice(selection, selected_count);
 	}
-	selected_input.data[row_id_index].Flatten(selected_count);
+	selected_input.data[row_id_index].Flatten();
 	return selected_count;
 }
 
@@ -516,7 +516,7 @@ private:
 		for (idx_t update_index = 0; update_index < update_columns.size(); update_index++) {
 			state.new_rows.data[update_columns[update_index].index].Reference(state.update_values.data[update_index]);
 		}
-		state.new_rows.SetCardinality(state.old_rows);
+		state.new_rows.SetCardinalityUnsafe(state.old_rows.size());
 		appender->Append(context.client, state.new_rows, 1, state.append_state);
 	}
 
@@ -571,7 +571,7 @@ public:
 	                      idx_t count, vector<row_t> &reserved_row_ids, Vector &fetch_row_ids, DataChunk &rows,
 	                      ColumnFetchState &fetch_state, TransactionalDeltaAppendState &append_state) const {
 		UnifiedVectorFormat row_id_data;
-		input_row_ids.ToUnifiedFormat(count, row_id_data);
+		input_row_ids.ToUnifiedFormat(row_id_data);
 		auto row_ids = UnifiedVectorFormat::GetData<row_t>(row_id_data);
 		reserved_row_ids.clear();
 		{
@@ -924,7 +924,7 @@ private:
 			                                          state.delegated_input.data[delegated_index++]);
 		}
 		state.delegated_input.data[delegated_index].Reference(input.data.back());
-		state.delegated_input.SetCardinality(input);
+		state.delegated_input.SetCardinalityUnsafe(input.size());
 		return state.delegated_input;
 	}
 
@@ -943,7 +943,7 @@ private:
 		D_ASSERT(lstate.preimage_rows.size() == selected_count);
 		auto &update = action_op.Cast<PhysicalUpdate>();
 		lstate.update_values.Reset();
-		lstate.update_values.SetCardinality(lstate.selected_input);
+		lstate.update_values.SetCardinalityUnsafe(lstate.selected_input.size());
 		for (idx_t index = 0; index < update.expressions.size(); index++) {
 			auto &expression = *update.expressions[index];
 			D_ASSERT(expression.GetExpressionType() == ExpressionType::BOUND_REF);
@@ -956,7 +956,7 @@ private:
 		for (idx_t index = 0; index < update.columns.size(); index++) {
 			lstate.pending_new_rows.data[update.columns[index].index].Reference(lstate.update_values.data[index]);
 		}
-		lstate.pending_new_rows.SetCardinality(lstate.preimage_rows);
+		lstate.pending_new_rows.SetCardinalityUnsafe(lstate.preimage_rows.size());
 	}
 
 	PhysicalOperator &action_op;

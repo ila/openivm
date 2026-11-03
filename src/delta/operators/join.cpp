@@ -432,23 +432,11 @@ void DemoteLeftJoins(LogicalOperator *node) {
 	}
 }
 
-// Per-LJ demote: walk the join tree and demote only the outer joins that need it,
-// based on which subtree contains delta-marked leaves in the current mask.
-// Demoting indiscriminately (the original DemoteLeftJoins) drops NULL-padded
-// rows from intermediate LJs that have no delta in this mask, which breaks
-// chained-LJ correctness when only a deeper-right table has changes
-// (probe 11: base LJ d1 LJ d2, Δd2 only).
-//
-// Rules (driven by which side supplies NULLs for that join type):
-//   LEFT JOIN  — right side is NULL-supplying; demote iff right subtree has Δ.
-//   RIGHT JOIN — left side is NULL-supplying; demote iff left subtree has Δ.
-//   FULL OUTER — both sides are NULL-supplying; demote iff EITHER subtree has Δ.
-//
-// This subsumes the previous global demote conditions without over-demoting in
-// chained-LJ shapes. For FULL OUTER aggregate views the upsert MERGE relies on
-// the IE delta containing only the matched-via-Δ portion (the unmatched parts
-// are tracked separately via openivm_match_count); failing to demote there would
-// leak phantom unmatched rows for groups untouched by the delta.
+// Remove NULL-padding from inputs that do not carry this term's delta. FULL
+// projection refreshes also need unmatched delta rows to carry affected keys
+// through later joins, so preserve the changed side as LEFT/RIGHT when only one
+// side has delta. FULL aggregates keep matched-only terms: their unmatched
+// contributions are maintained separately via openivm_match_count.
 static bool SubtreeHasDeltaLeaf(const vector<JoinLeafInfo> &leaves, uint64_t mask, const vector<size_t> &prefix) {
 	// The <= mutant indexes one past leaves; valid masks cannot make that iteration meaningful.
 	// mull-ignore-next: cxx_lt_to_le
@@ -465,32 +453,38 @@ static bool SubtreeHasDeltaLeaf(const vector<JoinLeafInfo> &leaves, uint64_t mas
 }
 
 static void DemoteOuterJoinsForMaskRec(LogicalOperator *node, const vector<JoinLeafInfo> &leaves, uint64_t mask,
-                                       vector<size_t> &path) {
+                                       RefreshType refresh_type, vector<size_t> &path) {
 	auto *join = dynamic_cast<LogicalJoin *>(node);
 	if (join && IsNullSupplyingJoin(join->join_type)) {
-		path.push_back(0); // left child
+		path.push_back(0);
 		bool left_has_delta = SubtreeHasDeltaLeaf(leaves, mask, path);
-		path.back() = 1; // right child
+		path.back() = 1;
 		bool right_has_delta = SubtreeHasDeltaLeaf(leaves, mask, path);
 		path.pop_back();
 		bool demote = join->join_type == JoinType::LEFT    ? right_has_delta
 		              : join->join_type == JoinType::RIGHT ? left_has_delta
-		                                                   : left_has_delta || right_has_delta; // FULL OUTER
-		if (demote) {
+		                                                   : left_has_delta || right_has_delta;
+		if (join->join_type == JoinType::OUTER && refresh_type == RefreshType::SIMPLE_PROJECTION &&
+		    left_has_delta != right_has_delta) {
+			join->join_type = left_has_delta ? JoinType::LEFT : JoinType::RIGHT;
+			OPENIVM_DEBUG_PRINT("[DeltaJoin] Retained unmatched FULL JOIN delta rows on %s input\n",
+			                    left_has_delta ? "left" : "right");
+		} else if (demote) {
 			join->join_type = JoinType::INNER;
 		}
 	}
 	// Recursing over every child is a tree-walk invariant; reversing the initial bound merely skips the walk.
 	for (size_t ci = 0; ci < node->children.size(); ci++) { // mull-ignore: cxx_lt_to_ge
 		path.push_back(ci);
-		DemoteOuterJoinsForMaskRec(node->children[ci].get(), leaves, mask, path);
+		DemoteOuterJoinsForMaskRec(node->children[ci].get(), leaves, mask, refresh_type, path);
 		path.pop_back();
 	}
 }
 
-void DemoteOuterJoinsForMask(LogicalOperator *node, const vector<JoinLeafInfo> &leaves, uint64_t mask) {
+void DemoteOuterJoinsForMask(LogicalOperator *node, const vector<JoinLeafInfo> &leaves, uint64_t mask,
+                             RefreshType refresh_type) {
 	vector<size_t> path;
-	DemoteOuterJoinsForMaskRec(node, leaves, mask, path);
+	DemoteOuterJoinsForMaskRec(node, leaves, mask, refresh_type, path);
 }
 
 struct TransitioningKeySet {
@@ -1536,7 +1530,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 		// This subsumes both original cases (right-only delta, both-sides delta)
 		// without over-demoting in chained-LJ shapes.
 		if (has_left_join) {
-			DemoteOuterJoinsForMask(term.get(), leaves, mask);
+			DemoteOuterJoinsForMask(term.get(), leaves, mask, input.context.model.type);
 		}
 
 		// Replace delta leaves
@@ -1724,7 +1718,7 @@ BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context, Binder &
 		// their NULL-padded rows; the upsert layer's key-based partial recompute
 		// (BuildLeftJoinProjectionRefresh) fixes NULL<->match transition rows.
 		if (has_left_join) {
-			DemoteOuterJoinsForMask(term.get(), leaves, (1ULL << delta_leaf));
+			DemoteOuterJoinsForMask(term.get(), leaves, (1ULL << delta_leaf), input.context.model.type);
 		}
 
 		vector<ColumnBinding> mul_bindings;

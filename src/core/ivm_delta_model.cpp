@@ -257,6 +257,9 @@ string BuildDeltaViewModelLineageJson(const DeltaViewModel &model) {
 	if (model.has_left_join_key_source) {
 		entries.push_back(RefreshMetadata::LeftJoinKeySourceToJson(model.left_join_key_source));
 	}
+	if (!model.full_outer_scopes.empty()) {
+		entries.push_back(RefreshMetadata::FullOuterScopesToJson(model.full_outer_scopes));
+	}
 	if (model.has_left_join_nullable) {
 		entries.push_back(RefreshMetadata::LeftJoinNullableSourcesToJson(model.left_join_nullable_sources));
 	}

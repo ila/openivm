@@ -444,9 +444,11 @@ TransactionalMVLockState::FindDeferredSourceDelta(const string &catalog, const s
 		                         SqlUtils::DeltaName(table))) {
 			// Ownership was removed by an earlier replacement, but this transaction
 			// still reserves the physical delta until its post-commit cleanup check.
-			return Catalog::GetEntry<TableCatalogEntry>(
-			    owner, Identifier(catalog), Identifier(source.delta_schema_name), Identifier(source.delta_table_name),
-			    OnEntryNotFound::RETURN_NULL);
+			return Catalog::GetEntry<TableCatalogEntry>(owner,
+			                                            QualifiedName(Identifier(catalog),
+			                                                          Identifier(source.delta_schema_name),
+			                                                          Identifier(source.delta_table_name)),
+			                                            OnEntryNotFound::RETURN_NULL);
 		}
 	}
 	return nullptr;

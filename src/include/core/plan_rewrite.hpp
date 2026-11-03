@@ -11,6 +11,7 @@ namespace duckdb {
 
 struct CreateMVPlanFacts;
 class BoundWindowExpression;
+class LogicalComparisonJoin;
 class LogicalAggregate;
 class LogicalProjection;
 bool IsRunningWindowCandidate(const BoundWindowExpression &window);
@@ -25,6 +26,10 @@ struct OutputSpine {
 OutputSpine FindOutputSpine(LogicalOperator *root, const std::function<bool(const LogicalOperator &)> &pass_through);
 /// The aggregate at the bottom of the spine, directly or below a HAVING filter.
 LogicalAggregate *SpineAggregate(const OutputSpine &spine);
+
+/// Keep the first usable projection refresh key whose lineage stays on
+/// preserved inputs; search its preserved subtree when that key is unsafe.
+LogicalComparisonJoin *FindProjectionKeyJoin(LogicalOperator &plan);
 
 struct PlanRewriteNeeds {
 	bool inline_cte_refs = false;

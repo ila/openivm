@@ -37,6 +37,71 @@ string SparkPortableRefreshSQL(string sql) {
 	static const std::regex bigint_cast_regex(R"(([A-Za-z_][A-Za-z0-9_\.]*)::BIGINT)", std::regex_constants::icase);
 	static const std::regex now_regex(R"(\bnow\(\))", std::regex_constants::icase);
 	static const std::regex null_safe_regex(R"(\s+IS\s+NOT\s+DISTINCT\s+FROM\s+)", std::regex_constants::icase);
+	// Use lexer tokens so helper syntax is translated without changing
+	// identifiers, literals or comments.
+	auto tokens = Parser::Tokenize(sql);
+	for (idx_t i = tokens.size(); i > 1; i--) {
+		auto &token = tokens[i - 1];
+		// Native old-state reconstruction expands signed weights with a
+		// correlated range. Scope construction still needs DuckDB-parseable
+		// SQL; render the shared per-row generator at this final dialect boundary.
+		if (token.type == SimplifiedTokenType::SIMPLIFIED_TOKEN_KEYWORD &&
+		    StringUtil::CIEquals(sql.substr(token.start, 5), "CROSS") && i + 2 < tokens.size() &&
+		    StringUtil::CIEquals(sql.substr(tokens[i].start, 4), "JOIN") && sql[tokens[i + 2].start] == '(') {
+			auto function =
+			    SqlUtils::TrimSQLFragment(sql.substr(tokens[i + 1].start, tokens[i + 2].start - tokens[i + 1].start));
+			if (!StringUtil::CIEquals(function, "range") && !StringUtil::CIEquals(function, "\"range\"")) {
+				continue;
+			}
+			auto close = i + 3;
+			idx_t depth = 1;
+			bool single_bound = true;
+			for (; close < tokens.size(); close++) {
+				if (tokens[close].type == SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR) {
+					auto op = sql[tokens[close].start];
+					if (op == ',' && depth == 1) {
+						single_bound = false;
+					}
+					if (op == '(') {
+						depth++;
+					} else if (op == ')' && --depth == 0) {
+						break;
+					}
+				}
+			}
+			auto alias = close + 1;
+			if (alias < tokens.size() && StringUtil::CIEquals(sql.substr(tokens[alias].start, 2), "AS")) {
+				alias++;
+			}
+			if (!single_bound || alias >= tokens.size() ||
+			    tokens[alias].type != SimplifiedTokenType::SIMPLIFIED_TOKEN_IDENTIFIER) {
+				continue;
+			}
+			idx_t alias_end;
+			auto names = SqlUtils::ReadQualifiedIdentifier(sql, tokens[alias].start, alias_end);
+			// An explicit output-column alias list is not this helper's shape.
+			if (names.size() != 1 || (alias + 1 < tokens.size() && sql[tokens[alias + 1].start] == '(')) {
+				continue;
+			}
+			auto argument_start = tokens[i + 2].start + 1;
+			auto argument = sql.substr(argument_start, tokens[close].start - argument_start);
+			auto replacement = SqlUtils::BuildRowRepetitionSQL(argument, names[0], SqlDialect::SPARK);
+			sql.replace(token.start, alias_end - token.start, SqlUtils::TrimSQLFragment(replacement));
+			continue;
+		}
+		if (token.type != SimplifiedTokenType::SIMPLIFIED_TOKEN_KEYWORD ||
+		    !StringUtil::CIEquals(sql.substr(token.start, 7), "EXCLUDE")) {
+			continue;
+		}
+		auto previous = i - 2;
+		while (previous > 0 && tokens[previous].type == SimplifiedTokenType::SIMPLIFIED_TOKEN_COMMENT) {
+			previous--;
+		}
+		if (tokens[previous].type == SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR &&
+		    sql[tokens[previous].start] == '*') {
+			sql.replace(token.start, 7, "EXCEPT");
+		}
+	}
 	sql = std::regex_replace(sql, quoted_cast_regex, "CAST($1 AS $2)");
 	sql = std::regex_replace(sql, bigint_cast_regex, "CAST($1 AS BIGINT)");
 	sql = std::regex_replace(sql, now_regex, "current_timestamp()");
@@ -377,7 +442,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// or a source stored in the metadata catalog) is collected and runs after the watermarks.
 	const string cleanup_data_catalog = cross_system ? internal_catalog_name : string();
 	string data_table_bare = IncrementalTableNames::DataTableName(view_name);
-	string data_table = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table_bare);
+	string data_table = internal_catalog_prefix + SqlUtils::QuoteIdentifier(data_table_bare);
 	OPENIVM_DEBUG_PRINT("[UPSERT] Looking up delta view '%s' in catalog '%s.%s'\n",
 	                    SqlUtils::DeltaName(view_name).c_str(), view_catalog_name.c_str(), view_schema_name.c_str());
 	optional_ptr<TableCatalogEntry> delta_view_catalog_entry;
@@ -385,12 +450,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	if (internal_catalog_prefix.empty() || internal_catalog_name == default_db || split_native_metadata) {
 		con.BeginTransaction();
 		delta_view_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
-		    planning_context, Identifier(internal_catalog_name), Identifier(internal_schema_name),
-		    Identifier(SqlUtils::DeltaName(view_name)), OnEntryNotFound::THROW_EXCEPTION, error_context);
+		    planning_context,
+		    QualifiedName(Identifier(internal_catalog_name), Identifier(internal_schema_name),
+		                  Identifier(SqlUtils::DeltaName(view_name))),
+		    OnEntryNotFound::THROW_EXCEPTION, error_context);
 		index_delta_view_catalog_entry = Catalog::GetEntry(
-		    planning_context, Identifier(internal_catalog_name), Identifier(internal_schema_name),
-		    EntryLookupInfo(CatalogType::INDEX_ENTRY,
-		                    QualifiedName(Identifier(data_table_bare + openivm::INDEX_SUFFIX)), error_context),
+		    planning_context,
+		    SqlUtils::QualifyLookup(EntryLookupInfo(CatalogType::INDEX_ENTRY,
+		                                            QualifiedName(Identifier(data_table_bare + openivm::INDEX_SUFFIX)),
+		                                            error_context),
+		                            Identifier(internal_catalog_name), Identifier(internal_schema_name)),
 		    OnEntryNotFound::RETURN_NULL);
 		con.Rollback();
 	}
@@ -438,9 +507,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			publication_columns =
 			    metadata.GetTableColumns(internal_catalog_name, internal_schema_name, PublishedViewName(view_name));
 		} else {
-			auto &published_entry = Catalog::GetEntry<TableCatalogEntry>(context, Identifier(internal_catalog_name),
-			                                                             Identifier(internal_schema_name),
-			                                                             Identifier(PublishedViewName(view_name)));
+			auto &published_entry = Catalog::GetEntry<TableCatalogEntry>(
+			    context, QualifiedName(Identifier(internal_catalog_name), Identifier(internal_schema_name),
+			                           Identifier(PublishedViewName(view_name))));
 			for (auto &column : published_entry.GetColumns().Logical()) {
 				publication_columns.push_back(column.Name().GetIdentifierName());
 			}
@@ -709,9 +778,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		// Global column enumeration binds every snapshot publication view. Read only
 		// this delta table and copy its schema while the catalog transaction is live.
 		con.context->RunFunctionInTransaction([&]() {
-			auto &entry = Catalog::GetEntry<TableCatalogEntry>(*con.context, Identifier(internal_catalog_name),
-			                                                   Identifier(internal_schema_name),
-			                                                   Identifier(SqlUtils::DeltaName(view_name)));
+			auto &entry = Catalog::GetEntry<TableCatalogEntry>(
+			    *con.context, QualifiedName(Identifier(internal_catalog_name), Identifier(internal_schema_name),
+			                                Identifier(SqlUtils::DeltaName(view_name))));
 			read_delta_columns(entry);
 		});
 	}
@@ -1225,7 +1294,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	    dispatch_refresh_type == RefreshType::FULL_REFRESH && active_facts.target_dialect == SqlDialect::SPARK;
 	auto build_snapshot_companion = [&]() {
 		auto rows = BuildSignedRowLists(column_names);
-		string snapshot = KeywordHelper::WriteOptionallyQuoted(string(openivm::TEMP_TABLE_PREFIX) + view_name);
+		string snapshot = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
 		string user_cols = SqlUtils::JoinQuotedColumns(SqlUtils::WithoutMultiplicity(column_names));
 		pre_companion = "CREATE OR REPLACE TEMP TABLE " + snapshot + " AS SELECT * FROM " + data_table + ";\n";
 		post_companion = BuildDeltaResetSQL(delta_view_name, delta_ts_filter) + "INSERT INTO " + delta_view_name +

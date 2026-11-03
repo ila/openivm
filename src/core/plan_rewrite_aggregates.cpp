@@ -29,7 +29,8 @@ namespace duckdb {
 unique_ptr<BoundAggregateExpression> MakeAggregate(ClientContext &context, const string &name,
                                                    unique_ptr<Expression> child, const string &alias) {
 	auto &catalog = Catalog::GetSystemCatalog(context);
-	auto &entry = catalog.GetEntry<AggregateFunctionCatalogEntry>(context, DEFAULT_SCHEMA, Identifier(name));
+	auto &entry = catalog.GetEntry<AggregateFunctionCatalogEntry>(
+	    context, QualifiedName(catalog.GetName(), DEFAULT_SCHEMA, Identifier(name)));
 	FunctionBinder binder(context);
 	ErrorData error;
 	vector<pair<Identifier, unique_ptr<Expression>>> arguments;

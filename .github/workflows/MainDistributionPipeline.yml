@@ -19,6 +19,7 @@ jobs:
       duckdb_version: v2.0.0
       ci_tools_version: v2.0-cyanoptera
       extension_name: openivm
+      use_merged_vcpkg_manifest: '1'
 
   code-quality-check:
     name: Code Quality Check

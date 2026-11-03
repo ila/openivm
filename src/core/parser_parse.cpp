@@ -88,7 +88,7 @@ static arena_ptr<TransformResultValue> TransformMaterializedView(PEGTransformer 
 	return transformer.MakeResult<unique_ptr<SQLStatement>>(std::move(extension));
 }
 
-static grammar_transform_process_function_t Finalize(transform_finalize_function_t transform) {
+static grammar_transform_process_function_t Finalize(const transform_finalize_function_t &transform) {
 	return [transform](PEGTransformer &transformer, ParseResult &result) {
 		return transformer.MakeProcess<FinalizeTransformProcess>(transformer, result, transform);
 	};

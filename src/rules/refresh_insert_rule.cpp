@@ -307,9 +307,11 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			return;
 		}
 		auto old_table = Catalog::GetEntry<TableCatalogEntry>(
-		    input.context, Identifier(catalog.GetName().GetIdentifierName()),
-		    Identifier(create.schema.name.GetIdentifierName()),
-		    Identifier(info.GetQualifiedName().Name().GetIdentifierName()), OnEntryNotFound::RETURN_NULL);
+		    input.context,
+		    QualifiedName(Identifier(catalog.GetName().GetIdentifierName()),
+		                  Identifier(create.schema.name.GetIdentifierName()),
+		                  Identifier(info.GetQualifiedName().Name().GetIdentifierName())),
+		    OnEntryNotFound::RETURN_NULL);
 		if (old_table && info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
 			return;
 		}
@@ -361,9 +363,11 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		}
 
 		auto source = Catalog::GetEntry<TableCatalogEntry>(
-		    input.context, Identifier(alter_info->GetQualifiedName().Catalog().GetIdentifierName()),
-		    Identifier(alter_info->GetQualifiedName().Schema().GetIdentifierName()),
-		    Identifier(alter_info->GetQualifiedName().Name().GetIdentifierName()), OnEntryNotFound::RETURN_NULL);
+		    input.context,
+		    QualifiedName(Identifier(alter_info->GetQualifiedName().Catalog().GetIdentifierName()),
+		                  Identifier(alter_info->GetQualifiedName().Schema().GetIdentifierName()),
+		                  Identifier(alter_info->GetQualifiedName().Name().GetIdentifierName())),
+		    OnEntryNotFound::RETURN_NULL);
 		if (!source) {
 			return;
 		}
