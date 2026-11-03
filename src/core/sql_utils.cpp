@@ -3,6 +3,7 @@
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
+#include "duckdb/common/local_file_system.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
@@ -25,7 +26,6 @@
 
 #include <cctype>
 #include <cstring>
-#include <fstream>
 #include <regex>
 #include <sstream>
 
@@ -405,23 +405,21 @@ static bool QualifierMatches(const vector<IdentifierSegmentSpan> &segments, cons
 }
 
 void SqlUtils::WriteFile(const string &filename, bool append, const string &compiled_query) {
-	std::ofstream file;
-	if (append) {
-		file.open(filename, std::ios_base::app);
-	} else {
-		file.open(filename);
-	}
-	if (!file.is_open()) {
-		throw IOException(
-		    "OpenIVM could not open compiled SQL file '%s'. Create the directory set by "
-		    "openivm_files_path and check write permissions; relative paths use the process working directory.",
-		    filename);
-	}
-	file << compiled_query << '\n';
-	file.close();
-	if (file.fail()) {
-		throw IOException("OpenIVM could not finish writing compiled SQL file '%s'. Check free space and permissions.",
-		                  filename);
+	LocalFileSystem fs;
+	auto flags =
+	    FileFlags::FILE_FLAGS_WRITE | (append ? FileFlags::FILE_FLAGS_FILE_CREATE | FileFlags::FILE_FLAGS_APPEND
+	                                          : FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+	try {
+		auto file = fs.OpenFile(filename, flags);
+		auto output = compiled_query + "\n";
+		if (fs.Write(*file, output.data(), output.size()) != static_cast<int64_t>(output.size())) {
+			throw IOException("short write");
+		}
+	} catch (const IOException &error) {
+		throw IOException("OpenIVM could not write compiled SQL file '%s': %s. Create the directory set by "
+		                  "openivm_files_path and check free space and permissions; relative paths use the process "
+		                  "working directory.",
+		                  filename, error.what());
 	}
 }
 
