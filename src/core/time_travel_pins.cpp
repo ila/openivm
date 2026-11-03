@@ -22,12 +22,13 @@ using BaseTableRefCallback = std::function<void(BaseTableRef &)>;
 // Resolve without the AT clause; DuckDB owns lookup errors for unresolved relations.
 static optional_ptr<CatalogEntry> LookupPinRelation(ClientContext &context, BaseTableRef &ref) {
 	QueryErrorContext error_context;
-	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, ref.table_name, error_context);
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, ref.Table(), error_context);
 	try {
-		auto catalog = ref.catalog_name;
-		auto schema = ref.schema_name;
+		auto catalog = ref.GetQualifiedName().Catalog();
+		auto schema = ref.GetQualifiedName().Schema();
 		Binder::BindSchemaOrCatalog(context, catalog, schema);
-		return Catalog::GetEntry(context, catalog, schema, lookup, OnEntryNotFound::RETURN_NULL);
+		return Catalog::GetEntry(context, Identifier(catalog), Identifier(schema), lookup,
+		                         OnEntryNotFound::RETURN_NULL);
 	} catch (const std::exception &) {
 		return nullptr;
 	}
@@ -54,34 +55,37 @@ TimeTravelPins TimeTravelPins::Peel(ClientContext &context, SQLStatement &statem
 		if (!ref.at_clause) {
 			// Track native scans too: the pin map is keyed by relation name, so mixed pinned and
 			// unpinned uses of that name cannot be represented safely.
-			unpinned.insert(ref.table_name);
+			unpinned.insert(ref.Table().GetIdentifierName());
 			return;
 		}
 		Pin pin;
-		pin.catalog = ref.catalog_name;
-		pin.schema = ref.schema_name;
+		pin.catalog = ref.GetQualifiedName().Catalog().GetIdentifierName();
+		pin.schema = ref.GetQualifiedName().Schema().GetIdentifierName();
 		auto relation = LookupPinRelation(context, ref);
 		pin.binds_natively = !relation || relation->ParentCatalog().SupportsTimeTravel();
 		if (relation) {
-			pin.catalog = relation->ParentCatalog().GetName();
-			pin.schema = relation->ParentSchema().name;
+			pin.catalog = relation->ParentCatalog().GetName().GetIdentifierName();
+			pin.schema = relation->ParentSchema().name.GetIdentifierName();
 		}
 		// Binding loses the explicit AT clause even when it names the current native snapshot.
 		// Preserve it for LPTS, but only remove foreign pins from the locally executable query.
 		pin.snapshot = pin.binds_natively ? ref.at_clause->Copy() : std::move(ref.at_clause);
-		auto existing = result.pins.find(ref.table_name);
+		auto existing = result.pins.find(ref.Table().GetIdentifierName());
 		if (existing != result.pins.end()) {
 			if (!AtClause::Equals(existing->second.snapshot, pin.snapshot)) {
-				ThrowAmbiguousPin(ref.table_name, "it is pinned to both '" + existing->second.snapshot->ToString() +
-				                                      "' and '" + pin.snapshot->ToString() + "'");
+				ThrowAmbiguousPin(ref.Table().GetIdentifierName(), "it is pinned to both '" +
+				                                                       existing->second.snapshot->ToString() +
+				                                                       "' and '" + pin.snapshot->ToString() + "'");
 			}
 			if (existing->second.catalog != pin.catalog || existing->second.schema != pin.schema) {
-				ThrowAmbiguousPin(ref.table_name, "the same pin names two differently qualified relations");
+				ThrowAmbiguousPin(ref.Table().GetIdentifierName(),
+				                  "the same pin names two differently qualified relations");
 			}
 		}
 		OPENIVM_DEBUG_PRINT("[TIME TRAVEL] Recorded pin '%s' on relation '%s' (native=%d)\n",
-		                    pin.snapshot->ToString().c_str(), ref.table_name.c_str(), pin.binds_natively);
-		result.pins[ref.table_name] = std::move(pin);
+		                    pin.snapshot->ToString().c_str(), ref.Table().GetIdentifierName().c_str(),
+		                    pin.binds_natively);
+		result.pins[ref.Table().GetIdentifierName()] = std::move(pin);
 	};
 	SqlUtils::VisitSourceReferences(statement, callback);
 	for (auto &entry : result.pins) {
@@ -97,13 +101,14 @@ SnapshotResolver TimeTravelPins::Resolver() const {
 		return {};
 	}
 	return [this](const TableCatalogEntry &table) -> unique_ptr<AtClause> {
-		auto entry = pins.find(table.name);
+		auto entry = pins.find(table.name.GetIdentifierName());
 		if (entry == pins.end()) {
 			return nullptr;
 		}
 		auto &pin = entry->second;
-		if ((!pin.catalog.empty() && !StringUtil::CIEquals(pin.catalog, table.ParentCatalog().GetName())) ||
-		    (!pin.schema.empty() && !StringUtil::CIEquals(pin.schema, table.schema.name))) {
+		if ((!pin.catalog.empty() &&
+		     !StringUtil::CIEquals(pin.catalog, table.ParentCatalog().GetName().GetIdentifierName())) ||
+		    (!pin.schema.empty() && !StringUtil::CIEquals(pin.schema, table.schema.name.GetIdentifierName()))) {
 			return nullptr;
 		}
 		return pin.snapshot->Copy();
@@ -114,20 +119,20 @@ string TimeTravelPins::StripFrom(ClientContext &context, const string &sql) cons
 	if (pins.empty()) {
 		return sql;
 	}
-	Parser parser(context.GetParserOptions());
+	Parser parser(context);
 	parser.ParseQuery(sql);
 	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
 		throw InternalException("Expected one view query while stripping time-travel pins");
 	}
 	BaseTableRefCallback callback = [&](BaseTableRef &ref) {
-		auto entry = pins.find(ref.table_name);
+		auto entry = pins.find(ref.Table().GetIdentifierName());
 		if (entry == pins.end() || entry->second.binds_natively) {
 			return;
 		}
 		auto &pin = entry->second;
 		auto relation = LookupPinRelation(context, ref);
-		if (relation && StringUtil::CIEquals(pin.catalog, relation->ParentCatalog().GetName()) &&
-		    StringUtil::CIEquals(pin.schema, relation->ParentSchema().name)) {
+		if (relation && StringUtil::CIEquals(pin.catalog, relation->ParentCatalog().GetName().GetIdentifierName()) &&
+		    StringUtil::CIEquals(pin.schema, relation->ParentSchema().name.GetIdentifierName())) {
 			ref.at_clause.reset();
 		}
 	};
@@ -179,7 +184,7 @@ static idx_t SkipIgnorableSpan(const string &sql, idx_t pos) {
 }
 
 string TimeTravelPins::QualifySources(ClientContext &context, const string &sql) {
-	Parser parser(context.GetParserOptions());
+	Parser parser(context);
 	parser.ParseQuery(sql);
 	if (parser.statements.size() != 1) {
 		throw InternalException("Expected one view query while qualifying sources");
@@ -194,11 +199,12 @@ string TimeTravelPins::QualifySources(ClientContext &context, const string &sql)
 			return; // Let normal binding report unresolved relations and handle replacement scans.
 		}
 		if (!ref.query_location.IsValid()) {
-			throw InternalException("Missing source location while qualifying '%s'", ref.table_name);
+			throw InternalException("Missing source location while qualifying '%s'", ref.Table().GetIdentifierName());
 		}
-		auto start = ref.query_location.GetIndex();
+		auto start = ref.query_location.Start();
 		auto end = start;
-		idx_t components = 1 + !ref.schema_name.empty() + !ref.catalog_name.empty();
+		idx_t components = 1 + !ref.GetQualifiedName().Schema().GetIdentifierName().empty() +
+		                   !ref.GetQualifiedName().Catalog().GetIdentifierName().empty();
 		for (idx_t i = 0; i < components; i++) {
 			end = SkipIgnorableSpan(sql, end);
 			idx_t quoted_end;
@@ -213,7 +219,8 @@ string TimeTravelPins::QualifySources(ClientContext &context, const string &sql)
 			if (i + 1 < components) {
 				end = SkipIgnorableSpan(sql, end);
 				if (end >= sql.size() || sql[end] != '.') {
-					throw InternalException("Invalid source span while qualifying '%s'", ref.table_name);
+					throw InternalException("Invalid source span while qualifying '%s'",
+					                        ref.Table().GetIdentifierName());
 				}
 				end++;
 			}
@@ -221,8 +228,8 @@ string TimeTravelPins::QualifySources(ClientContext &context, const string &sql)
 		auto qualified =
 		    SqlUtils::FullName(relation->ParentCatalog().GetName(), relation->ParentSchema().name, relation->name);
 		replacements[start] = {end, qualified};
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Original SQL source '%s' resolves to %s\n", ref.table_name.c_str(),
-		                    qualified.c_str());
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Original SQL source '%s' resolves to %s\n",
+		                    ref.Table().GetIdentifierName().c_str(), qualified.c_str());
 	};
 	SqlUtils::VisitSourceReferences(*parser.statements[0], callback);
 	string result = sql;

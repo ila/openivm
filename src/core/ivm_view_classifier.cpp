@@ -41,17 +41,18 @@ static void DeduplicateGroupColumns(vector<string> &group_columns) {
 }
 
 static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr) {
-	while (expr && expr->expression_class == ExpressionClass::BOUND_CAST) {
-		auto &cast = expr->Cast<BoundCastExpression>();
-		expr = cast.child.get();
+	while (expr && BoundCastExpression::IsCast(*expr)) {
+		auto &cast = expr->Cast<BoundFunctionExpression>();
+		expr = BoundCastExpression::ChildMutable(cast).get();
 	}
-	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
+	if (!expr || expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		return nullptr;
 	}
 	return &expr->Cast<BoundColumnRefExpression>();
 }
 
-static bool ResolvesToAggregateValueBinding(idx_t table_index, idx_t column_index, const CreateMVPlanFacts &facts) {
+static bool ResolvesToAggregateValueBinding(TableIndex table_index, ProjectionIndex column_index,
+                                            const CreateMVPlanFacts &facts) {
 	for (auto *aggregate : facts.aggregates) {
 		if (aggregate && aggregate->group_index == facts.analysis.group_index &&
 		    ResolvesToOutputBinding(table_index, column_index, aggregate->aggregate_index,
@@ -86,7 +87,7 @@ static bool VisibleOutputResolvesToAggregateValue(const CreateMVPlanFacts &facts
 		return false;
 	}
 	auto *bcr = GetColumnRefThroughCasts(facts.first_projection->expressions[output_idx].get());
-	return bcr && ResolvesToAggregateValueBinding(bcr->binding.table_index, bcr->binding.column_index, facts);
+	return bcr && ResolvesToAggregateValueBinding(bcr->Binding().table_index, bcr->Binding().column_index, facts);
 }
 
 static bool CanInspectVisibleOutputBinding(const CreateMVPlanFacts &facts, const vector<ColumnBinding> &bindings,
@@ -175,32 +176,34 @@ static void AddJoinKeyGroupColumns(const CreateMVPlanFacts &facts, const vector<
 		return;
 	}
 
-	unordered_map<idx_t, unordered_set<idx_t>> join_key_cols;
+	unordered_map<TableIndex, unordered_set<ProjectionIndex>> join_key_cols;
 	for (auto &cond : cjoin->conditions) {
-		AddJoinKeyColumn(cond.left, join_key_cols);
-		AddJoinKeyColumn(cond.right, join_key_cols);
+		if (!cond.IsComparison())
+			continue;
+		AddJoinKeyColumn(cond.LeftReference(), join_key_cols);
+		AddJoinKeyColumn(cond.RightReference(), join_key_cols);
 	}
 
 	auto &top_proj = *top_proj_ptr;
 	for (idx_t expr_i = 0; expr_i < top_proj.expressions.size(); expr_i++) {
 		auto &expr = top_proj.expressions[expr_i];
-		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 			continue;
 		}
 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
-		auto it = join_key_cols.find(bcr.binding.table_index);
-		if (it == join_key_cols.end() || !it->second.count(bcr.binding.column_index)) {
+		auto it = join_key_cols.find(bcr.Binding().table_index);
+		if (it == join_key_cols.end() || !it->second.count(bcr.Binding().column_index)) {
 			continue;
 		}
 
 		string col_name;
-		if (!expr->alias.empty()) {
-			col_name = expr->alias;
+		if (!expr->GetAlias().GetIdentifierName().empty()) {
+			col_name = expr->GetAlias().GetIdentifierName();
 		} else if (expr_i < output_names.size() && !output_names[expr_i].empty() &&
 		           !IncrementalTableNames::IsInternalColumn(output_names[expr_i])) {
 			col_name = output_names[expr_i];
 		} else {
-			col_name = bcr.GetName();
+			col_name = bcr.GetName().GetIdentifierName();
 		}
 		if (IncrementalTableNames::IsInternalColumn(col_name)) {
 			continue;
@@ -281,7 +284,7 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Inner DISTINCT below an outer projection -- using "
 			                    "GROUP_RECOMPUTE\n");
 		}
-	} else if (group_count > 0 && group_index != DConstants::INVALID_INDEX) {
+	} else if (group_count > 0 && group_index.IsValid()) {
 		model.group_columns = DeriveGroupColumnNames(facts, group_index, group_count, output_names);
 	}
 

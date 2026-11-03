@@ -10,7 +10,7 @@ OpenIVM is currently under testing. We hope to release it as a community extensi
 by the end of 2026. [Issues and feature requests](https://github.com/ila/openivm/issues)
 are welcome.
 
-OpenIVM currently requires a source build with DuckDB v1.5.4. Follow the
+OpenIVM currently requires a source build with DuckDB v2.0.0. Follow the
 [build and setup guide](docs/build/building.md) first; the built CLI already loads OpenIVM.
 
 ```sql

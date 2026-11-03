@@ -43,8 +43,8 @@ static void SourceVisitQueryNode(QueryNode &node, const SourceRefVisitor &visito
 static void SourceVisitExpression(ParsedExpression &expression, const SourceRefVisitor &visitor) {
 	if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
 		auto &subquery = expression.Cast<SubqueryExpression>();
-		if (subquery.subquery && subquery.subquery->node) {
-			SourceVisitQueryNode(*subquery.subquery->node, visitor);
+		if (subquery.Subquery() && subquery.Subquery()->node) {
+			SourceVisitQueryNode(*subquery.Subquery()->node, visitor);
 		}
 	}
 	ParsedExpressionIterator::EnumerateChildren(
@@ -55,8 +55,9 @@ static void SourceVisitTableRef(unique_ptr<TableRef> &ref, const SourceRefVisito
 	switch (ref->type) {
 	case TableReferenceType::BASE_TABLE: {
 		auto &base_table = ref->Cast<BaseTableRef>();
-		bool unqualified = base_table.catalog_name.empty() && base_table.schema_name.empty();
-		if (unqualified && visitor.cte_names.find(base_table.table_name) != visitor.cte_names.end()) {
+		bool unqualified = base_table.GetQualifiedName().Catalog().GetIdentifierName().empty() &&
+		                   base_table.GetQualifiedName().Schema().GetIdentifierName().empty();
+		if (unqualified && visitor.cte_names.find(base_table.Table().GetIdentifierName()) != visitor.cte_names.end()) {
 			break;
 		}
 		visitor.callback(ref);
@@ -116,10 +117,10 @@ static void SourceVisitQueryNode(QueryNode &node, const SourceRefVisitor &visito
 	// Each CTE body sees preceding siblings, but not its own name.
 	SourceRefVisitor scoped {visitor.callback, visitor.cte_names};
 	for (auto &cte : node.cte_map.map) {
-		if (cte.second->query && cte.second->query->node) {
-			SourceVisitQueryNode(*cte.second->query->node, scoped);
+		if (cte.second->query_node && cte.second->query_node) {
+			SourceVisitQueryNode(*cte.second->query_node, scoped);
 		}
-		scoped.cte_names.insert(cte.first);
+		scoped.cte_names.insert(cte.first.GetIdentifierName());
 	}
 	switch (node.type) {
 	case QueryNodeType::SELECT_NODE: {
@@ -155,7 +156,7 @@ static void SourceVisitQueryNode(QueryNode &node, const SourceRefVisitor &visito
 	case QueryNodeType::RECURSIVE_CTE_NODE: {
 		auto &recursive_cte = node.Cast<RecursiveCTENode>();
 		SourceRefVisitor recursive_scope {visitor.callback, scoped.cte_names};
-		recursive_scope.cte_names.insert(recursive_cte.ctename);
+		recursive_scope.cte_names.insert(recursive_cte.ctename.GetIdentifierName());
 		if (recursive_cte.left) {
 			SourceVisitQueryNode(*recursive_cte.left, recursive_scope);
 		}
@@ -171,7 +172,7 @@ static void SourceVisitQueryNode(QueryNode &node, const SourceRefVisitor &visito
 		}
 		if (cte.child) {
 			SourceRefVisitor child_scope {visitor.callback, scoped.cte_names};
-			child_scope.cte_names.insert(cte.ctename);
+			child_scope.cte_names.insert(cte.ctename.GetIdentifierName());
 			SourceVisitQueryNode(*cte.child, child_scope);
 		}
 		break;
@@ -207,8 +208,8 @@ static void SourceVisitStatement(SQLStatement &statement, const SourceRefVisitor
 	}
 	case StatementType::INSERT_STATEMENT: {
 		auto &insert = statement.Cast<InsertStatement>();
-		if (insert.select_statement && insert.select_statement->node) {
-			SourceVisitQueryNode(*insert.select_statement->node, visitor);
+		if (insert.node->select_statement && insert.node->select_statement->node) {
+			SourceVisitQueryNode(*insert.node->select_statement->node, visitor);
 		}
 		break;
 	}
@@ -530,10 +531,6 @@ string SqlUtils::LastIdentifierPart(string name) {
 	return name;
 }
 
-string SqlUtils::FullName(const string &catalog, const string &schema, const string &table) {
-	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteIdentifier(table);
-}
-
 string SqlUtils::QualifiedPrefix(const string &catalog, const string &schema) {
 	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + ".";
 }
@@ -630,8 +627,9 @@ string SqlUtils::DuckLakeTableFunction(const string &function_name, const string
 
 SessionLocation SqlUtils::SessionDefaultLocation(ClientContext &context) {
 	auto &entry = ClientData::Get(context).catalog_search_path->GetDefault();
-	return {entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : entry.catalog,
-	        entry.schema.empty() ? string(DEFAULT_SCHEMA) : entry.schema};
+	return {entry.GetCatalog().empty() ? DatabaseManager::GetDefaultDatabase(context).GetIdentifierName()
+	                                   : entry.GetCatalog().GetIdentifierName(),
+	        entry.GetSchema().empty() ? string(DEFAULT_SCHEMA) : entry.GetSchema().GetIdentifierName()};
 }
 
 string SqlUtils::DeleteViewRowsSQL(const string &table, const string &view_name, const string &column) {
@@ -654,7 +652,7 @@ vector<string> SqlUtils::WithoutMultiplicity(const vector<string> &columns) {
 }
 
 string SqlUtils::JoinQuotedColumns(const vector<string> &columns) {
-	return JoinEach(columns, ", ", QuoteIdentifier);
+	return JoinEach(columns, ", ", [](const string &column) { return QuoteIdentifier(column); });
 }
 
 string SqlUtils::JoinQualifiedQuotedColumns(const vector<string> &columns, const string &alias) {

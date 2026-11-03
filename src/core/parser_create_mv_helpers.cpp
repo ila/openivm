@@ -220,7 +220,7 @@ void AppendMetadataMigrationSQL(vector<string> &ddl, const string &table, option
 	for (auto &column : MetadataColumns(table)) {
 		string definition = column.migration;
 		if (column.added && column.In(remote) &&
-		    !(existing && existing->ColumnExists(definition.substr(0, definition.find(' '))))) {
+		    !(existing && existing->ColumnExists(Identifier(definition.substr(0, definition.find(' ')))))) {
 			ddl.push_back("alter table " + table + " add column if not exists " + definition);
 		}
 	}
@@ -257,8 +257,8 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 		// Inspect this transaction's catalog, not a process-wide initialization flag: older
 		// databases and other attached catalogs must still receive missing columns. A missing
 		// table is created above with every column.
-		auto existing =
-		    Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, table, OnEntryNotFound::RETURN_NULL);
+		auto existing = Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(schema),
+		                                                     Identifier(table), OnEntryNotFound::RETURN_NULL);
 		if (existing) {
 			AppendMetadataMigrationSQL(ddl, table, existing, remote);
 		}
@@ -400,8 +400,9 @@ void AppendCreateMVSystemTablesDDL(ClientContext &context, const string &catalog
 		// a DuckDB file lock after writing metadata but before creating the physical
 		// DuckLake/default-catalog objects, a retry should clean that stale row rather
 		// than report a misleading duplicate MV.
-		auto views = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, openivm::VIEWS_TABLE,
-		                                                  OnEntryNotFound::RETURN_NULL);
+		auto views =
+		    Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(schema),
+		                                         Identifier(openivm::VIEWS_TABLE), OnEntryNotFound::RETURN_NULL);
 		// Remote catalogs have no DuckDB storage to scan; the guarded DELETE is harmless.
 		if (views && (remote || HasViewMetadata(context, *views, view_name))) {
 			ddl.push_back("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE " + stale_mv_condition);

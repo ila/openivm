@@ -112,13 +112,13 @@ void MutationGate::RecordSourceCommit(const string &source, idx_t catalog_oid, t
 	admission.last_write_commit = MaxValue(admission.last_write_commit, commit_id);
 }
 
-bool MutationGate::HasSourceCommitAfter(const string &source, idx_t catalog_oid, transaction_t snapshot) {
+bool MutationGate::HasSourceCommitAfter(const string &source, idx_t catalog_oid, VisibilityBound snapshot) {
 	std::lock_guard<mutex> guard(lock);
 	return sources.at(catalog_oid).at(source)->last_write_commit >= snapshot;
 }
 
 void MutationGate::UnlockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication,
-                                transaction_t oldest_snapshot) {
+                                VisibilityBound oldest_snapshot) {
 	std::lock_guard<mutex> guard(lock);
 	auto &catalog_sources = sources.at(catalog_oid);
 	auto &admission = *catalog_sources.at(source);
@@ -164,8 +164,8 @@ SourceAdmissionGuard::SourceAdmissionGuard(DatabaseInstance &db, const void *own
 
 SourceAdmissionGuard::~SourceAdmissionGuard() {
 	auto oldest_snapshot = source_database->GetCatalog().IsDuckCatalog()
-	                           ? DuckTransactionManager::Get(*source_database).LowestActiveStart()
-	                           : MAX_TRANSACTION_ID;
+	                           ? DuckTransactionManager::Get(*source_database).LowestVisibilityBound()
+	                           : VisibilityBound::IncludingUncommitted();
 	gate->UnlockSource(owner, source, source_database->GetCatalog().GetOid(), publication, oldest_snapshot);
 }
 
@@ -182,7 +182,7 @@ void SourceAdmissionGuard::RecordCommit() {
 	}
 }
 
-bool SourceAdmissionGuard::HasCommitAfter(transaction_t snapshot) {
+bool SourceAdmissionGuard::HasCommitOutsideSnapshot(VisibilityBound snapshot) {
 	D_ASSERT(publication);
 	return gate->HasSourceCommitAfter(source, source_database->GetCatalog().GetOid(), snapshot);
 }
@@ -217,7 +217,7 @@ unique_ptr<SourceAdmissionGuard> TransactionalMVLockState::AcquireSourceWriteAdm
 		return nullptr;
 	}
 	return make_uniq<SourceAdmissionGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner,
-	                                       Catalog::GetCatalog(owner, catalog), std::move(source), false);
+	                                       Catalog::GetCatalog(owner, Identifier(catalog)), std::move(source), false);
 }
 
 void TransactionalMVLockState::RetainSourceWriteAdmission(unique_ptr<SourceAdmissionGuard> admission) {
@@ -285,20 +285,20 @@ void TransactionalMVLockState::AcquireSourcePublicationLock(const string &catalo
 		return;
 	}
 	auto admission = make_uniq<SourceAdmissionGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner,
-	                                                 Catalog::GetCatalog(owner, catalog), source, true);
+	                                                 Catalog::GetCatalog(owner, Identifier(catalog)), source, true);
 	OPENIVM_DEBUG_PRINT("[LOCK] acquired source publication lock %s owner=%p\n", source.c_str(), mutation_owner);
 	source_publication_locks.emplace(std::move(source), std::move(admission));
 }
 
 void TransactionalMVLockState::VerifySourceSnapshot(const string &catalog, const string &schema, const string &table) {
-	auto &source_catalog = Catalog::GetCatalog(owner, catalog);
+	auto &source_catalog = Catalog::GetCatalog(owner, Identifier(catalog));
 	if (!source_catalog.IsDuckCatalog()) {
 		return;
 	}
-	auto snapshot = DuckTransaction::Get(owner, source_catalog).start_time;
+	auto snapshot = DuckTransaction::Get(owner, source_catalog).GetSnapshotView().visibility_bound;
 	auto source = StringUtil::Lower(SqlUtils::FullName(catalog, schema, table));
 	lock_guard<mutex> guard(state_lock);
-	if (source_publication_locks.at(source)->HasCommitAfter(snapshot)) {
+	if (source_publication_locks.at(source)->HasCommitOutsideSnapshot(snapshot)) {
 		throw TransactionException("OpenIVM cannot establish source capture from an older source snapshot for "
 		                           "'%s'; retry the transaction",
 		                           SqlUtils::FullName(catalog, schema, table));
@@ -444,8 +444,9 @@ TransactionalMVLockState::FindDeferredSourceDelta(const string &catalog, const s
 		                         SqlUtils::DeltaName(table))) {
 			// Ownership was removed by an earlier replacement, but this transaction
 			// still reserves the physical delta until its post-commit cleanup check.
-			return Catalog::GetEntry<TableCatalogEntry>(owner, catalog, source.delta_schema_name,
-			                                            source.delta_table_name, OnEntryNotFound::RETURN_NULL);
+			return Catalog::GetEntry<TableCatalogEntry>(
+			    owner, Identifier(catalog), Identifier(source.delta_schema_name), Identifier(source.delta_table_name),
+			    OnEntryNotFound::RETURN_NULL);
 		}
 	}
 	return nullptr;
@@ -459,8 +460,9 @@ void TransactionalMVLockState::TransactionRollback(MetaTransaction &transaction,
 	Release();
 }
 
-RebindQueryInfo TransactionalMVLockState::OnExecutePrepared(ClientContext &context, PreparedStatementCallbackInfo &info,
-                                                            RebindQueryInfo current_rebind) {
+RebindQueryInfo TransactionalMVLockState::OnRebindPreparedStatement(ClientContext &context,
+                                                                    BindPreparedStatementCallbackInfo &info,
+                                                                    RebindQueryInfo current_rebind) {
 	auto &plan = info.prepared_statement.physical_plan;
 	if (plan && !info.prepared_statement.properties.IsReadOnly()) {
 		AdmitPlanMutations(context, plan->Root());

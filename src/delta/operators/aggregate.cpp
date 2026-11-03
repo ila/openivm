@@ -20,24 +20,30 @@ DeltaPlanFragment CompileAggregateDelta(DeltaOperatorInput input) {
 	auto mult_group_by =
 	    make_uniq<BoundColumnRefExpression>(openivm::MULTIPLICITY_COL, input.mul_type, input_mul_binding);
 	ColumnBinding mod_mul_binding;
-	mod_mul_binding.column_index = modified_node.groups.size();
+	mod_mul_binding.column_index = ProjectionIndex(modified_node.groups.size());
 	modified_node.groups.emplace_back(std::move(mult_group_by));
 
 	auto mult_group_by_stats = make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(input.mul_type));
 	modified_node.group_stats.emplace_back(std::move(mult_group_by_stats));
 
+	auto multiplicity_group = ProjectionIndex(modified_node.groups.size() - 1);
 	if (modified_node.grouping_sets.empty()) {
-		modified_node.grouping_sets = {{0}};
+		GroupingSet all_groups;
+		for (idx_t group = 0; group < modified_node.groups.size(); group++) {
+			all_groups.insert(ProjectionIndex(group));
+		}
+		modified_node.grouping_sets.push_back(std::move(all_groups));
 	} else {
-		idx_t gr = modified_node.grouping_sets[0].size();
-		modified_node.grouping_sets[0].insert(gr);
+		for (auto &grouping_set : modified_node.grouping_sets) {
+			grouping_set.insert(multiplicity_group);
+		}
 	}
 
 	mod_mul_binding.table_index = modified_node.group_index;
 	input.plan->Verify(input.context.input.context);
 	OPENIVM_DEBUG_PRINT("[DeltaAggregate] Done, now %zu groups (added mul), mul_binding: table=%lu col=%lu\n",
-	                    modified_node.groups.size(), (unsigned long)mod_mul_binding.table_index,
-	                    (unsigned long)mod_mul_binding.column_index);
+	                    modified_node.groups.size(), (unsigned long)mod_mul_binding.table_index.index,
+	                    (unsigned long)mod_mul_binding.column_index.GetIndex());
 	return {std::move(input.plan), mod_mul_binding};
 }
 

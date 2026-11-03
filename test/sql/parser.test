@@ -1286,3 +1286,45 @@ DROP TABLE extractor_left;
 
 statement ok
 DROP TABLE extractor_right;
+
+# Parse MV syntax through DuckDB's grammar, with the legacy override disabled.
+statement ok
+SET active_grammar_extensions=['openivm'];
+SET allow_parser_override_extension='default';
+SET openivm_disable_daemon=true;
+CREATE SCHEMA "PEG.Schema";
+CREATE TABLE peg_source(k INTEGER, v INTEGER);
+INSERT INTO peg_source VALUES (1,10),(1,10),(NULL,20);
+CREATE /* header comment */ MATERIALIZED VIEW "PEG.Schema"."MV.AS" REFRESH EVERY '5 minutes' AS
+WITH input AS (SELECT * FROM peg_source)
+SELECT k,v,'AS; REFRESH EVERY' AS label FROM input;
+ALTER MATERIALIZED VIEW "PEG.Schema"."MV.AS" SET REFRESH MANUAL;
+
+statement ok
+INSERT INTO peg_source VALUES (1,10),(2,NULL);
+UPDATE peg_source SET v=v+1 WHERE k=1;
+DELETE FROM peg_source WHERE k IS NULL;
+
+statement ok
+PRAGMA refresh('"PEG.Schema"."MV.AS"');
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM "PEG.Schema"."MV.AS" EXCEPT ALL SELECT k,v,'AS; REFRESH EVERY' FROM peg_source)
+ UNION ALL
+ (SELECT k,v,'AS; REFRESH EVERY' FROM peg_source EXCEPT ALL SELECT * FROM "PEG.Schema"."MV.AS")
+);
+----
+0
+
+statement error
+CREATE MATERIALIZED VIEW peg_bad_literal AS SELECT 'a'/* comment */'b' AS label;
+----
+syntax error
+
+statement ok
+DROP VIEW "PEG.Schema"."MV.AS";
+DROP TABLE peg_source;
+DROP SCHEMA "PEG.Schema";
+SET allow_parser_override_extension='fallback';
+SET active_grammar_extensions=[];

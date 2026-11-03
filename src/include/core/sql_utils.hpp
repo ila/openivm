@@ -3,6 +3,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 #include "lpts_pipeline.hpp"
 
 #include <string>
@@ -40,7 +41,10 @@ public:
 	// Empty replacement keeps a reference unchanged; visit all references in one scan.
 	static string RewriteTableReferences(const string &sql,
 	                                     const std::function<string(const vector<string> &)> &rewrite);
-	static string FullName(const string &catalog, const string &schema, const string &table);
+	template <class CATALOG, class SCHEMA, class TABLE>
+	static string FullName(const CATALOG &catalog, const SCHEMA &schema, const TABLE &table) {
+		return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteIdentifier(table);
+	}
 	/// Compare SQL expressions holding catalog identifiers using DuckDB's ASCII-only case folding.
 	static string IdentifierEqualsSQL(const string &left, const string &right);
 	static string QualifiedPrefix(const string &catalog, const string &schema);
@@ -51,7 +55,7 @@ public:
 	                                    const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id);
 	static bool GetBoolSetting(ClientContext &context, const string &setting_name, bool default_value) {
 		Value setting_value;
-		if (context.TryGetCurrentSetting(setting_name, setting_value) && !setting_value.IsNull()) {
+		if (context.TryGetCurrentSetting(Identifier(setting_name), setting_value) && !setting_value.IsNull()) {
 			return setting_value.GetValue<bool>();
 		}
 		return default_value;
@@ -104,8 +108,9 @@ public:
 	static int64_t ExtractRefreshInterval(string &query);
 
 	/// Quote an identifier for safe use in generated SQL (handles reserved words and special chars).
-	static string QuoteIdentifier(const string &name) {
-		return KeywordHelper::WriteOptionallyQuoted(name);
+	template <class T>
+	static string QuoteIdentifier(const T &name) {
+		return SQLIdentifier::ToString(name);
 	}
 
 	/// Escape a string value for use inside single-quoted SQL literals.

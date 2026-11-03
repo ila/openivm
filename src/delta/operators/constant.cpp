@@ -19,7 +19,7 @@ DeltaPlanFragment CompileConstantZeroDelta(DeltaOperatorInput input) {
 	// The empty result needs one binding per output type; >= disables construction and <= adds a type-less binding.
 	for (idx_t i = 0; i < output_types.size(); // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
 	     i++) {                                // mull-ignore: cxx_post_inc_to_post_dec
-		bindings.emplace_back(table_index, i);
+		bindings.emplace_back(table_index, ProjectionIndex(i));
 	}
 	if (bindings.empty()) {
 		throw InternalException("DeltaConstant: zero-delta result has no multiplicity binding");
@@ -49,7 +49,7 @@ DeltaPlanFragment CompileStaticConstantLeaf(DeltaOperatorInput input) {
 		exprs.push_back(make_uniq<BoundColumnRefExpression>(input.plan->types[i], bindings[i]));
 	}
 	auto mul_expr = make_uniq<BoundConstantExpression>(Value::INTEGER(1));
-	mul_expr->alias = openivm::MULTIPLICITY_COL;
+	mul_expr->SetAlias(Identifier(openivm::MULTIPLICITY_COL));
 	exprs.push_back(std::move(mul_expr));
 
 	auto projection =

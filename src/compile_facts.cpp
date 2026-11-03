@@ -178,7 +178,7 @@ static void PushBucket(CompileWithFactsBindData &bd, const string &kind, const s
 } // namespace
 
 unique_ptr<FunctionData> OpenIvmCompileWithFactsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                                     vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs.size() < 2) {
 		throw InvalidInputException("openivm_compile_with_facts(view_name, facts_json) requires exactly two arguments");
 	}

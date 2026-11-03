@@ -30,7 +30,8 @@ DeltaPlanFragment CompileUnionDelta(DeltaOperatorInput input) {
 	ColumnBinding new_mul_binding = union_bindings.back();
 
 	OPENIVM_DEBUG_PRINT("[DeltaUnion] Done, mul_binding: table=%lu col=%lu\n",
-	                    (unsigned long)new_mul_binding.table_index, (unsigned long)new_mul_binding.column_index);
+	                    (unsigned long)new_mul_binding.table_index.index,
+	                    (unsigned long)new_mul_binding.column_index.GetIndex());
 	return {std::move(input.plan), new_mul_binding};
 }
 

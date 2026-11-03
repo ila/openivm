@@ -6,9 +6,9 @@
 
 namespace duckdb {
 
-using old_idx = idx_t;
-using new_idx = idx_t;
-using col_idx = idx_t;
+using old_idx = TableIndex;
+using new_idx = TableIndex;
+using col_idx = ProjectionIndex;
 
 struct RenumberWrapper {
 	unique_ptr<LogicalOperator> op;

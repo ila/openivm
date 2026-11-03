@@ -2,6 +2,7 @@
 #include "duckdb/main/database_manager.hpp"
 
 #include "core/openivm_constants.hpp"
+#include "core/metadata_json.hpp"
 #include "core/published_view.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
@@ -93,23 +94,37 @@ struct FojJoinInfo {
 	string left_table, left_col, right_table, right_col;
 	string dt_left_name, dt_right_name; // delta table names
 
-	static FojJoinInfo Parse(RefreshMetadata &metadata, const string &view_name,
-	                         const vector<string> &delta_table_names) {
-		FojJoinInfo info;
+	static vector<FojJoinInfo> ParseAll(RefreshMetadata &metadata, const string &view_name,
+	                                    const vector<string> &delta_table_names) {
+		vector<FojJoinInfo> joins;
 		string raw = metadata.GetFullOuterJoinCols(view_name);
-		auto comma_pos = raw.find(',');
-		if (comma_pos != string::npos) {
-			string left_part = raw.substr(0, comma_pos);
-			string right_part = raw.substr(comma_pos + 1);
-			auto lc = left_part.find(':');
-			if (lc != string::npos) {
-				info.left_table = left_part.substr(0, lc);
-				info.left_col = left_part.substr(lc + 1);
+		if (StringUtil::StartsWith(raw, "{")) {
+			for (const auto &object : MetadataJson::ExtractJsonObjectsFromArray(raw, "edges")) {
+				FojJoinInfo info;
+				if (!MetadataJson::ExtractJsonString(object, "left_table", info.left_table) ||
+				    !MetadataJson::ExtractJsonString(object, "left_column", info.left_col) ||
+				    !MetadataJson::ExtractJsonString(object, "right_table", info.right_table) ||
+				    !MetadataJson::ExtractJsonString(object, "right_column", info.right_col)) {
+					continue;
+				}
+				joins.push_back(std::move(info));
 			}
-			auto rc = right_part.find(':');
-			if (rc != string::npos) {
-				info.right_table = right_part.substr(0, rc);
-				info.right_col = right_part.substr(rc + 1);
+		} else {
+			// Databases created before multi-boundary metadata used one table:column pair.
+			auto comma_pos = raw.find(',');
+			if (comma_pos != string::npos) {
+				FojJoinInfo info;
+				string left_part = raw.substr(0, comma_pos);
+				string right_part = raw.substr(comma_pos + 1);
+				auto lc = left_part.find(':');
+				auto rc = right_part.find(':');
+				if (lc != string::npos && rc != string::npos) {
+					info.left_table = left_part.substr(0, lc);
+					info.left_col = left_part.substr(lc + 1);
+					info.right_table = right_part.substr(0, rc);
+					info.right_col = right_part.substr(rc + 1);
+					joins.push_back(std::move(info));
+				}
 			}
 		}
 		auto resolve_source = [&](string &table, string &delta_name) {
@@ -128,9 +143,17 @@ struct FojJoinInfo {
 				return;
 			}
 		};
-		resolve_source(info.left_table, info.dt_left_name);
-		resolve_source(info.right_table, info.dt_right_name);
-		return info;
+		for (auto &info : joins) {
+			resolve_source(info.left_table, info.dt_left_name);
+			resolve_source(info.right_table, info.dt_right_name);
+		}
+		return joins;
+	}
+
+	static FojJoinInfo Parse(RefreshMetadata &metadata, const string &view_name,
+	                         const vector<string> &delta_table_names) {
+		auto joins = ParseAll(metadata, view_name, delta_table_names);
+		return joins.empty() ? FojJoinInfo() : std::move(joins.front());
 	}
 };
 
@@ -254,51 +277,53 @@ string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec) {
 string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &view_name,
                                      const vector<string> &delta_table_names, const vector<string> &group_columns,
                                      const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs) {
-	auto join = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
-	if (join.left_col.empty() || join.right_col.empty() || join.dt_left_name.empty() || join.dt_right_name.empty() ||
-	    join.left_table == join.right_table) {
-		return "";
-	}
+	auto joins = FojJoinInfo::ParseAll(metadata, view_name, delta_table_names);
 	string groups;
-	for (const auto &spec : delta_specs) {
-		bool left = StringUtil::CIEquals(spec.source_sql, join.left_table);
-		if (!left && !StringUtil::CIEquals(spec.source_sql, join.right_table)) {
+	for (const auto &join : joins) {
+		if (join.left_col.empty() || join.right_col.empty() || join.dt_left_name.empty() ||
+		    join.dt_right_name.empty() || StringUtil::CIEquals(join.left_table, join.right_table)) {
 			continue;
 		}
-		const auto &other_table = left ? join.right_table : join.left_table;
-		const auto &source_key = left ? join.left_col : join.right_col;
-		const auto &other_key = left ? join.right_col : join.left_col;
-		auto source_ref = SqlUtils::FindTableReference(view_query_sql, spec.source_sql);
-		auto other_ref = SqlUtils::FindTableReference(view_query_sql, other_table);
-		if (source_ref.empty() || other_ref.empty()) {
-			continue;
-		}
-		auto delta = BuildGroupRecomputeDeltaRowsSQL(spec);
-		string other_rows = "SELECT * FROM " + other_ref;
-		for (const auto &other_spec : delta_specs) {
-			if (StringUtil::CIEquals(other_spec.source_sql, other_table)) {
-				// Deleted opposite-side rows can carry an old unmatched group too.
-				other_rows += " UNION ALL SELECT * FROM " + BuildGroupRecomputeDeltaRowsSQL(other_spec);
+		for (const auto &spec : delta_specs) {
+			bool left = StringUtil::CIEquals(spec.source_sql, join.left_table);
+			if (!left && !StringUtil::CIEquals(spec.source_sql, join.right_table)) {
+				continue;
 			}
-		}
-		string affected_other = "(SELECT openivm_other.* FROM (" + other_rows +
-		                        ") openivm_other WHERE EXISTS (SELECT 1 FROM " + delta +
-		                        " openivm_changed WHERE openivm_other." + SqlUtils::QuoteIdentifier(other_key) +
-		                        " = openivm_changed." + SqlUtils::QuoteIdentifier(source_key) + "))";
-		auto append_groups = [&](const string &source_rows, const string &opposite_rows) {
-			auto query = SqlUtils::ReplaceTableReferences(view_query_sql, source_ref, source_rows);
-			query = SqlUtils::ReplaceTableReferences(query, other_ref, opposite_rows);
-			if (!groups.empty()) {
-				groups += "\nUNION\n";
+			const auto &other_table = left ? join.right_table : join.left_table;
+			const auto &source_key = left ? join.left_col : join.right_col;
+			const auto &other_key = left ? join.right_col : join.left_col;
+			auto source_ref = SqlUtils::FindTableReference(view_query_sql, spec.source_sql);
+			auto other_ref = SqlUtils::FindTableReference(view_query_sql, other_table);
+			if (source_ref.empty() || other_ref.empty()) {
+				continue;
 			}
-			groups += "SELECT DISTINCT " + SqlUtils::JoinQuotedColumns(group_columns) + " FROM (" + query +
-			          ") openivm_unmatched_groups";
-		};
-		append_groups(delta, "(SELECT * FROM " + other_ref + " WHERE false)");
-		append_groups("(SELECT * FROM " + source_ref + " WHERE false)", affected_other);
+			auto delta = BuildGroupRecomputeDeltaRowsSQL(spec);
+			string other_rows = "SELECT * FROM " + other_ref;
+			for (const auto &other_spec : delta_specs) {
+				if (StringUtil::CIEquals(other_spec.source_sql, other_table)) {
+					// Deleted opposite-side rows can carry an old unmatched group too.
+					other_rows += " UNION ALL SELECT * FROM " + BuildGroupRecomputeDeltaRowsSQL(other_spec);
+				}
+			}
+			string affected_other = "(SELECT openivm_other.* FROM (" + other_rows +
+			                        ") openivm_other WHERE EXISTS (SELECT 1 FROM " + delta +
+			                        " openivm_changed WHERE openivm_other." + SqlUtils::QuoteIdentifier(other_key) +
+			                        " = openivm_changed." + SqlUtils::QuoteIdentifier(source_key) + "))";
+			auto append_groups = [&](const string &source_rows, const string &opposite_rows) {
+				auto query = SqlUtils::ReplaceTableReferences(view_query_sql, source_ref, source_rows);
+				query = SqlUtils::ReplaceTableReferences(query, other_ref, opposite_rows);
+				if (!groups.empty()) {
+					groups += "\nUNION\n";
+				}
+				groups += "SELECT DISTINCT " + SqlUtils::JoinQuotedColumns(group_columns) + " FROM (" + query +
+				          ") openivm_unmatched_groups";
+			};
+			append_groups(delta, "(SELECT * FROM " + other_ref + " WHERE false)");
+			append_groups("(SELECT * FROM " + source_ref + " WHERE false)", affected_other);
+		}
 	}
-	OPENIVM_DEBUG_PRINT("[UPSERT] Full outer unmatched group discovery for %s: %zu changed sources\n",
-	                    view_name.c_str(), delta_specs.size());
+	OPENIVM_DEBUG_PRINT("[UPSERT] Full outer unmatched group discovery for %s: %zu edges, %zu changed sources\n",
+	                    view_name.c_str(), joins.size(), delta_specs.size());
 	return groups;
 }
 
@@ -418,7 +443,7 @@ string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool 
 	if (last_refresh_result->HasError() || last_refresh_result->RowCount() == 0) {
 		return "";
 	}
-	auto ts = last_refresh_result->GetValue(0, 0);
+	auto ts = last_refresh_result->Collection().GetValue(0, 0);
 	if (ts.IsNull()) {
 		return "";
 	}
@@ -492,8 +517,27 @@ AffectedGroupSignedDelta BuildAffectedGroupSignedDelta(const string &data_table,
 // The same affected-row predicate applies to the old snapshot, recomputed rows,
 // and deletion target. Use one alias so callers cannot accidentally scope them differently.
 string BuildSnapshotDeltaRefreshSQL(const string &data_table, const string &query, const string &delta_table,
-                                    const string &old_table, const string &new_table, const string &filter) {
+                                    const string &old_table, const string &new_table, const string &filter,
+                                    bool use_data_modifying_ctes) {
 	string predicate = " openivm_target\nWHERE " + filter;
+	if (use_data_modifying_ctes) {
+		auto deleted = SqlUtils::QuoteIdentifier("openivm_deleted_" + SqlUtils::LastIdentifierPart(old_table));
+		auto inserted = SqlUtils::QuoteIdentifier("openivm_inserted_" + SqlUtils::LastIdentifierPart(new_table));
+		// Snapshot both row sets before deletion. DML CTEs expose their one-row Count result,
+		// so dependencies also execute when a modification affects no rows.
+		string prefix = "WITH " + old_table + " AS MATERIALIZED (SELECT * FROM " + data_table + predicate + "),\n" +
+		                new_table + " AS MATERIALIZED (SELECT * FROM (" + query + ")" + predicate + "),\n" + deleted +
+		                " AS MATERIALIZED (DELETE FROM " + data_table +
+		                " AS openivm_target USING (SELECT count(*) FROM " + old_table +
+		                ") openivm_old_ready, (SELECT count(*) FROM " + new_table + ") openivm_new_ready WHERE " +
+		                filter + "),\n" + inserted + " AS MATERIALIZED (INSERT INTO " + data_table +
+		                " SELECT openivm_new.* FROM " + new_table + " openivm_new CROSS JOIN " + deleted + ")\n";
+		auto after_insert = [&](const string &rows) {
+			return "(SELECT openivm_rows.* FROM " + rows + " openivm_rows CROSS JOIN " + inserted + ") openivm_rows";
+		};
+		OPENIVM_DEBUG_PRINT("[SNAPSHOT REFRESH] Using data-modifying CTEs for %s\n", data_table.c_str());
+		return BuildSignedMultisetDeltaInsertSQL(delta_table, after_insert(old_table), after_insert(new_table), prefix);
+	}
 	return "CREATE OR REPLACE TEMP TABLE " + old_table + " AS\nSELECT * FROM " + data_table + predicate + ";\n" +
 	       "CREATE OR REPLACE TEMP TABLE " + new_table + " AS\nSELECT * FROM (" + query + ")" + predicate + ";\n" +
 	       "DELETE FROM " + data_table + " AS" + predicate + ";\n" + "INSERT INTO " + data_table + "\nSELECT * FROM " +
@@ -875,8 +919,8 @@ static string ResolveDuckLakeCatalogName(Connection &con, const string &view_cat
 		}
 	}
 	auto probe = con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'ducklake'");
-	if (probe && !probe->HasError() && probe->RowCount() == 1 && !probe->GetValue(0, 0).IsNull()) {
-		return probe->GetValue(0, 0).ToString();
+	if (probe && !probe->HasError() && probe->RowCount() == 1 && !probe->Collection().GetValue(0, 0).IsNull()) {
+		return probe->Collection().GetValue(0, 0).ToString();
 	}
 	if (probe && !probe->HasError() && probe->RowCount() > 1) {
 		throw Exception(ExceptionType::CATALOG,
@@ -1354,8 +1398,8 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
 
 static string CurrentDatabase(Connection &con) {
 	auto res = con.Query("SELECT current_database()");
-	if (!res->HasError() && res->RowCount() > 0 && !res->GetValue(0, 0).IsNull()) {
-		return res->GetValue(0, 0).ToString();
+	if (!res->HasError() && res->RowCount() > 0 && !res->Collection().GetValue(0, 0).IsNull()) {
+		return res->Collection().GetValue(0, 0).ToString();
 	}
 	return "";
 }
@@ -1374,7 +1418,7 @@ ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connec
 		resolved.view_catalog_name = parts[0];
 		resolved.view_schema_name = parts[1];
 	} else if (parts.size() == 2) {
-		if (DatabaseManager::Get(context).GetDatabase(context, parts[0])) {
+		if (DatabaseManager::Get(context).GetDatabase(context, Identifier(parts[0]))) {
 			resolved.view_catalog_name = parts[0];
 			resolved.view_schema_name = DEFAULT_SCHEMA;
 		} else {
@@ -1396,8 +1440,8 @@ ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connec
 		                            SqlUtils::IdentifierEqualsSQL("table_name", Value(name).ToSQLString()));
 		if (!candidates->HasError()) {
 			for (idx_t row = 0; row < candidates->RowCount(); row++) {
-				auto catalog = candidates->GetValue(0, row).ToString();
-				auto schema = candidates->GetValue(1, row).ToString();
+				auto catalog = candidates->Collection().GetValue(0, row).ToString();
+				auto schema = candidates->Collection().GetValue(1, row).ToString();
 				RefreshMetadata::UseCatalog(context, con, catalog);
 				auto candidate = metadata.FindViewKey(catalog, schema, name);
 				if (candidate.empty()) {
@@ -1546,22 +1590,23 @@ openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &v
 			add_location(public_name, {public_location.catalog_name, public_location.schema_name});
 		}
 	}
-	Parser parser(con.context->GetParserOptions());
+	Parser parser(*con.context);
 	parser.ParseQuery(view_query_sql);
 	bool qualified = false;
 	openivm::TimeTravelPins pins;
 	con.context->RunFunctionInTransaction([&]() {
 		pins = openivm::TimeTravelPins::Peel(*con.context, *parser.statements.at(0), [&](BaseTableRef &ref) {
-			auto location = locations.find(ref.table_name);
-			if (location != locations.end() && ref.catalog_name.empty() && ref.schema_name.empty()) {
-				if (ambiguous_names.find(ref.table_name) != ambiguous_names.end()) {
+			auto location = locations.find(ref.Table().GetIdentifierName());
+			if (location != locations.end() && ref.GetQualifiedName().Catalog().GetIdentifierName().empty() &&
+			    ref.GetQualifiedName().Schema().GetIdentifierName().empty()) {
+				if (ambiguous_names.find(ref.Table().GetIdentifierName()) != ambiguous_names.end()) {
 					throw BinderException(
 					    "OpenIVM cannot recover the schema of legacy unqualified source '%s' in '%s'; "
 					    "CREATE OR REPLACE the materialized view with qualified source names",
-					    ref.table_name, view_name);
+					    ref.Table().GetIdentifierName(), view_name);
 				}
-				ref.catalog_name = location->second.catalog_name;
-				ref.schema_name = location->second.schema_name;
+				ref.SetQualifiedName(Identifier(location->second.catalog_name),
+				                     Identifier(location->second.schema_name), ref.Table());
 				qualified = true;
 			}
 		});

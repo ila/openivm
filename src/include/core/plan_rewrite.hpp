@@ -34,6 +34,7 @@ struct PlanRewriteNeeds {
 	bool derived_aggregates = false;
 	bool has_aggregate = false;
 	bool outer_join_support = false;
+	bool blocking_set_operation = false;
 	bool semi_anti_subqueries = false;
 	bool running_window_state = false;
 };
@@ -65,6 +66,12 @@ void FoldConstantScalarSubqueries(ClientContext &context, unique_ptr<LogicalOper
 /// that cannot match the plan are skipped without another preflight traversal.
 void PlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
                  vector<string> &planner_names, const PlanRewriteNeeds &needs);
+
+/// Expand materialized CTE references into independently renumbered plan copies.
+/// Join delta compilation needs one leaf per CTE occurrence so it can generate
+/// every inclusion-exclusion cross-term. This is also used after rebinding the
+/// compact CTE graph emitted by LPTS for a stored materialized-view definition.
+void InlineMaterializedCteRefs(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
 
 bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &plan, const CreateMVPlanFacts &facts,
                                 const vector<string> &output_names, string &sql);

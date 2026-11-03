@@ -8,3 +8,5 @@ duckdb_extension_load(openivm
 
 # Any extra extensions that should be built
 # e.g.: duckdb_extension_load(json)
+# DuckDB 2.0 builds extensions without linking them unless explicitly requested.
+duckdb_extension_statically_link(openivm)

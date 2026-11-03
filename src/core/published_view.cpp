@@ -19,9 +19,10 @@ bool IsSnapshotPublication(ClientContext &context, const string &catalog, const 
                            const string &view_name) {
 	bool snapshot_publication = false;
 	auto lookup = [&]() {
-		auto entry = Catalog::GetEntry(context, catalog, schema,
-		                               EntryLookupInfo(CatalogType::VIEW_ENTRY, PublishedViewName(view_name)),
-		                               OnEntryNotFound::RETURN_NULL);
+		auto entry = Catalog::GetEntry(
+		    context, Identifier(catalog), Identifier(schema),
+		    EntryLookupInfo(CatalogType::VIEW_ENTRY, QualifiedName(Identifier(PublishedViewName(view_name)))),
+		    OnEntryNotFound::RETURN_NULL);
 		snapshot_publication = entry && entry->type == CatalogType::VIEW_ENTRY;
 	};
 	if (context.transaction.HasActiveTransaction()) {
@@ -40,7 +41,8 @@ void WarnSnapshotHistoryDeletion(ClientContext &context, LogicalOperator &plan) 
 		return;
 	}
 	auto &get = plan.Cast<LogicalGet>();
-	if (get.function.name != "ducklake_expire_snapshots" && get.function.name != "ducklake_cleanup_old_files") {
+	if (get.function.GetName().GetIdentifierName() != "ducklake_expire_snapshots" &&
+	    get.function.GetName().GetIdentifierName() != "ducklake_cleanup_old_files") {
 		return;
 	}
 	auto dry_run = get.named_parameters.find("dry_run");
@@ -67,16 +69,18 @@ void WarnSnapshotHistoryDeletion(ClientContext &context, LogicalOperator &plan) 
 			                       views->GetError());
 		}
 		for (idx_t row = 0; row < views->RowCount(); row++) {
-			auto schema = views->GetValue(1, row).ToString();
-			auto internal_schema = views->GetValue(3, row).ToString();
-			if (IsSnapshotPublication(context, catalog, internal_schema, views->GetValue(0, row).ToString())) {
-				affected.push_back(SqlUtils::FullName(catalog, schema, views->GetValue(2, row).ToString()));
+			auto schema = views->Collection().GetValue(1, row).ToString();
+			auto internal_schema = views->Collection().GetValue(3, row).ToString();
+			if (IsSnapshotPublication(context, catalog, internal_schema,
+			                          views->Collection().GetValue(0, row).ToString())) {
+				affected.push_back(
+				    SqlUtils::FullName(catalog, schema, views->Collection().GetValue(2, row).ToString()));
 			}
 		}
 	}
 	if (!affected.empty()) {
 		Printer::Print(
-		    "Warning: " + get.function.name + " on " + SqlUtils::QuoteIdentifier(catalog) +
+		    "Warning: " + get.function.GetName().GetIdentifierName() + " on " + SqlUtils::QuoteIdentifier(catalog) +
 		    " may delete snapshot history required by OpenIVM materialized views: " + StringUtil::Join(affected, ", ") +
 		    ". Retain their pinned snapshots; deleting them can break reads. This operation is not blocked.");
 	}
@@ -91,11 +95,11 @@ string BuildSnapshotPublicationSQL(Connection &con, const string &catalog, const
 	auto snapshot =
 	    con.Query("SELECT COALESCE((SELECT id FROM " + quoted_catalog +
 	              ".last_committed_snapshot()), (SELECT id FROM " + quoted_catalog + ".current_snapshot()))");
-	if (snapshot->HasError() || snapshot->RowCount() != 1 || snapshot->GetValue(0, 0).IsNull()) {
+	if (snapshot->HasError() || snapshot->RowCount() != 1 || snapshot->Collection().GetValue(0, 0).IsNull()) {
 		throw CatalogException("Could not resolve committed snapshot for publication '%s'", published);
 	}
 	auto pinned = SqlUtils::ReplaceTableReferences(
-	    query, data_table, data_table + " AT (VERSION => " + snapshot->GetValue(0, 0).ToString() + ")");
+	    query, data_table, data_table + " AT (VERSION => " + snapshot->Collection().GetValue(0, 0).ToString() + ")");
 	if (pinned == query) {
 		throw InternalException("Snapshot publication query does not reference its maintenance table");
 	}

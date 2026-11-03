@@ -47,11 +47,11 @@ string SparkPortableRefreshSQL(string sql) {
 static void CopyOpenIvmSetting(ClientContext &from, ClientContext &to, const string &name) {
 	auto &db_config = DBConfig::GetConfig(to);
 	ExtensionOption option;
-	if (!db_config.TryGetExtensionOption(name, option) || !option.setting_index.IsValid()) {
+	if (!db_config.TryGetExtensionOption(Identifier(name), option) || !option.setting_index.IsValid()) {
 		return;
 	}
 	Value value;
-	if (from.TryGetCurrentSetting(name, value) && !value.IsNull()) {
+	if (from.TryGetCurrentSetting(Identifier(name), value) && !value.IsNull()) {
 		to.config.user_settings.SetUserSetting(option.setting_index.GetIndex(), value);
 	} else {
 		to.config.user_settings.ClearSetting(option.setting_index.GetIndex());
@@ -80,7 +80,7 @@ static string RenderStoredViewQueryForDialect(Connection &con, const string &vie
 	string rendered;
 	con.context->RunFunctionInTransaction([&]() {
 		auto &context = *con.context;
-		Parser parser(context.GetParserOptions());
+		Parser parser(context);
 		parser.ParseQuery(view_query_sql);
 		if (parser.statements.size() != 1) {
 			throw ParserException("Expected one stored view query, found %llu",
@@ -91,7 +91,8 @@ static string RenderStoredViewQueryForDialect(Connection &con, const string &vie
 		planner.CreatePlan(std::move(parser.statements[0]));
 		auto plan = std::move(planner.plan);
 		auto ast = LogicalPlanToAst(context, plan, dialect,
-		                            dialect == SqlDialect::DUCKDB ? SnapshotResolver() : time_travel_pins.Resolver());
+		                            dialect == SqlDialect::DUCKDB ? SnapshotResolver() : time_travel_pins.Resolver(),
+		                            CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
 		auto cte_list = AstToCteList(*ast, dialect);
 		rendered = cte_list->ToQuery(true, output_names);
 	});
@@ -384,11 +385,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	if (internal_catalog_prefix.empty() || internal_catalog_name == default_db || split_native_metadata) {
 		con.BeginTransaction();
 		delta_view_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
-		    planning_context, internal_catalog_name, internal_schema_name, SqlUtils::DeltaName(view_name),
-		    OnEntryNotFound::THROW_EXCEPTION, error_context);
+		    planning_context, Identifier(internal_catalog_name), Identifier(internal_schema_name),
+		    Identifier(SqlUtils::DeltaName(view_name)), OnEntryNotFound::THROW_EXCEPTION, error_context);
 		index_delta_view_catalog_entry = Catalog::GetEntry(
-		    planning_context, internal_catalog_name, internal_schema_name,
-		    EntryLookupInfo(CatalogType::INDEX_ENTRY, data_table_bare + openivm::INDEX_SUFFIX, error_context),
+		    planning_context, Identifier(internal_catalog_name), Identifier(internal_schema_name),
+		    EntryLookupInfo(CatalogType::INDEX_ENTRY,
+		                    QualifiedName(Identifier(data_table_bare + openivm::INDEX_SUFFIX)), error_context),
 		    OnEntryNotFound::RETURN_NULL);
 		con.Rollback();
 	}
@@ -431,27 +433,28 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                              "the native DuckLake executor");
 	}
 	if (!snapshot_publication && !publication->HasError() && publication->RowCount() &&
-	    !publication->GetValue(0, 0).IsNull()) {
+	    !publication->Collection().GetValue(0, 0).IsNull()) {
 		if (target_is_ducklake) {
 			publication_columns =
 			    metadata.GetTableColumns(internal_catalog_name, internal_schema_name, PublishedViewName(view_name));
 		} else {
-			auto &published_entry = Catalog::GetEntry<TableCatalogEntry>(
-			    context, internal_catalog_name, internal_schema_name, PublishedViewName(view_name));
+			auto &published_entry = Catalog::GetEntry<TableCatalogEntry>(context, Identifier(internal_catalog_name),
+			                                                             Identifier(internal_schema_name),
+			                                                             Identifier(PublishedViewName(view_name)));
 			for (auto &column : published_entry.GetColumns().Logical()) {
-				publication_columns.push_back(column.Name());
+				publication_columns.push_back(column.Name().GetIdentifierName());
 			}
 		}
-		publication_query = publication->GetValue(0, 0).ToString();
+		publication_query = publication->Collection().GetValue(0, 0).ToString();
 		publication_source_query = publication_query;
-		Parser publication_parser;
+		auto publication_parser = Parser::GetBuiltinParser();
 		publication_parser.ParseQuery(publication_query);
 		auto &node = publication_parser.statements[0]->Cast<SelectStatement>().node;
 		publication_has_filter =
 		    node->type != QueryNodeType::SELECT_NODE || bool(node->Cast<SelectNode>().where_clause);
 		for (auto &modifier : node->modifiers) {
 			global_publication |= modifier->type == ResultModifierType::LIMIT_MODIFIER ||
-			                      modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER ||
+
 			                      modifier->type == ResultModifierType::ORDER_MODIFIER;
 		}
 
@@ -549,7 +552,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		auto flag_result = con.Query("SELECT refresh_in_progress FROM " + string(openivm::VIEWS_TABLE) +
 		                             " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
 		bool interrupted = !flag_result->HasError() && flag_result->RowCount() > 0 &&
-		                   !flag_result->GetValue(0, 0).IsNull() && flag_result->GetValue(0, 0).GetValue<bool>();
+		                   !flag_result->Collection().GetValue(0, 0).IsNull() &&
+		                   flag_result->Collection().GetValue(0, 0).GetValue<bool>();
 		if (interrupted) {
 			Printer::Print("Warning: recovering '" + view_name + "' from interrupted refresh via full recompute.");
 		}
@@ -576,7 +580,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                  (source_has_full_outer && !full_outer_merge);
 	Value refresh_mode_val;
 	bool force_full_refresh = false;
-	if (context.TryGetCurrentSetting("openivm_refresh_mode", refresh_mode_val) && !refresh_mode_val.IsNull()) {
+	if (context.TryGetCurrentSetting(Identifier("openivm_refresh_mode"), refresh_mode_val) &&
+	    !refresh_mode_val.IsNull()) {
 		auto mode = StringUtil::Lower(refresh_mode_val.ToString());
 		if (mode == "full") {
 			force_full_refresh = true;
@@ -704,8 +709,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		// Global column enumeration binds every snapshot publication view. Read only
 		// this delta table and copy its schema while the catalog transaction is live.
 		con.context->RunFunctionInTransaction([&]() {
-			auto &entry = Catalog::GetEntry<TableCatalogEntry>(*con.context, internal_catalog_name,
-			                                                   internal_schema_name, SqlUtils::DeltaName(view_name));
+			auto &entry = Catalog::GetEntry<TableCatalogEntry>(*con.context, Identifier(internal_catalog_name),
+			                                                   Identifier(internal_schema_name),
+			                                                   Identifier(SqlUtils::DeltaName(view_name)));
 			read_delta_columns(entry);
 		});
 	}
@@ -1267,7 +1273,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                       "');";
 		OPENIVM_DEBUG_PRINT("[UPSERT] Planning ComputeDelta query: %s\n", compute_delta.c_str());
 		auto compute_delta_plan_start = profile_now();
-		Parser p;
+		auto p = Parser::GetBuiltinParser();
 		p.ParseQuery(compute_delta);
 
 		con.BeginTransaction();
@@ -1301,7 +1307,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				SqlDialect dialect = active_facts.target_dialect;
 				auto ast = LogicalPlanToAst(con_ctx, plan, dialect,
 				                            dialect == SqlDialect::DUCKDB ? SnapshotResolver()
-				                                                          : view_time_travel_pins.Resolver());
+				                                                          : view_time_travel_pins.Resolver(),
+				                            CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
 				if (ast->NodeType() == "Insert") {
 					auto &insert = static_cast<AstInsertNode &>(*ast);
 					if (StringUtil::CIEquals(insert.target_table, delta_view_name_bare)) {
@@ -1596,7 +1603,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		delete_retry_plan->fallback_program = build_program(fallback_upsert_query);
 	}
 	Value files_path_val;
-	if (write_query_file && context.TryGetCurrentSetting("openivm_files_path", files_path_val) &&
+	if (write_query_file && context.TryGetCurrentSetting(Identifier("openivm_files_path"), files_path_val) &&
 	    !files_path_val.IsNull()) {
 		string refresh_file_path = files_path_val.ToString() + "/openivm_upsert_queries_" + view_name + ".sql";
 		duckdb::SqlUtils::WriteFile(refresh_file_path, false, clean_query);

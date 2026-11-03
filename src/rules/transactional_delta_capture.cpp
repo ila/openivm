@@ -1,3 +1,4 @@
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "rules/transactional_delta_capture.hpp"
 
 #include "core/openivm_constants.hpp"
@@ -5,7 +6,7 @@
 #include "core/refresh_locks.hpp"
 #include "core/refresh_metadata.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
-#include "duckdb/planner/operator/logical_simple.hpp"
+#include "duckdb/planner/operator/logical_alter.hpp"
 #include "duckdb/execution/operator/schema/physical_create_table.hpp"
 #include "core/sql_utils.hpp"
 
@@ -119,18 +120,20 @@ static void EnterDeltaWritePhase(ClientContext &context) {
 class TransactionalDeltaAppendState {
 public:
 	TransactionalDeltaAppendState(ClientContext &context, const vector<unique_ptr<Expression>> &generated_expressions,
-	                              const vector<LogicalType> &delta_types)
-	    : generated_executor(context, generated_expressions) {
+	                              const vector<LogicalType> &delta_types) {
+		if (!generated_expressions.empty()) {
+			generated_executor = make_uniq<ExpressionExecutor>(context, generated_expressions);
+		}
 		vector<LogicalType> generated_types;
 		generated_types.reserve(generated_expressions.size());
 		for (auto &expression : generated_expressions) {
-			generated_types.push_back(expression->return_type);
+			generated_types.push_back(expression->GetReturnType());
 		}
 		generated_values.Initialize(Allocator::Get(context), generated_types);
 		delta_rows.Initialize(Allocator::Get(context), delta_types);
 	}
 
-	ExpressionExecutor generated_executor;
+	unique_ptr<ExpressionExecutor> generated_executor;
 	DataChunk generated_values;
 	DataChunk delta_rows;
 	TableAppendState local_append_state;
@@ -170,13 +173,14 @@ public:
 		delta_rows.Reset();
 		if (!generated_expressions.empty()) {
 			state.generated_values.Reset();
-			state.generated_executor.Execute(base_rows, state.generated_values);
+			state.generated_executor->Execute(base_rows, state.generated_values);
 		}
 		for (idx_t delta_index = 0; delta_index < delta_column_map.size(); delta_index++) {
 			if (delta_index == multiplicity_index.GetIndex()) {
-				delta_rows.data[delta_index].Reference(Value::INTEGER(multiplicity));
+				delta_rows.data[delta_index].Reference(Value::INTEGER(multiplicity), count_t(base_rows.size()));
 			} else if (delta_index == timestamp_index.GetIndex()) {
-				delta_rows.data[delta_index].Reference(Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
+				delta_rows.data[delta_index].Reference(Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()),
+				                                       count_t(base_rows.size()));
 			} else {
 				auto generated_index = generated_column_map[delta_index];
 				if (generated_index != DConstants::INVALID_INDEX) {
@@ -201,8 +205,9 @@ public:
 		}
 		auto &optimistic_collection = storage.GetOptimisticCollection(context, state.collection_index);
 		auto &collection = *optimistic_collection.collection;
-		if (collection.Append(delta_rows, state.local_append_state)) {
-			state.optimistic_writer->WriteNewRowGroup(optimistic_collection);
+		auto flushed = collection.Append(delta_rows, state.local_append_state);
+		if (flushed.IsValid()) {
+			state.optimistic_writer->WriteNewRowGroup(optimistic_collection, flushed.GetIndex());
 		}
 	}
 
@@ -214,24 +219,24 @@ public:
 		auto &storage = delta_table.GetStorage();
 		auto &optimistic_collection = storage.GetOptimisticCollection(context, state.collection_index);
 		auto &collection = *optimistic_collection.collection;
-		TransactionData transaction_data(0, 0);
+		auto transaction_data = TransactionData::Unversioned();
 		collection.FinalizeAppend(transaction_data, state.local_append_state);
 
 		lock_guard<mutex> guard(append_lock);
 		if (collection.GetTotalRows() < storage.GetRowGroupSize()) {
 			vector<unique_ptr<BoundConstraint>> no_constraints;
 			LocalAppendState append_state;
-			storage.InitializeLocalAppend(append_state, delta_table, context, no_constraints);
+			storage.InitializeLocalAppend(append_state, delta_table.Cast<DuckTableEntry>(), context, no_constraints);
 			auto &transaction = DuckTransaction::Get(context, delta_table.catalog);
 			for (auto &chunk : collection.Chunks(transaction)) {
-				storage.LocalAppend(append_state, context, chunk, false);
+				storage.LocalAppend(append_state, delta_table.Cast<DuckTableEntry>(), context, chunk, false);
 			}
 			storage.FinalizeLocalAppend(append_state);
 			return;
 		}
 		state.optimistic_writer->WriteUnflushedRowGroups(optimistic_collection);
 		state.optimistic_writer->FinalFlush();
-		storage.LocalMerge(context, optimistic_collection);
+		storage.LocalMerge(context, delta_table.Cast<DuckTableEntry>(), optimistic_collection);
 		storage.GetOptimisticWriter(context).Merge(*state.optimistic_writer);
 	}
 
@@ -248,7 +253,7 @@ private:
 		case_insensitive_map_t<idx_t> base_column_index;
 		idx_t base_index = 0;
 		for (auto &column : base_columns.Physical()) {
-			base_column_index[column.Name()] = base_index++;
+			base_column_index[column.Name().GetIdentifierName()] = base_index++;
 		}
 
 		idx_t generated_index = 0;
@@ -264,7 +269,7 @@ private:
 				timestamp_index = column.Physical().index;
 				continue;
 			}
-			auto entry = base_column_index.find(column.Name());
+			auto entry = base_column_index.find(column.Name().GetIdentifierName());
 			if (entry == base_column_index.end()) {
 				if (generated_index >= generated_expressions.size()) {
 					throw InternalException("OpenIVM could not bind generated delta column '%s'", column.Name());
@@ -348,7 +353,7 @@ static idx_t SelectUnseenRows(DataChunk &input, idx_t row_id_index, array<RowIdD
                               DataChunk &selected_input) {
 	auto &row_ids = input.data[row_id_index];
 	row_ids.Flatten(input.size());
-	auto row_id_data = FlatVector::GetData<row_t>(row_ids);
+	auto row_id_data = FlatVector::GetDataMutable<row_t>(row_ids);
 	for (auto &candidate_rows : candidates) {
 		candidate_rows.clear();
 	}
@@ -389,12 +394,14 @@ public:
 	                                    const vector<unique_ptr<Expression>> &generated_expressions,
 	                                    const vector<LogicalType> &delta_types, const vector<LogicalType> &base_types,
 	                                    const vector<LogicalType> &input_types, bool capture_existing_rows)
-	    : append_state(context.client, generated_expressions, delta_types),
-	      update_executor(context.client, update_expressions), selection(STANDARD_VECTOR_SIZE) {
+	    : append_state(context.client, generated_expressions, delta_types), selection(STANDARD_VECTOR_SIZE) {
+		if (!update_expressions.empty()) {
+			update_executor = make_uniq<ExpressionExecutor>(context.client, update_expressions);
+		}
 		vector<LogicalType> update_types;
 		update_types.reserve(update_expressions.size());
 		for (auto &expression : update_expressions) {
-			update_types.push_back(expression->return_type);
+			update_types.push_back(expression->GetReturnType());
 		}
 		update_values.Initialize(Allocator::Get(context.client), update_types);
 		if (!capture_existing_rows) {
@@ -406,7 +413,7 @@ public:
 	}
 
 	TransactionalDeltaAppendState append_state;
-	ExpressionExecutor update_executor;
+	unique_ptr<ExpressionExecutor> update_executor;
 	DataChunk update_values;
 	DataChunk selected_input;
 	DataChunk old_rows;
@@ -501,7 +508,7 @@ private:
 			return;
 		}
 		state.update_values.Reset();
-		state.update_executor.Execute(state.selected_input, state.update_values);
+		state.update_executor->Execute(state.selected_input, state.update_values);
 		state.new_rows.Reset();
 		for (idx_t column = 0; column < row_fetcher.Types().size(); column++) {
 			state.new_rows.data[column].Reference(state.old_rows.data[column]);
@@ -583,7 +590,7 @@ public:
 		}
 
 		if (!reserved_row_ids.empty()) {
-			auto fetch_data = FlatVector::GetData<row_t>(fetch_row_ids);
+			auto fetch_data = FlatVector::GetDataMutable<row_t>(fetch_row_ids);
 			for (idx_t index = 0; index < reserved_row_ids.size(); index++) {
 				fetch_data[index] = reserved_row_ids[index];
 			}
@@ -637,7 +644,7 @@ public:
 		DataChunk rows;
 		rows.Initialize(Allocator::Get(context), row_fetcher.Types());
 		ColumnFetchState fetch_state;
-		auto row_id_data = FlatVector::GetData<row_t>(row_ids);
+		auto row_id_data = FlatVector::GetDataMutable<row_t>(row_ids);
 		idx_t count = 0;
 		idx_t invisible_count = 0;
 		for (auto row_id : state.captured_row_ids) {
@@ -716,7 +723,7 @@ public:
 		vector<LogicalType> update_types;
 		update_types.reserve(update.expressions.size());
 		for (auto &expression : update.expressions) {
-			update_types.push_back(expression->return_type);
+			update_types.push_back(expression->GetReturnType());
 		}
 		update_values.Initialize(Allocator::Get(context.client), update_types);
 		pending_new_rows.Initialize(Allocator::Get(context.client), base_types);
@@ -755,9 +762,33 @@ public:
 		    action_op.type != PhysicalOperatorType::DELETE_OPERATOR) {
 			throw InternalException("OpenIVM cannot capture unsupported MERGE action operator %s", action_op.GetName());
 		}
-		if (capture_delete_insert_update) {
-			NormalizeUpdateDefaults(coordinator->ActionInputTypes());
+		// DuckDB 2.0 constructs each action's input pipeline before this wrapper
+		// is installed. Preserve that input, including the action projection.
+		for (auto &child : action_op.children) {
+			children.push_back(child);
 		}
+		if (capture_delete_insert_update) {
+			NormalizeUpdateDefaults(children[0].get().types);
+		}
+	}
+
+	bool IsSink() const override {
+		return action_op.IsSink();
+	}
+	bool ParallelSink() const override {
+		return action_op.ParallelSink();
+	}
+	bool SinkOrderDependent() const override {
+		return action_op.SinkOrderDependent();
+	}
+	bool IsSource() const override {
+		return action_op.IsSource();
+	}
+	bool ParallelSource() const override {
+		return action_op.ParallelSource();
+	}
+	OrderPreservationType SourceOrder() const override {
+		return action_op.SourceOrder();
 	}
 
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
@@ -766,7 +797,7 @@ public:
 	}
 
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override {
-		auto &capture_input_types = delegated_types.empty() ? coordinator->ActionInputTypes() : delegated_types;
+		auto &capture_input_types = delegated_types.empty() ? children[0].get().types : delegated_types;
 		return make_uniq<MergeActionDeltaCaptureLocalState>(
 		    context, action_op, *coordinator->Appender(), coordinator->RowFetcher().Types(), capture_input_types,
 		    delegated_types, capture_delete_insert_update, !default_update_indexes.empty());
@@ -867,8 +898,8 @@ private:
 		for (auto update_index : default_update_indexes) {
 			auto &expression = update.expressions[update_index];
 			const auto reference_index = delegated_types.size();
-			delegated_types.push_back(expression->return_type);
-			expression = make_uniq<BoundReferenceExpression>(expression->return_type, reference_index);
+			delegated_types.push_back(expression->GetReturnType());
+			expression = make_uniq<BoundReferenceExpression>(expression->GetReturnType(), reference_index);
 		}
 		delegated_types.push_back(input_types.back());
 	}
@@ -917,7 +948,7 @@ private:
 			auto &expression = *update.expressions[index];
 			D_ASSERT(expression.GetExpressionType() == ExpressionType::BOUND_REF);
 			auto &reference = expression.Cast<BoundReferenceExpression>();
-			lstate.update_values.data[index].Reference(lstate.selected_input.data[reference.index]);
+			lstate.update_values.data[index].Reference(lstate.selected_input.data[reference.Index()]);
 		}
 		for (idx_t column = 0; column < coordinator->RowFetcher().Types().size(); column++) {
 			lstate.pending_new_rows.data[column].Reference(lstate.preimage_rows.data[column]);
@@ -939,7 +970,7 @@ static vector<unique_ptr<Expression>> BindGeneratedExpressions(ClientContext &co
                                                                TableCatalogEntry &delta_table) {
 	case_insensitive_set_t physical_columns;
 	for (auto &column : base_table.GetColumns().Physical()) {
-		physical_columns.insert(column.Name());
+		physical_columns.insert(column.Name().GetIdentifierName());
 	}
 	vector<unique_ptr<Expression>> generated_expressions;
 	auto binder = Binder::CreateBinder(context);
@@ -947,7 +978,7 @@ static vector<unique_ptr<Expression>> BindGeneratedExpressions(ClientContext &co
 	CheckBinder generated_binder(*binder, context, base_table.name, base_table.GetColumns(), bound_columns);
 	for (auto &column : delta_table.GetColumns().Physical()) {
 		if (column.Name() == openivm::MULTIPLICITY_COL || column.Name() == openivm::TIMESTAMP_COL ||
-		    physical_columns.find(column.Name()) != physical_columns.end()) {
+		    physical_columns.find(column.Name().GetIdentifierName()) != physical_columns.end()) {
 			continue;
 		}
 		auto &base_column = base_table.GetColumns().GetColumn(column.Name());
@@ -999,9 +1030,12 @@ public:
 			                                                    BindGeneratedExpressions(context, *old_table, *delta));
 		}
 	}
-	void Prepare(ClientContext &context) const {
+	void Admit(ClientContext &context) const {
 		PrepareSourceLifecycle(context, catalog, schema, table,
 		                       delta ? SqlUtils::FullName(catalog, delta->schema.name, delta->name) : string());
+	}
+	void Prepare(ClientContext &context) const {
+		Admit(context);
 		if (!old_table || !delta) {
 			return;
 		}
@@ -1114,7 +1148,13 @@ void AdmitPlanMutations(ClientContext &context, PhysicalOperator &op) {
 			return;
 		}
 	}
-	if (dynamic_cast<PhysicalSourceLifecycle *>(&op) || dynamic_cast<PhysicalTransactionalDeltaCapture *>(&op) ||
+	if (auto source = dynamic_cast<PhysicalSourceLifecycle *>(&op)) {
+		// Untracked lifecycle DDL needs only source admission. Tracked sources and
+		// durable incarnation changes acquire the mutation gate conditionally.
+		source->Admit(context);
+		return;
+	}
+	if (dynamic_cast<PhysicalTransactionalDeltaCapture *>(&op) ||
 	    dynamic_cast<PhysicalMergeActionDeltaCapture *>(&op)) {
 		TransactionalMVLockState::Get(context).AcquireMutationLock();
 		return;
@@ -1139,14 +1179,15 @@ PhysicalOperator &LogicalSourceLifecycle::CreatePlan(ClientContext &context, Phy
 	if (children[0]->type == LogicalOperatorType::LOGICAL_ALTER) {
 		auto &source = *old_table;
 		auto &alter = planner.CreatePlan(*children[0]);
-		return planner.Make<PhysicalSourceLifecycle>(context, alter, nullptr, delta, ColumnList(),
-		                                             source.catalog.GetName(), source.schema.name, source.name);
+		return planner.Make<PhysicalSourceLifecycle>(
+		    context, alter, nullptr, delta, ColumnList(), source.catalog.GetName().GetIdentifierName(),
+		    source.schema.name.GetIdentifierName(), source.name.GetIdentifierName());
 	}
 	auto &op = children[0]->Cast<LogicalCreateTable>();
 	auto &base = op.info->Base();
-	auto catalog = op.schema.catalog.GetName();
-	auto schema = op.schema.name;
-	auto table = base.table;
+	auto catalog = op.schema.catalog.GetName().GetIdentifierName();
+	auto schema = op.schema.name.GetIdentifierName();
+	auto table = base.GetQualifiedName().Name().GetIdentifierName();
 	if (!delta) {
 		// Untracked CTAS retains DuckDB's native ordering/batch strategy. Its
 		// output marker only records admission and retires any FK incarnation.
