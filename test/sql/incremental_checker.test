@@ -156,6 +156,72 @@ SELECT count(*) FROM (
 statement ok
 SET TimeZone='UTC';
 
+# Full-refresh fallback must preserve a sort value that is absent from the output.
+statement ok
+SET TimeZone='Pacific/Kiritimati';
+
+statement ok
+CREATE TABLE t_hidden_order(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO t_hidden_order VALUES (1,10),(2,30),(3,20);
+
+statement ok
+CREATE VIEW expected_hidden_date_order AS
+    SELECT k FROM t_hidden_order GROUP BY k
+    ORDER BY CASE WHEN DATE_DIFF('day', (CURRENT_TIMESTAMP AT TIME ZONE 'Pacific/Honolulu')::DATE,
+                                 CURRENT_DATE)=0 THEN SUM(v) ELSE -SUM(v) END DESC, k LIMIT 2;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_hidden_date_order AS
+    SELECT k FROM t_hidden_order GROUP BY k
+    ORDER BY CASE WHEN DATE_DIFF('day', (CURRENT_TIMESTAMP AT TIME ZONE 'Pacific/Honolulu')::DATE,
+                                 CURRENT_DATE)=0 THEN SUM(v) ELSE -SUM(v) END DESC, k LIMIT 2;
+
+query I
+SELECT k FROM mv_hidden_date_order;
+----
+1
+3
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_hidden_date_order EXCEPT ALL SELECT * FROM expected_hidden_date_order)
+    UNION ALL
+    (SELECT * FROM expected_hidden_date_order EXCEPT ALL SELECT * FROM mv_hidden_date_order)
+);
+----
+0
+
+statement ok
+SET TimeZone='Pacific/Honolulu';
+
+statement ok
+UPDATE t_hidden_order SET v=45 WHERE k=1;
+DELETE FROM t_hidden_order WHERE k=2;
+INSERT INTO t_hidden_order VALUES (4,50);
+
+statement ok
+PRAGMA refresh('mv_hidden_date_order');
+
+query I
+SELECT k FROM mv_hidden_date_order;
+----
+4
+1
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_hidden_date_order EXCEPT ALL SELECT * FROM expected_hidden_date_order)
+    UNION ALL
+    (SELECT * FROM expected_hidden_date_order EXCEPT ALL SELECT * FROM mv_hidden_date_order)
+);
+----
+0
+
+statement ok
+SET TimeZone='UTC';
+
 statement ok
 CREATE MACRO nested_now() AS CURRENT_TIMESTAMP;
 

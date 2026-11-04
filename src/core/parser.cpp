@@ -968,6 +968,19 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	idx_t lineage_entry_count = view_model.LineageEntryCount();
 	string model_profile_detail = create_profile_enabled ? BuildDeltaViewModelProfileDetail(view_model) : string();
 	RefreshType refresh_type = view_model.type;
+	// A full-refresh fallback stores the user's ordered query, including LIMIT.
+	// Its hidden ORDER BY expressions are unavailable from that query's output.
+	// Rank the ordered result before materializing it so publication can preserve
+	// the final order without rebinding those expressions against the data table.
+	// DuckDB preserves order through the single subquery and empty OVER window;
+	// the persisted rank survives unordered table writes and refreshes.
+	bool stored_order_ordinal =
+	    refresh_type == RefreshType::FULL_REFRESH && lpts_fallback && !top_k_order_suffix.empty();
+	if (stored_order_ordinal) {
+		view_query = "SELECT *, ROW_NUMBER() OVER () AS " + string(openivm::PUBLISHED_ORDINAL_COL) + " FROM (" +
+		             view_query + ") openivm_ordered";
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Stored full-refresh order ordinal for %s\n", view_name.c_str());
+	}
 	auto aggregate_columns = std::move(view_model.group_columns);
 	auto aggregate_types = std::move(view_model.aggregate_types);
 	auto window_partition_columns = std::move(view_model.window_partition_columns);
@@ -1625,19 +1638,24 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		if (!internal_cols.empty()) {
 			published_query += " EXCLUDE (" + SqlUtils::JoinQuotedColumns(internal_cols) + ")";
 		}
-		published_query +=
-		    top_k_order_suffix.empty() ? ", CAST(0 AS BIGINT)" : ", ROW_NUMBER() OVER (" + top_k_order_suffix + ")";
+		if (!stored_order_ordinal) {
+			published_query +=
+			    top_k_order_suffix.empty() ? ", CAST(0 AS BIGINT)" : ", ROW_NUMBER() OVER (" + top_k_order_suffix + ")";
+		}
 		// Rank the selected rows, not every raw group before TOP_N. The ordinal
 		// describes order within the published relation, including after OFFSET.
 		// Without a bound, retain the direct form: an extra nested ORDER BY
 		// would sort the entire relation again without reducing window input.
 		bool rank_selected_rows = !stored_query_retains_top_k && !top_k_order_suffix.empty() &&
 		                          StringUtil::StartsWith(top_k_suffix.substr(top_k_order_suffix.size()), " LIMIT ");
-		string published_source = qdt + view_tail;
+		string published_source = qdt + (stored_order_ordinal ? "" : view_tail);
 		if (rank_selected_rows) {
 			published_source = "(SELECT * FROM " + published_source + ") openivm_selected";
 		}
-		published_query += " AS " + string(openivm::PUBLISHED_ORDINAL_COL) + " FROM " + published_source;
+		if (!stored_order_ordinal) {
+			published_query += " AS " + string(openivm::PUBLISHED_ORDINAL_COL);
+		}
+		published_query += " FROM " + published_source;
 		if (rank_selected_rows) {
 			// Also marks ordered publication as global for affected-key scoping.
 			published_query += " ORDER BY " + string(openivm::PUBLISHED_ORDINAL_COL);
