@@ -109,31 +109,17 @@ string SparkPortableRefreshSQL(string sql) {
 	return sql;
 }
 
-static void CopyOpenIvmSetting(ClientContext &from, ClientContext &to, const string &name) {
-	auto &db_config = DBConfig::GetConfig(to);
-	ExtensionOption option;
-	if (!db_config.TryGetExtensionOption(Identifier(name), option) || !option.setting_index.IsValid()) {
-		return;
-	}
-	Value value;
-	if (from.TryGetCurrentSetting(Identifier(name), value) && !value.IsNull()) {
-		to.config.user_settings.SetUserSetting(option.setting_index.GetIndex(), value);
-	} else {
-		to.config.user_settings.ClearSetting(option.setting_index.GetIndex());
-	}
-}
-
 void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext &to) {
 	// Per-call compile context (target dialect, compile_only, cascade hints) is
 	// carried by CompileFacts — see compile_facts.hpp. Only the remaining
-	// session-scoped planning settings still need to be mirrored onto the fresh
-	// planning connection.
+	// session-scoped planning settings and TimeZone (which can be folded into
+	// the plan) still need to be mirrored onto the fresh planning connection.
 	static const char *PLANNING_SETTINGS[] = {
 	    "openivm_adaptive_refresh", "openivm_cost_decay",    "openivm_skip_empty_deltas",  "openivm_fk_pruning",
-	    "openivm_ducklake_nterm",   "openivm_regular_nterm", "openivm_regular_nterm_left",
+	    "openivm_ducklake_nterm",   "openivm_regular_nterm", "openivm_regular_nterm_left", "TimeZone",
 	};
 	for (auto setting_name : PLANNING_SETTINGS) {
-		CopyOpenIvmSetting(from, to, setting_name);
+		SqlUtils::CopySessionSetting(from, to, setting_name);
 	}
 }
 

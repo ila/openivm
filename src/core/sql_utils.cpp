@@ -6,6 +6,7 @@
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/cte_node.hpp"
@@ -30,6 +31,20 @@
 #include <sstream>
 
 namespace duckdb {
+
+void SqlUtils::CopySessionSetting(ClientContext &from, ClientContext &to, const string &name) {
+	auto &db_config = DBConfig::GetConfig(to);
+	ExtensionOption option;
+	if (!db_config.TryGetExtensionOption(Identifier(name), option) || !option.setting_index.IsValid()) {
+		return;
+	}
+	Value value;
+	if (from.TryGetCurrentSetting(Identifier(name), value) && !value.IsNull()) {
+		to.config.user_settings.SetUserSetting(option.setting_index.GetIndex(), value);
+	} else {
+		to.config.user_settings.ClearSetting(option.setting_index.GetIndex());
+	}
+}
 
 // A `BaseTableRef` whose unqualified name matches a CTE visible at that point is a reference to
 // the CTE, not a scan of a same-named relation, so it must never be treated as an unpinned scan.

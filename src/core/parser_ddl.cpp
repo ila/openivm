@@ -427,6 +427,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	}
 	auto &db = DatabaseInstance::GetDatabase(context);
 	auto conn = make_uniq<Connection>(db);
+	SqlUtils::CopySessionSetting(context, *conn->context, "TimeZone");
 	auto &helper_lock_state = TransactionalMVLockState::Get(*conn->context);
 	helper_lock_state.SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 	MutationLockGuard mutation_guard(context);

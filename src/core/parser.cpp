@@ -547,25 +547,33 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback to original query: %s\n", view_query.c_str());
 			}
 		};
-		try {
-			// Compaction is optional and may throw after consuming or partially
-			// rewriting its input. Run it on a candidate copy so fallback always
-			// serializes the intact rewritten plan.
-			auto compacted_plan = select_plan->Copy(context);
-			compacted_plan = CompactCommonSubplans(context, *select_planner.binder, std::move(compacted_plan),
-			                                       CommonSubplanCompactionMode::SERIALIZATION_SIZE);
-			view_query = serialize_plan(compacted_plan);
-			if (!view_query.empty() && view_query.back() == ';') {
-				view_query.pop_back();
+		if (!has_query_dependent_binding) {
+			try {
+				// Compaction is optional and may throw after consuming or partially
+				// rewriting its input. Run it on a candidate copy so fallback always
+				// serializes the intact rewritten plan.
+				auto compacted_plan = select_plan->Copy(context);
+				compacted_plan = CompactCommonSubplans(context, *select_planner.binder, std::move(compacted_plan),
+				                                       CommonSubplanCompactionMode::SERIALIZATION_SIZE);
+				view_query = serialize_plan(compacted_plan);
+				if (!view_query.empty() && view_query.back() == ';') {
+					view_query.pop_back();
+				}
+				StringUtil::Trim(view_query);
+				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
+			} catch (std::exception &) {
+				// Common-subplan compaction is an optional size optimization. Some
+				// already-normalized OpenIVM plans cannot be represented by DuckDB's
+				// common-subplan optimizer, so retry the unchanged rewritten plan before
+				// falling back to the user's SQL.
+				serialize_original();
 			}
-			StringUtil::Trim(view_query);
-			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
-		} catch (std::exception &) {
-			// Common-subplan compaction is an optional size optimization. Some
-			// already-normalized OpenIVM plans cannot be represented by DuckDB's
-			// common-subplan optimizer, so retry the unchanged rewritten plan before
-			// falling back to the user's SQL.
-			serialize_original();
+		} else {
+			// DuckDB may fold CURRENT_DATE/CURRENT_TIMESTAMP during planning. The
+			// serialized plan would then freeze that value across full refreshes.
+			view_query = original_view_query;
+			lpts_fallback = true;
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Query-dependent binding keeps original SQL: %s\n", view_query.c_str());
 		}
 		if (PlanNeedsOriginalSqlForLpts(post_rewrite_facts)) {
 			view_query = original_view_query;

@@ -73,6 +73,89 @@ SELECT type FROM openivm_views WHERE view_sql_name = 'mv_nested_now';
 ----
 3
 
+# A changing SQL value function must survive CREATE-time plan serialization.
+# These time zones always have different local dates at the same instant.
+statement ok
+SET TimeZone='Pacific/Kiritimati';
+
+statement ok
+CREATE TABLE t_date AS SELECT * FROM t3;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_nested_date AS
+    SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) AS age_days FROM t_date;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'mv_nested_date';
+----
+3
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_nested_date EXCEPT ALL
+     SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) FROM t_date)
+    UNION ALL
+    (SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) FROM t_date EXCEPT ALL
+     SELECT * FROM mv_nested_date)
+);
+----
+0
+
+statement ok
+SET TimeZone='Pacific/Honolulu';
+
+statement ok
+CREATE MATERIALIZED VIEW mv_nested_date_west AS
+    SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) AS age_days FROM t_date;
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_nested_date_west EXCEPT ALL
+     SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) FROM t_date)
+    UNION ALL
+    (SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) FROM t_date EXCEPT ALL
+     SELECT * FROM mv_nested_date_west)
+);
+----
+0
+
+statement ok
+INSERT INTO t_date VALUES (4);
+
+statement ok
+PRAGMA refresh('mv_nested_date_west');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_nested_date_west EXCEPT ALL
+     SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) FROM t_date)
+    UNION ALL
+    (SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) FROM t_date EXCEPT ALL
+     SELECT * FROM mv_nested_date_west)
+);
+----
+0
+
+statement ok
+SET TimeZone='Pacific/Kiritimati';
+
+statement ok
+PRAGMA refresh('mv_nested_date');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_nested_date EXCEPT ALL
+     SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) FROM t_date)
+    UNION ALL
+    (SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) FROM t_date EXCEPT ALL
+     SELECT * FROM mv_nested_date)
+);
+----
+0
+
+statement ok
+SET TimeZone='UTC';
+
 statement ok
 CREATE MACRO nested_now() AS CURRENT_TIMESTAMP;
 

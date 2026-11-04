@@ -1322,6 +1322,48 @@ CREATE MATERIALIZED VIEW peg_bad_literal AS SELECT 'a'/* comment */'b' AS label;
 ----
 syntax error
 
+# The definition must not run a modifying CTE during initial materialization.
+statement error
+CREATE MATERIALIZED VIEW peg_delete_cte AS
+WITH gone AS (DELETE FROM peg_source WHERE k=1 RETURNING k) SELECT * FROM gone;
+----
+Materialized-view definitions cannot contain data-modifying or COPY CTEs
+
+statement error
+CREATE MATERIALIZED VIEW peg_update_cte AS
+WITH changed AS (UPDATE peg_source SET v=v+1 WHERE k=1 RETURNING k) SELECT * FROM changed;
+----
+Materialized-view definitions cannot contain data-modifying or COPY CTEs
+
+statement error
+CREATE MATERIALIZED VIEW peg_insert_cte AS
+WITH added AS (INSERT INTO peg_source VALUES (99,99) RETURNING k) SELECT * FROM added;
+----
+Materialized-view definitions cannot contain data-modifying or COPY CTEs
+
+statement error
+CREATE MATERIALIZED VIEW peg_copy_cte AS
+WITH written AS (COPY (SELECT * FROM peg_source) TO '{TEST_DIR}/peg_copy_cte.csv' (FORMAT CSV))
+SELECT * FROM written;
+----
+Materialized-view definitions cannot contain data-modifying or COPY CTEs
+
+query I
+SELECT count(*) FROM peg_source WHERE k=1;
+----
+3
+
+query I
+SELECT count(*) FROM peg_source WHERE k=99;
+----
+0
+
+query I
+SELECT count(*) FROM openivm_views
+WHERE view_sql_name IN ('peg_delete_cte', 'peg_update_cte', 'peg_insert_cte', 'peg_copy_cte');
+----
+0
+
 statement ok
 DROP VIEW "PEG.Schema"."MV.AS";
 DROP TABLE peg_source;

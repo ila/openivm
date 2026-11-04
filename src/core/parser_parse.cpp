@@ -50,6 +50,17 @@ static arena_ptr<TransformResultValue> TransformMaterializedView(PEGTransformer 
 		transformer.TransformOptional(list, 1, is_replace);
 		transformer.TransformOptional(list, 5, refresh_interval);
 		auto select = transformer.Transform<unique_ptr<SelectStatement>>(list.GetChild(7));
+		// A top-level side-effecting CTE executes when the initial data table is
+		// created, but DuckDB cannot bind it inside OpenIVM's refresh query. DuckDB
+		// rejects nested side-effecting CTEs itself. Reject this one before execution.
+		for (const auto &cte : select->node->cte_map.map) {
+			auto type = cte.second->query_node->type;
+			if (type == QueryNodeType::INSERT_QUERY_NODE || type == QueryNodeType::UPDATE_QUERY_NODE ||
+			    type == QueryNodeType::DELETE_QUERY_NODE || type == QueryNodeType::MERGE_QUERY_NODE ||
+			    type == QueryNodeType::COPY_QUERY_NODE) {
+				throw ParserException("Materialized-view definitions cannot contain data-modifying or COPY CTEs");
+			}
+		}
 		query = select->ToString();
 		auto info = make_uniq<CreateTableInfo>(target);
 		info->on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
