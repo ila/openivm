@@ -49,12 +49,16 @@ void DemoteOuterJoinsForMask(LogicalOperator *node, const vector<JoinLeafInfo> &
                              RefreshType refresh_type);
 
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf,
-                               const ColumnBinding &mul_binding);
+                               const ColumnBinding &mul_binding, idx_t original_leaf_width);
+
+void ShiftAncestorProjectionMap(const vector<LogicalOperator *> &ancestors, const vector<size_t> &leaf_path,
+                                size_t depth, idx_t insertion_idx, idx_t added);
 
 void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
                                                 const ColumnBinding &mul_binding, const char *context_label,
                                                 bool preserve_constant_sibling_child_outputs = false,
-                                                idx_t fallback_mul_idx = DConstants::INVALID_INDEX);
+                                                idx_t fallback_mul_idx = DConstants::INVALID_INDEX,
+                                                idx_t original_leaf_width = DConstants::INVALID_INDEX);
 
 // lhs * rhs, bound as DuckDB's multiplication operator.
 unique_ptr<Expression> MultiplyIntegers(Binder &binder, unique_ptr<Expression> lhs, unique_ptr<Expression> rhs);

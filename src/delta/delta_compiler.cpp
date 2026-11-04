@@ -13,7 +13,7 @@ namespace {
 static string CurrentCatalog(ClientContext &context) {
 	auto &sp = ClientData::Get(context).catalog_search_path;
 	auto def = sp->GetDefault();
-	return def.catalog;
+	return def.GetCatalog().GetIdentifierName();
 }
 
 } // namespace

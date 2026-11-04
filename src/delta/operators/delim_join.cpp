@@ -88,18 +88,18 @@ static bool IsSafeSemiAntiDelimJoin(LogicalOperator &op) {
 		return false;
 	}
 	auto &join = op.Cast<LogicalComparisonJoin>();
-	if (!IsSemiAntiJoinType(join.join_type) || join.conditions.empty() || join.predicate) {
+	if (!IsSemiAntiJoinType(join.join_type) || join.conditions.empty() || join.HasArbitraryConditions()) {
 		return false;
 	}
 	for (auto &condition : join.conditions) {
 		// This gate only selects the cheaper rewrite; rejecting equality retains the equivalent DELIM_JOIN fallback.
-		if (condition.comparison != ExpressionType::COMPARE_EQUAL && // mull-ignore: cxx_ne_to_eq
-		    condition.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+		if (condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL && // mull-ignore: cxx_ne_to_eq
+		    condition.GetComparisonType() != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 			return false;
 		}
 	}
 	for (auto &expr : join.duplicate_eliminated_columns) {
-		if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
+		if (!expr || expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 			return false;
 		}
 	}
@@ -135,7 +135,7 @@ static void AppendMultiplicityBindingsToJoinProjectionMaps(LogicalOperator &op, 
 						continue;
 					}
 					if (std::find(proj_map.begin(), proj_map.end(), binding_idx) == proj_map.end()) {
-						proj_map.push_back(binding_idx);
+						proj_map.push_back(ProjectionIndex(binding_idx));
 					}
 				}
 			}
@@ -166,25 +166,25 @@ static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, L
 	vector<unique_ptr<Expression>> exprs;
 	exprs.reserve(delim_join.duplicate_eliminated_columns.size());
 	for (auto &expr : delim_join.duplicate_eliminated_columns) {
-		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 			throw NotImplementedException("DELIM_JOIN duplicate-eliminated expression must be a column reference");
 		}
 		auto &col_ref = expr->Cast<BoundColumnRefExpression>();
 		idx_t source_ordinal = DConstants::INVALID_INDEX;
 		for (idx_t i = 0; i < source_bindings.size(); i++) {
-			if (source_bindings[i] == col_ref.binding) {
+			if (source_bindings[i] == col_ref.Binding()) {
 				source_ordinal = i;
 				break;
 			}
 		}
 		if (source_ordinal == DConstants::INVALID_INDEX) {
 			if (!allow_ordinal_fallback ||
-			    col_ref.binding.column_index >= copy_bindings.size()) { // mull-ignore: cxx_ge_to_gt
+			    col_ref.Binding().column_index >= copy_bindings.size()) { // mull-ignore: cxx_ge_to_gt
 				throw InternalException("DELIM_JOIN duplicate-eliminated binding not found in source child");
 			}
-			source_ordinal = col_ref.binding.column_index;
+			source_ordinal = col_ref.Binding().column_index;
 		}
-		exprs.push_back(make_uniq<BoundColumnRefExpression>(col_ref.return_type, copy_bindings[source_ordinal]));
+		exprs.push_back(make_uniq<BoundColumnRefExpression>(col_ref.GetReturnType(), copy_bindings[source_ordinal]));
 	}
 	if (exprs.empty()) {
 		throw NotImplementedException("DELIM_JOIN without duplicate-eliminated columns is not supported");
@@ -279,10 +279,10 @@ static ColumnBinding FindOutputBinding(const vector<ColumnBinding> &term_binding
 		if (!candidates.empty()) {
 			candidates += ", ";
 		}
-		candidates += to_string(binding.table_index) + ":" + to_string(binding.column_index);
+		candidates += to_string(binding.table_index.index) + ":" + to_string(binding.column_index);
 	}
 	throw InternalException("DeltaDelimJoin: original output binding %llu:%llu not found in rewritten term [%s]",
-	                        (idx_t)target.table_index, (idx_t)target.column_index, candidates.c_str());
+	                        target.table_index.index, (idx_t)target.column_index, candidates.c_str());
 }
 
 static bool ReplaceDelimGets(ClientContext &context, unique_ptr<LogicalOperator> &node,
@@ -433,7 +433,7 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 			auto &leaf_ref = GetNodeAtPath(term, leaves[i].path);
 			auto leaf_bindings = leaf_ref->GetColumnBindings();
 			DeltaGetResult delta_i = CreateDeltaGetNode(context, input.context.metadata_con, binder, leaves[i].get,
-			                                            input.context.view, &source_cache);
+			                                            input.context.view, &source_cache, true);
 			auto delta_bindings = delta_i.node->GetColumnBindings();
 			AddLeafBindingReplacements(leaf_bindings, delta_bindings, output_replacements, delta_i.mul_binding);
 			mul_bindings.push_back(delta_i.mul_binding);

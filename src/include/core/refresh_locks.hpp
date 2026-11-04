@@ -49,9 +49,9 @@ private:
 	};
 	void LockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication);
 	void UnlockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication,
-	                  transaction_t oldest_snapshot);
+	                  VisibilityBound oldest_snapshot);
 	void RecordSourceCommit(const string &source, idx_t catalog_oid, transaction_t commit_id);
-	bool HasSourceCommitAfter(const string &source, idx_t catalog_oid, transaction_t snapshot);
+	bool HasSourceCommitAfter(const string &source, idx_t catalog_oid, VisibilityBound snapshot);
 	mutex lock;
 	std::condition_variable condition;
 	const void *active_owner = nullptr;
@@ -102,7 +102,7 @@ public:
 	void MarkExecuted() {
 		executed = true;
 	}
-	bool HasCommitAfter(transaction_t snapshot);
+	bool HasCommitOutsideSnapshot(VisibilityBound snapshot);
 
 private:
 	shared_ptr<MutationGate> gate;
@@ -155,8 +155,8 @@ public:
 	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override;
 	// A prepared statement re-executes its cached plan without the optimizer rule that takes
 	// the gate for tracked DML; take it here, still before execution locks any table.
-	RebindQueryInfo OnExecutePrepared(ClientContext &context, PreparedStatementCallbackInfo &info,
-	                                  RebindQueryInfo current_rebind) override;
+	RebindQueryInfo OnRebindPreparedStatement(ClientContext &context, BindPreparedStatementCallbackInfo &info,
+	                                          RebindQueryInfo current_rebind) override;
 
 private:
 	void CleanupUnusedSourceDeltas(ClientContext &context, const vector<RefreshMetadata::DeltaSource> &sources,

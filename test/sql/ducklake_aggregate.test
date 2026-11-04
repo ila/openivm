@@ -7,7 +7,7 @@ require openivm
 require parquet
 
 statement ok
-INSTALL ducklake;
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository';
 
 statement ok
 LOAD ducklake;
@@ -1379,6 +1379,130 @@ SELECT COUNT(*) FROM (
     SELECT grp, SUM(amount) FROM dl.sum_null_state GROUP BY grp
     EXCEPT ALL
     SELECT grp, total FROM dl.sum_null_state_mv
+);
+----
+0
+
+# Nested FULL OUTER joins expose derived aliases that cannot be mapped to one
+# physical table by the single-join affected-group shortcut.
+statement ok
+CREATE TABLE dl.nested_foj_left (id INT, grp INT);
+
+statement ok
+CREATE TABLE dl.nested_foj_middle (id INT, grp INT);
+
+statement ok
+CREATE TABLE dl.nested_foj_right (id INT, grp INT);
+
+statement ok
+INSERT INTO dl.nested_foj_left VALUES (1, 10), (2, 20);
+
+statement ok
+INSERT INTO dl.nested_foj_middle VALUES (2, 20), (3, 30);
+
+statement ok
+INSERT INTO dl.nested_foj_right VALUES (3, 30), (4, 40);
+
+# The source query fits a deliberately small user limit, while its generated
+# staged lifecycle program does not. OpenIVM must scope its larger internal
+# allowance and restore the caller's setting after creation.
+statement ok
+SET max_expression_depth = 64;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.nested_foj_mv AS
+WITH left_middle AS (
+    SELECT COALESCE(l.id, m.id) AS joined_id,
+           COALESCE(l.grp, m.grp) AS joined_grp
+    FROM dl.nested_foj_left l
+    FULL OUTER JOIN dl.nested_foj_middle m ON l.id = m.id
+), all_sources AS (
+    SELECT COALESCE(lm.joined_id, r.id) AS joined_id,
+           COALESCE(lm.joined_grp, r.grp) AS joined_grp
+    FROM left_middle lm
+    FULL OUTER JOIN dl.nested_foj_right r ON lm.joined_id = r.id
+)
+SELECT joined_grp, COUNT(*) AS row_count
+FROM all_sources
+GROUP BY joined_grp;
+
+query I
+SELECT current_setting('max_expression_depth')::BIGINT;
+----
+64
+
+statement ok
+SET max_expression_depth = 1000;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'nested_foj_mv';
+----
+6
+
+# Batch conflicting changes across every side before one refresh.
+statement ok
+UPDATE dl.nested_foj_left SET grp = 21 WHERE id = 2;
+
+statement ok
+DELETE FROM dl.nested_foj_middle WHERE id = 3;
+
+statement ok
+INSERT INTO dl.nested_foj_middle VALUES (4, 41), (5, 50);
+
+statement ok
+UPDATE dl.nested_foj_right SET grp = 31 WHERE id = 3;
+
+statement ok
+INSERT INTO dl.nested_foj_right VALUES (5, 50), (6, 60);
+
+statement ok
+DELETE FROM dl.nested_foj_right WHERE id = 6;
+
+statement ok
+PRAGMA refresh('nested_foj_mv');
+
+query I
+WITH expected AS (
+    WITH left_middle AS (
+        SELECT COALESCE(l.id, m.id) AS joined_id,
+               COALESCE(l.grp, m.grp) AS joined_grp
+        FROM dl.nested_foj_left l
+        FULL OUTER JOIN dl.nested_foj_middle m ON l.id = m.id
+    ), all_sources AS (
+        SELECT COALESCE(lm.joined_id, r.id) AS joined_id,
+               COALESCE(lm.joined_grp, r.grp) AS joined_grp
+        FROM left_middle lm
+        FULL OUTER JOIN dl.nested_foj_right r ON lm.joined_id = r.id
+    )
+    SELECT joined_grp, COUNT(*) AS row_count FROM all_sources GROUP BY joined_grp
+)
+SELECT COUNT(*) FROM (
+    SELECT * FROM dl.nested_foj_mv
+    EXCEPT ALL
+    SELECT * FROM expected
+);
+----
+0
+
+query I
+WITH expected AS (
+    WITH left_middle AS (
+        SELECT COALESCE(l.id, m.id) AS joined_id,
+               COALESCE(l.grp, m.grp) AS joined_grp
+        FROM dl.nested_foj_left l
+        FULL OUTER JOIN dl.nested_foj_middle m ON l.id = m.id
+    ), all_sources AS (
+        SELECT COALESCE(lm.joined_id, r.id) AS joined_id,
+               COALESCE(lm.joined_grp, r.grp) AS joined_grp
+        FROM left_middle lm
+        FULL OUTER JOIN dl.nested_foj_right r ON lm.joined_id = r.id
+    )
+    SELECT joined_grp, COUNT(*) AS row_count FROM all_sources GROUP BY joined_grp
+)
+SELECT COUNT(*) FROM (
+    SELECT * FROM expected
+    EXCEPT ALL
+    SELECT * FROM dl.nested_foj_mv
 );
 ----
 0

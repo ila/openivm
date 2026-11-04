@@ -4787,3 +4787,69 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# Deep macro expansion exercises LPTS/OpenIVM expression rendering at 64 nested calls while a
+# conflicting DML batch is maintained incrementally.
+statement ok
+CREATE MACRO deep_agg_1(x) AS x + 1;
+
+statement ok
+CREATE MACRO deep_agg_2(x) AS deep_agg_1(deep_agg_1(x));
+
+statement ok
+CREATE MACRO deep_agg_3(x) AS deep_agg_2(deep_agg_2(x));
+
+statement ok
+CREATE MACRO deep_agg_4(x) AS deep_agg_3(deep_agg_3(x));
+
+statement ok
+CREATE MACRO deep_agg_5(x) AS deep_agg_4(deep_agg_4(x));
+
+statement ok
+CREATE MACRO deep_agg_6(x) AS deep_agg_5(deep_agg_5(x));
+
+statement ok
+CREATE MACRO deep_agg_7(x) AS deep_agg_6(deep_agg_6(x));
+
+statement ok
+CREATE TABLE deep_aggregate_source(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO deep_aggregate_source VALUES (1, 1), (1, 2), (2, 3);
+
+statement ok
+CREATE MATERIALIZED VIEW deep_aggregate_mv AS
+SELECT k, SUM(deep_agg_7(v)) AS total, COUNT(*) AS row_count
+FROM deep_aggregate_source
+GROUP BY k;
+
+# Batch INSERT + UPDATE + DELETE before one refresh.
+statement ok
+INSERT INTO deep_aggregate_source VALUES (1, 5), (3, 7);
+
+statement ok
+UPDATE deep_aggregate_source SET v = v + 10 WHERE k = 2;
+
+statement ok
+DELETE FROM deep_aggregate_source WHERE k = 1 AND v = 1;
+
+statement ok
+PRAGMA refresh('deep_aggregate_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT k, total, row_count FROM deep_aggregate_mv
+    EXCEPT ALL
+    SELECT k, SUM(deep_agg_7(v)), COUNT(*) FROM deep_aggregate_source GROUP BY k
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT k, SUM(deep_agg_7(v)), COUNT(*) FROM deep_aggregate_source GROUP BY k
+    EXCEPT ALL
+    SELECT k, total, row_count FROM deep_aggregate_mv
+);
+----
+0

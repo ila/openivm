@@ -54,7 +54,7 @@ namespace duckdb {
 static shared_ptr<RefreshDaemon> global_daemon;
 
 static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context, TableFunctionBindInput &input,
-                                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	string view_catalog_name = StringValue::Get(input.inputs[0]);
 	string view_schema_name = StringValue::Get(input.inputs[1]);
 	string view_name = StringValue::Get(input.inputs[2]);
@@ -72,7 +72,7 @@ static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context,
 	}
 	OPENIVM_DEBUG_PRINT("[ComputeDelta Bind] View: %s, Query: %s\n", view_name.c_str(), view_query.c_str());
 
-	Parser parser;
+	auto parser = Parser::GetBuiltinParser();
 	parser.ParseQuery(view_query);
 	duckdb::openivm::TimeTravelPins::Peel(context, *parser.statements[0]);
 	Planner planner(context);
@@ -304,6 +304,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		con.Query(sql);
 	}
 
+	RegisterMaterializedViewGrammar(instance);
 	auto materialized_view_parser = duckdb::MaterializedViewParserExtension();
 
 	auto incremental_rewrite_rule = duckdb::IncrementalRewriteRule();
@@ -377,7 +378,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    view_name = ResolveViewCatalogFromContext(context, con, view_name).view_name;
 		    RefreshMetadata(con).GetViewType(view_name);
 		    Value directory;
-		    bool enabled = context.TryGetCurrentSetting("openivm_files_path", directory) && !directory.IsNull();
+		    bool enabled =
+		        context.TryGetCurrentSetting(Identifier("openivm_files_path"), directory) && !directory.IsNull();
 		    auto &fs = FileSystem::GetFileSystem(context);
 		    auto cwd = FileSystem::GetWorkingDirectory();
 		    vector<string> rows;
@@ -428,11 +430,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    string last_refresh = "NULL";
 		    string next_refresh = "NULL";
 		    if (!last_update_result->HasError() && last_update_result->RowCount() > 0 &&
-		        !last_update_result->GetValue(0, 0).IsNull()) {
-			    last_refresh = "'" + last_update_result->GetValue(0, 0).ToString() + "'";
+		        !last_update_result->Collection().GetValue(0, 0).IsNull()) {
+			    last_refresh = "'" + last_update_result->Collection().GetValue(0, 0).ToString() + "'";
 			    if (interval > 0) {
-				    next_refresh = "'" + last_update_result->GetValue(0, 0).ToString() + "'::TIMESTAMP + INTERVAL '" +
-				                   to_string(interval) + " seconds'";
+				    next_refresh = "'" + last_update_result->Collection().GetValue(0, 0).ToString() +
+				                   "'::TIMESTAMP + INTERVAL '" + to_string(interval) + " seconds'";
 			    }
 		    }
 

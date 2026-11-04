@@ -44,7 +44,7 @@ static bool ExpressionHasHaving(ParsedExpression &expression) {
 	bool found = false;
 	ParsedExpressionIterator::VisitExpressionClassMutable(
 	    expression, ExpressionClass::SUBQUERY, [&](ParsedExpression &subquery) {
-		    found = found || HasHaving(*subquery.Cast<SubqueryExpression>().subquery->node);
+		    found = found || HasHaving(*subquery.Cast<SubqueryExpression>().Subquery()->node);
 	    });
 	return found;
 }
@@ -53,7 +53,7 @@ static bool ExpressionHasHaving(ParsedExpression &expression) {
 static bool HasHaving(QueryNode &node) {
 	bool found = node.type == QueryNodeType::SELECT_NODE && node.Cast<SelectNode>().having;
 	for (auto &cte : node.cte_map.map) {
-		found = found || HasHaving(*cte.second->query->node);
+		found = found || HasHaving(*cte.second->query_node);
 	}
 	if (node.type == QueryNodeType::SET_OPERATION_NODE) {
 		for (auto &child : node.Cast<SetOperationNode>().children) {
@@ -76,7 +76,7 @@ static bool HasHaving(QueryNode &node) {
 // Returns false when another HAVING remains, so the caller diffs the current view instead.
 static bool TryBuildGroupRecomputeAffectedQuery(const string &view_query_sql, string &affected_query_sql) {
 	affected_query_sql = view_query_sql;
-	Parser parser;
+	auto parser = Parser::GetBuiltinParser();
 	try {
 		parser.ParseQuery(view_query_sql);
 		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
@@ -86,7 +86,7 @@ static bool TryBuildGroupRecomputeAffectedQuery(const string &view_query_sql, st
 		bool relaxed = false;
 		auto &ctes = root.cte_map.map;
 		for (auto &cte : ctes) {
-			auto &body = *cte.second->query->node;
+			auto &body = *cte.second->query_node;
 			if (body.type != QueryNodeType::SELECT_NODE) {
 				continue;
 			}
@@ -96,10 +96,10 @@ static bool TryBuildGroupRecomputeAffectedQuery(const string &view_query_sql, st
 				continue;
 			}
 			auto &source = filter.from_table->Cast<BaseTableRef>();
-			auto aggregate = ctes.find(source.table_name);
-			if (!source.schema_name.empty() || aggregate == ctes.end() ||
-			    aggregate->second->query->node->type != QueryNodeType::SELECT_NODE ||
-			    aggregate->second->query->node->Cast<SelectNode>().groups.group_expressions.empty()) {
+			auto aggregate = ctes.find(source.Table());
+			if (!source.GetQualifiedName().Schema().GetIdentifierName().empty() || aggregate == ctes.end() ||
+			    aggregate->second->query_node->type != QueryNodeType::SELECT_NODE ||
+			    aggregate->second->query_node->Cast<SelectNode>().groups.group_expressions.empty()) {
 				continue;
 			}
 			filter.where_clause.reset();

@@ -20,8 +20,8 @@ DeltaPlanFragment CompileWindowDelta(DeltaOperatorInput input) {
 	plan_as_window->ResolveOperatorTypes();
 
 	OPENIVM_DEBUG_PRINT("[DeltaWindow] Done, mul_binding: table=%lu col=%lu\n",
-	                    (unsigned long)child_mul.mul_binding.table_index,
-	                    (unsigned long)child_mul.mul_binding.column_index);
+	                    (unsigned long)child_mul.mul_binding.table_index.index,
+	                    (unsigned long)child_mul.mul_binding.column_index.GetIndex());
 	return {std::move(plan_as_window), child_mul.mul_binding};
 }
 

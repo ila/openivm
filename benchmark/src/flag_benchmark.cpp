@@ -477,13 +477,13 @@ static bool RunOneConfig(const QueryDef &q, Workload wl, int delta_size, bool al
 		auto chk = con.Query("SELECT COUNT(*) FROM information_schema.tables WHERE table_catalog='dl' "
 		                     "AND LOWER(table_name)='warehouse'");
 		bool needs_init = !chk || chk->HasError() || chk->RowCount() == 0 ||
-		                  chk->GetValue(0, 0).GetValue<int64_t>() == 0;
+		                  chk->Collection().GetValue(0, 0).GetValue<int64_t>() == 0;
 		if (needs_init) {
 			con.Query("USE dl.main");
 			CreateTPCCSchema(con);
 			auto probe = con.Query("SELECT current_database()");
 			string native_cat = (probe && !probe->HasError() && probe->RowCount() > 0)
-			                        ? probe->GetValue(0, 0).ToString()
+			                        ? probe->Collection().GetValue(0, 0).ToString()
 			                        : "memory";
 			if (native_cat == "dl") native_cat = "memory";
 			for (const char *t : {"WAREHOUSE", "DISTRICT", "CUSTOMER", "ITEM", "STOCK", "OORDER", "NEW_ORDER",
@@ -573,7 +573,7 @@ static bool RunOneConfig(const QueryDef &q, Workload wl, int delta_size, bool al
 	string last_mv = q.refresh_mvs.back();
 	auto cnt = con.Query("SELECT COUNT(*) FROM " + last_mv);
 	if (cnt && !cnt->HasError() && cnt->RowCount() > 0) {
-		r.mv_rows = cnt->GetValue(0, 0).GetValue<int64_t>();
+		r.mv_rows = cnt->Collection().GetValue(0, 0).GetValue<int64_t>();
 	}
 
 	r.ok = 1;

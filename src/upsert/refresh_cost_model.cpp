@@ -32,10 +32,10 @@ namespace duckdb {
 /// Get the row count of a table by name, returns 0 if table doesn't exist.
 static double GetTableRowCount(Connection &con, const string &table_sql) {
 	auto result = con.Query("SELECT COUNT(*) FROM " + table_sql + ";");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	if (result->HasError() || result->RowCount() == 0 || result->Collection().GetValue(0, 0).IsNull()) {
 		return 0;
 	}
-	return result->GetValue(0, 0).GetValue<double>();
+	return result->Collection().GetValue(0, 0).GetValue<double>();
 }
 
 static const DeltaActivityResult::Source *
@@ -209,8 +209,10 @@ static bool ActiveSourceIsInsertOnlyPK(const PlanStats &stats, idx_t active_idx)
 				continue;
 			}
 			auto &fk = constraint->Cast<ForeignKeyConstraint>().info;
-			if (fk.type == ForeignKeyType::FK_TYPE_FOREIGN_KEY_TABLE && StringUtil::CIEquals(fk.table, active.name) &&
-			    (fk.schema.empty() || StringUtil::CIEquals(fk.schema, active.schema.name))) {
+			if (fk.type == ForeignKeyType::FK_TYPE_FOREIGN_KEY_TABLE &&
+			    StringUtil::CIEquals(fk.table.GetIdentifierName(), active.name.GetIdentifierName()) &&
+			    (fk.schema.empty() ||
+			     StringUtil::CIEquals(fk.schema.GetIdentifierName(), active.schema.name.GetIdentifierName()))) {
 				return true;
 			}
 		}
@@ -256,7 +258,7 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 		if (get.GetTable().get() != nullptr) {
 			TableStats ts;
 			ts.table = get.GetTable();
-			ts.table_name = get.GetTable()->name;
+			ts.table_name = get.GetTable()->name.GetIdentifierName();
 			ts.base_card = static_cast<double>(get.EstimateCardinality(context));
 			if (ts.base_card == 0) {
 				ts.base_card = 1;
@@ -265,14 +267,15 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 			// Actual (unfiltered) table row count — for filter selectivity estimation.
 			// base_card from EstimateCardinality may reflect pushed-down filters, so
 			// actual_card / base_card gives us the filter selectivity ratio.
-			auto catalog_name = get.GetTable()->ParentCatalog().GetName();
-			auto schema_name = get.GetTable()->schema.name;
+			auto catalog_name = get.GetTable()->ParentCatalog().GetName().GetIdentifierName();
+			auto schema_name = get.GetTable()->schema.name.GetIdentifierName();
 			ts.actual_card = GetTableRowCount(con, SqlUtils::FullName(catalog_name, schema_name, ts.table_name));
 			if (ts.actual_card == 0) {
 				ts.actual_card = 1;
 			}
 
-			bool ducklake_source = get.function.name == "ducklake_scan" && get.function.function_info;
+			bool ducklake_source =
+			    get.function.GetName().GetIdentifierName() == "ducklake_scan" && get.function.function_info;
 			ts.delta_table_name = ducklake_source ? ts.table_name : SqlUtils::DeltaName(ts.table_name);
 			// Repeated source names have qualified metadata keys. Resolve the key by
 			// physical identity before looking up its watermark or cached activity.
@@ -280,7 +283,7 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 			                     " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND " +
 			                     RefreshMetadata::SourcePredicate(ts.delta_table_name, catalog_name, schema_name));
 			if (!key->HasError() && key->RowCount() == 1) {
-				ts.delta_table_name = key->GetValue(0, 0).ToString();
+				ts.delta_table_name = key->Collection().GetValue(0, 0).ToString();
 			}
 			stats.all_ducklake = stats.all_ducklake && ducklake_source;
 			auto source =
@@ -731,7 +734,7 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 
 		double decay = 0.9;
 		Value decay_val;
-		if (context.TryGetCurrentSetting("openivm_cost_decay", decay_val) && !decay_val.IsNull()) {
+		if (context.TryGetCurrentSetting(Identifier("openivm_cost_decay"), decay_val) && !decay_val.IsNull()) {
 			decay = decay_val.GetValue<double>();
 			if (decay < 0.0 || decay > 1.0) {
 				decay = 0.9;
@@ -803,7 +806,7 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 
 RefreshCostEstimate EstimateViewRefreshCost(ClientContext &context, const string &view_query_sql,
                                             const string &view_name, const DeltaActivityResult &delta_activity) {
-	Parser parser;
+	auto parser = Parser::GetBuiltinParser();
 	parser.ParseQuery(view_query_sql);
 	if (parser.statements.empty()) {
 		throw ParserException("View '" + view_name + "' has an empty IVM metadata query");
@@ -870,7 +873,7 @@ vector<StrategyCostEstimate> EstimatePerQuery(ClientContext &context, const stri
 	(void)view_name;
 	(void)query_plan;
 	Value flag;
-	if (!context.TryGetCurrentSetting("openivm_enable_view_matching", flag) || flag.IsNull() ||
+	if (!context.TryGetCurrentSetting(Identifier("openivm_enable_view_matching"), flag) || flag.IsNull() ||
 	    !BooleanValue::Get(flag)) {
 		return {};
 	}

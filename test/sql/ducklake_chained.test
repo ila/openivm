@@ -7,7 +7,7 @@ require openivm
 require parquet
 
 statement ok
-INSTALL ducklake;
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository';
 
 statement ok
 LOAD ducklake;
@@ -1248,7 +1248,7 @@ SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_lo
 statement error
 PRAGMA refresh_pipeline(NULL);
 ----
-No function matches
+non-empty
 
 statement error
 PRAGMA refresh_pipeline(NULL::VARCHAR);
