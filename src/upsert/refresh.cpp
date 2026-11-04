@@ -25,6 +25,12 @@
 #include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/statement/merge_into_statement.hpp"
+#include "duckdb/parser/query_node/merge_query_node.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/comparison_expression.hpp"
+#include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/parser.hpp"
 #include <chrono>
 
@@ -38,6 +44,93 @@ static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadat
 // User-facing "schema.name" for error messages; view_key is the internal storage key.
 static string DisplayViewName(RefreshMetadata &metadata, const string &view_schema_name, const string &view_key) {
 	return (view_schema_name.empty() ? string("main") : view_schema_name) + "." + metadata.GetViewSQLName(view_key);
+}
+
+// A NULL-safe MERGE key prevents DuckDB from pushing its runtime key filter into
+// the DuckLake target scan. Once the delta has been built, an ordinary equality
+// is equivalent for any key that has no NULL in this refresh's source rows.
+static void FindMergeEqualityCandidates(unique_ptr<ParsedExpression> &condition,
+                                        vector<pair<string, unique_ptr<ParsedExpression> *>> &candidates) {
+	if (condition->GetExpressionClass() == ExpressionClass::CONJUNCTION &&
+	    condition->GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		for (auto &child : condition->Cast<ConjunctionExpression>().GetChildrenMutable()) {
+			FindMergeEqualityCandidates(child, candidates);
+		}
+		return;
+	}
+	if (condition->GetExpressionClass() != ExpressionClass::COMPARISON ||
+	    condition->GetExpressionType() != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+		return;
+	}
+	auto &comparison = condition->Cast<ComparisonExpression>();
+	if (comparison.Left().GetExpressionClass() != ExpressionClass::COLUMN_REF ||
+	    comparison.Right().GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+		return;
+	}
+	auto &left = comparison.Left().Cast<ColumnRefExpression>();
+	auto &right = comparison.Right().Cast<ColumnRefExpression>();
+	if (left.ColumnNames().size() != 2 || right.ColumnNames().size() != 2 ||
+	    !StringUtil::CIEquals(left.ColumnNames()[0].GetIdentifierName(), "v") ||
+	    !StringUtil::CIEquals(right.ColumnNames()[0].GetIdentifierName(), "d") ||
+	    !StringUtil::CIEquals(left.GetColumnName().GetIdentifierName(), right.GetColumnName().GetIdentifierName())) {
+		return;
+	}
+	candidates.emplace_back(right.GetColumnName().GetIdentifierName(), &condition);
+}
+
+static bool TryOptimizeDuckLakeMerge(Connection &con, const string &sql, string &optimized_sql) {
+	if (sql.find("refresh_cte") == string::npos) {
+		return false;
+	}
+	Parser parser(ParserOptions::Builtin());
+	parser.ParseQuery(sql);
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::MERGE_INTO_STATEMENT) {
+		return false;
+	}
+	auto &node = *parser.statements[0]->Cast<MergeIntoStatement>().node;
+	if (!node.source || node.source->type != TableReferenceType::BASE_TABLE || !node.join_condition) {
+		return false;
+	}
+	auto &source = node.source->Cast<BaseTableRef>();
+	if (!StringUtil::CIEquals(source.Table().GetIdentifierName(), "refresh_cte") || node.cte_map.map.empty()) {
+		return false;
+	}
+	vector<pair<string, unique_ptr<ParsedExpression> *>> candidates;
+	FindMergeEqualityCandidates(node.join_condition, candidates);
+	if (candidates.empty()) {
+		return false;
+	}
+	string probe = node.cte_map.ToString() + "SELECT ";
+	for (idx_t i = 0; i < candidates.size(); i++) {
+		if (i) {
+			probe += ", ";
+		}
+		probe += "bool_or(d." + SqlUtils::QuoteIdentifier(candidates[i].first) + " IS NULL)";
+	}
+	probe += " FROM " + source.ToString();
+	auto result = con.Query(probe);
+	if (result->HasError()) {
+		throw Exception(ExceptionType::EXECUTOR, "Could not inspect DuckLake MERGE delta keys: " + result->GetError());
+	}
+	if (result->RowCount() != 1 || result->ColumnCount() != candidates.size()) {
+		throw InternalException("DuckLake MERGE delta-key probe returned an invalid result");
+	}
+	for (idx_t i = 0; i < candidates.size(); i++) {
+		auto has_null = result->Collection().GetValue(i, 0);
+		if (has_null.IsNull() || has_null.GetValue<bool>()) {
+			continue;
+		}
+		auto &condition = *candidates[i].second;
+		auto &comparison = condition->Cast<ComparisonExpression>();
+		condition = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, comparison.Left().Copy(),
+		                                            comparison.Right().Copy());
+		optimized_sql = parser.statements[0]->ToString();
+		OPENIVM_DEBUG_PRINT("[REFRESH] DuckLake MERGE equality filter on delta key '%s'\n",
+		                    candidates[i].first.c_str());
+		return true;
+	}
+	OPENIVM_DEBUG_PRINT("[REFRESH] DuckLake MERGE retained NULL-safe keys; every candidate has a NULL delta\n");
+	return false;
 }
 
 // Another client committed a DuckLake source change while a refresh attempt read it. The
@@ -442,6 +535,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		bool retry_required = false;
 		int64_t expected_delete_count = -1;
 		int64_t actual_delete_count = -1;
+		string runtime_program_sql;
 		auto execute_program = [&](const string &program, const ProjectionDeleteRetryPlan *retry_plan) {
 			execution_started = true;
 			// Cross-catalog data statements outside a transaction commit individually.
@@ -457,8 +551,12 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 				}
 			}
 			bool fail_data_statement = !fail_data_point.empty();
+			// The probe and the MERGE must see the same delta snapshot. Only specialize
+			// DuckLake programs that already run in one data transaction.
+			bool optimize_ducklake_merge = tx_open && probe_meta.IsDuckLakeCatalog(view_catalog_name) &&
+			                               program.find("MERGE INTO") != string::npos;
 			bool split_program = profiler.Enabled() || (retry_plan && retry_plan->IsActive()) || lease.Active() ||
-			                     crash_after_view_delta || fail_data_statement;
+			                     crash_after_view_delta || fail_data_statement || optimize_ducklake_merge;
 			if (!split_program) {
 				executed_statement_count++;
 				return exec_con.Query(program);
@@ -467,12 +565,23 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			auto statements = SqlUtils::SplitSQLStatements(program);
 			executed_statement_count += statements.size();
 			unique_ptr<QueryResult> program_result;
+			bool specialized_merge = false;
 			for (idx_t stmt_idx = 0; stmt_idx < statements.size(); stmt_idx++) {
 				if (lease.Active()) {
 					if (stmt_idx == 1 && MetadataLocator::TestPoint(context, "lease_lost_mid_data")) {
 						lease.SimulateTakeover(true);
 					}
 					lease.Require(display_name);
+				}
+				if (optimize_ducklake_merge && statements[stmt_idx].find("MERGE INTO") != string::npos) {
+					auto probe_start = std::chrono::steady_clock::now();
+					string optimized_sql;
+					bool optimized = TryOptimizeDuckLakeMerge(exec_con, statements[stmt_idx], optimized_sql);
+					profiler.AddStep("ducklake_merge_key_probe", probe_start, optimized ? "equality" : "null_safe");
+					if (optimized) {
+						statements[stmt_idx] = std::move(optimized_sql);
+						specialized_merge = true;
+					}
 				}
 				auto stmt_start = std::chrono::steady_clock::now();
 				program_result = exec_con.Query(statements[stmt_idx]);
@@ -513,6 +622,13 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 						break;
 					}
 				}
+			}
+			if (specialized_merge) {
+				runtime_program_sql.clear();
+				for (auto &statement : statements) {
+					runtime_program_sql += statement + ";\n";
+				}
+				executed_program = &runtime_program_sql;
 			}
 			return program_result;
 		};
@@ -591,6 +707,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		if (archive_enabled && tx_open && !cross_system) {
 			// Same transaction as the refresh: the archive is visible exactly when the
 			// refresh commits, and an archive failure rolls the refresh back.
+			set_archived_program();
 			auto archive_start = std::chrono::steady_clock::now();
 			auto archive_error = WriteCompiledProgram(context, exec_con, archived, CompiledProgramOutcome::COMMITTED,
 			                                          archive_catalog, archive_schema);

@@ -1383,6 +1383,154 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# DuckLake MERGE may use an equality key only when the pending delta contains
+# no NULL for that key. A downstream MV keeps this refresh in one data transaction.
+statement ok
+SET openivm_archive_compiled_sql = true;
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+CREATE TABLE dl.merge_keys_src (id INT, customer_id INT, symbol VARCHAR, amount INT);
+
+statement ok
+INSERT INTO dl.merge_keys_src VALUES (1, 10, 'A', 2), (2, 20, 'B', 3);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.merge_keys_mv AS
+    SELECT customer_id, symbol, SUM(amount) AS total, COUNT(*) AS cnt
+    FROM dl.merge_keys_src GROUP BY customer_id, symbol;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.merge_keys_child AS SELECT SUM(total) AS total FROM dl.merge_keys_mv;
+
+# Non-NULL customer_id can be used as an ordinary equality join key.
+statement ok
+INSERT INTO dl.merge_keys_src VALUES (3, 10, 'A', 5), (4, 30, 'C', 7);
+
+statement ok
+UPDATE dl.merge_keys_src SET amount = 8 WHERE id = 2;
+
+statement ok
+DELETE FROM dl.merge_keys_src WHERE id = 4;
+
+statement ok
+PRAGMA refresh('merge_keys_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT customer_id, symbol, SUM(amount), COUNT(*) FROM dl.merge_keys_src GROUP BY customer_id, symbol
+        EXCEPT ALL SELECT customer_id, symbol, total, cnt FROM dl.merge_keys_mv)),
+       (SELECT COUNT(*) FROM (SELECT customer_id, symbol, total, cnt FROM dl.merge_keys_mv
+        EXCEPT ALL SELECT customer_id, symbol, SUM(amount), COUNT(*) FROM dl.merge_keys_src GROUP BY customer_id, symbol));
+----
+0	0
+
+query II
+SELECT COUNT(*) FILTER (WHERE contains(s.sql, 'v.customer_id = d.customer_id')),
+       COUNT(*) FILTER (WHERE contains(s.sql, 'v.customer_id IS NOT DISTINCT FROM d.customer_id'))
+FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING (view_name, operation, version)
+WHERE p.view_sql_name = 'merge_keys_mv' AND p.operation = 'refresh' AND p.version = 1
+  AND contains(s.sql, 'MERGE INTO');
+----
+1	0
+
+# A NULL customer_id can still use a non-NULL symbol equality key.
+statement ok
+INSERT INTO dl.merge_keys_src VALUES (5, NULL, 'N', 11), (6, NULL, 'N', 2);
+
+statement ok
+UPDATE dl.merge_keys_src SET amount = 12 WHERE id = 5;
+
+statement ok
+DELETE FROM dl.merge_keys_src WHERE id = 6;
+
+statement ok
+PRAGMA refresh('merge_keys_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT customer_id, symbol, SUM(amount), COUNT(*) FROM dl.merge_keys_src GROUP BY customer_id, symbol
+        EXCEPT ALL SELECT customer_id, symbol, total, cnt FROM dl.merge_keys_mv)),
+       (SELECT COUNT(*) FROM (SELECT customer_id, symbol, total, cnt FROM dl.merge_keys_mv
+        EXCEPT ALL SELECT customer_id, symbol, SUM(amount), COUNT(*) FROM dl.merge_keys_src GROUP BY customer_id, symbol));
+----
+0	0
+
+query II
+SELECT COUNT(*) FILTER (WHERE contains(s.sql, 'v.symbol = d.symbol')),
+       COUNT(*) FILTER (WHERE contains(s.sql, 'v.customer_id IS NOT DISTINCT FROM d.customer_id'))
+FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING (view_name, operation, version)
+WHERE p.view_sql_name = 'merge_keys_mv' AND p.operation = 'refresh' AND p.version = 2
+  AND contains(s.sql, 'MERGE INTO');
+----
+1	1
+
+# The same NULL customer_id group must match on a later batch through symbol.
+statement ok
+UPDATE dl.merge_keys_src SET amount = 14 WHERE id = 5;
+
+statement ok
+INSERT INTO dl.merge_keys_src VALUES (9, NULL, 'N', 3), (10, 40, 'D', 1);
+
+statement ok
+DELETE FROM dl.merge_keys_src WHERE id = 9;
+
+statement ok
+PRAGMA refresh('merge_keys_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT customer_id, symbol, SUM(amount), COUNT(*) FROM dl.merge_keys_src GROUP BY customer_id, symbol
+        EXCEPT ALL SELECT customer_id, symbol, total, cnt FROM dl.merge_keys_mv)),
+       (SELECT COUNT(*) FROM (SELECT customer_id, symbol, total, cnt FROM dl.merge_keys_mv
+        EXCEPT ALL SELECT customer_id, symbol, SUM(amount), COUNT(*) FROM dl.merge_keys_src GROUP BY customer_id, symbol));
+----
+0	0
+
+query I
+SELECT COUNT(*) FILTER (WHERE contains(s.sql, 'v.symbol = d.symbol'))
+FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING (view_name, operation, version)
+WHERE p.view_sql_name = 'merge_keys_mv' AND p.operation = 'refresh' AND p.version = 3
+  AND contains(s.sql, 'MERGE INTO');
+----
+1
+
+# When both group keys contain NULL, keep the original NULL-safe MERGE.
+statement ok
+INSERT INTO dl.merge_keys_src VALUES (7, NULL, NULL, 4), (8, NULL, NULL, 1);
+
+statement ok
+UPDATE dl.merge_keys_src SET amount = 5 WHERE id = 7;
+
+statement ok
+DELETE FROM dl.merge_keys_src WHERE id = 8;
+
+statement ok
+PRAGMA refresh('merge_keys_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT customer_id, symbol, SUM(amount), COUNT(*) FROM dl.merge_keys_src GROUP BY customer_id, symbol
+        EXCEPT ALL SELECT customer_id, symbol, total, cnt FROM dl.merge_keys_mv)),
+       (SELECT COUNT(*) FROM (SELECT customer_id, symbol, total, cnt FROM dl.merge_keys_mv
+        EXCEPT ALL SELECT customer_id, symbol, SUM(amount), COUNT(*) FROM dl.merge_keys_src GROUP BY customer_id, symbol));
+----
+0	0
+
+query II
+SELECT COUNT(*) FILTER (WHERE contains(s.sql, 'v.customer_id = d.customer_id') OR contains(s.sql, 'v.symbol = d.symbol')),
+       COUNT(*) FILTER (WHERE contains(s.sql, 'v.customer_id IS NOT DISTINCT FROM d.customer_id')
+                          AND contains(s.sql, 'v.symbol IS NOT DISTINCT FROM d.symbol'))
+FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING (view_name, operation, version)
+WHERE p.view_sql_name = 'merge_keys_mv' AND p.operation = 'refresh' AND p.version = 4
+  AND contains(s.sql, 'MERGE INTO');
+----
+0	1
+
+statement ok
+SET openivm_archive_compiled_sql = false;
+
+statement ok
+SET openivm_cascade_refresh = 'downstream';
+
 # Nested FULL OUTER joins expose derived aliases that cannot be mapped to one
 # physical table by the single-join affected-group shortcut.
 statement ok
