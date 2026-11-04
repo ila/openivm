@@ -427,7 +427,8 @@ void SqlUtils::WriteFile(const string &filename, bool append, const string &comp
 	try {
 		auto file = fs.OpenFile(filename, flags);
 		auto output = compiled_query + "\n";
-		if (fs.Write(*file, output.data(), output.size()) != static_cast<int64_t>(output.size())) {
+		auto output_bytes = NumericCast<int64_t>(output.size());
+		if (fs.Write(*file, output.data(), output_bytes) != output_bytes) {
 			throw IOException("short write");
 		}
 	} catch (const IOException &error) {
