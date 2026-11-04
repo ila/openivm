@@ -1607,10 +1607,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 
 	// User-facing VIEW hides internal openivm_* columns via EXCLUDE.
-	// If LPTS fell back to the original SQL, the data table has only the
-	// user-visible columns — no `openivm_*` columns even if the rewritten plan
-	// would have added them via AVG/STDDEV decomposition. Skip the EXCLUDE
-	// list in that case; otherwise CREATE VIEW fails on nonexistent columns.
+	// If LPTS fell back to the original SQL, the data table lacks the rewrite's
+	// hidden columns (for example AVG/STDDEV state). The stored order ordinal,
+	// when present, passes through publication and is hidden by the public view.
+	// Skip EXCLUDE here so CREATE VIEW does not name nonexistent rewrite columns.
 	add_profile_marker("create_mv_user_view");
 	{
 		// Collect internal column names from the LPTS output

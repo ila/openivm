@@ -156,6 +156,64 @@ SELECT count(*) FROM (
 statement ok
 SET TimeZone='UTC';
 
+# An ordered percentage limit is published over unlimited incremental state.
+statement ok
+CREATE TABLE t_percent(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO t_percent VALUES (1,10),(2,20),(3,30),(4,40);
+
+statement ok
+CREATE VIEW expected_percent AS
+    SELECT k FROM t_percent GROUP BY k ORDER BY SUM(v) DESC, k LIMIT 50 PERCENT;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_percent AS
+    SELECT k FROM t_percent GROUP BY k ORDER BY SUM(v) DESC, k LIMIT 50 PERCENT;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'mv_percent';
+----
+0
+
+query I
+SELECT k FROM mv_percent;
+----
+4
+3
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_percent EXCEPT ALL SELECT * FROM expected_percent)
+    UNION ALL
+    (SELECT * FROM expected_percent EXCEPT ALL SELECT * FROM mv_percent)
+);
+----
+0
+
+statement ok
+INSERT INTO t_percent VALUES (5,50),(6,60);
+DELETE FROM t_percent WHERE k=4;
+UPDATE t_percent SET v=70 WHERE k=2;
+
+statement ok
+PRAGMA refresh('mv_percent');
+
+query I
+SELECT k FROM mv_percent;
+----
+2
+6
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_percent EXCEPT ALL SELECT * FROM expected_percent)
+    UNION ALL
+    (SELECT * FROM expected_percent EXCEPT ALL SELECT * FROM mv_percent)
+);
+----
+0
+
 # Full-refresh fallback must preserve a sort value that is absent from the output.
 statement ok
 SET TimeZone='Pacific/Kiritimati';
@@ -178,8 +236,26 @@ CREATE MATERIALIZED VIEW mv_hidden_date_order AS
     ORDER BY CASE WHEN DATE_DIFF('day', (CURRENT_TIMESTAMP AT TIME ZONE 'Pacific/Honolulu')::DATE,
                                  CURRENT_DATE)=0 THEN SUM(v) ELSE -SUM(v) END DESC, k LIMIT 2;
 
+statement ok
+CREATE VIEW expected_hidden_date_percent AS
+    SELECT k FROM t_hidden_order GROUP BY k
+    ORDER BY CASE WHEN DATE_DIFF('day', (CURRENT_TIMESTAMP AT TIME ZONE 'Pacific/Honolulu')::DATE,
+                                 CURRENT_DATE)=0 THEN SUM(v) ELSE -SUM(v) END DESC, k LIMIT 67 PERCENT;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_hidden_date_percent AS
+    SELECT k FROM t_hidden_order GROUP BY k
+    ORDER BY CASE WHEN DATE_DIFF('day', (CURRENT_TIMESTAMP AT TIME ZONE 'Pacific/Honolulu')::DATE,
+                                 CURRENT_DATE)=0 THEN SUM(v) ELSE -SUM(v) END DESC, k LIMIT 67 PERCENT;
+
 query I
 SELECT k FROM mv_hidden_date_order;
+----
+1
+3
+
+query I
+SELECT k FROM mv_hidden_date_percent;
 ----
 1
 3
@@ -189,6 +265,15 @@ SELECT count(*) FROM (
     (SELECT * FROM mv_hidden_date_order EXCEPT ALL SELECT * FROM expected_hidden_date_order)
     UNION ALL
     (SELECT * FROM expected_hidden_date_order EXCEPT ALL SELECT * FROM mv_hidden_date_order)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_hidden_date_percent EXCEPT ALL SELECT * FROM expected_hidden_date_percent)
+    UNION ALL
+    (SELECT * FROM expected_hidden_date_percent EXCEPT ALL SELECT * FROM mv_hidden_date_percent)
 );
 ----
 0
@@ -204,8 +289,17 @@ INSERT INTO t_hidden_order VALUES (4,50);
 statement ok
 PRAGMA refresh('mv_hidden_date_order');
 
+statement ok
+PRAGMA refresh('mv_hidden_date_percent');
+
 query I
 SELECT k FROM mv_hidden_date_order;
+----
+4
+1
+
+query I
+SELECT k FROM mv_hidden_date_percent;
 ----
 4
 1
@@ -215,6 +309,15 @@ SELECT count(*) FROM (
     (SELECT * FROM mv_hidden_date_order EXCEPT ALL SELECT * FROM expected_hidden_date_order)
     UNION ALL
     (SELECT * FROM expected_hidden_date_order EXCEPT ALL SELECT * FROM mv_hidden_date_order)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_hidden_date_percent EXCEPT ALL SELECT * FROM expected_hidden_date_percent)
+    UNION ALL
+    (SELECT * FROM expected_hidden_date_percent EXCEPT ALL SELECT * FROM mv_hidden_date_percent)
 );
 ----
 0

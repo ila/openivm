@@ -244,6 +244,7 @@ void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string>
 	}
 	vector<BoundOrderByNode> *orders = nullptr;
 	idx_t limit = DConstants::INVALID_INDEX, offset = 0;
+	double limit_percentage = -1;
 	unique_ptr<LogicalOperator> *order_slot = nullptr;
 	if ((*slot)->type == LogicalOperatorType::LOGICAL_TOP_N) {
 		auto &top = (*slot)->Cast<LogicalTopN>();
@@ -252,12 +253,15 @@ void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string>
 		offset = top.offset;
 	} else if ((*slot)->type == LogicalOperatorType::LOGICAL_LIMIT) {
 		auto &top = (*slot)->Cast<LogicalLimit>();
-		if ((top.limit_val.Type() != LimitNodeType::UNSET && top.limit_val.Type() != LimitNodeType::CONSTANT_VALUE) ||
+		if ((top.limit_val.Type() != LimitNodeType::UNSET && top.limit_val.Type() != LimitNodeType::CONSTANT_VALUE &&
+		     top.limit_val.Type() != LimitNodeType::CONSTANT_PERCENTAGE) ||
 		    (top.offset_val.Type() != LimitNodeType::UNSET && top.offset_val.Type() != LimitNodeType::CONSTANT_VALUE)) {
 			return;
 		}
 		if (top.limit_val.Type() == LimitNodeType::CONSTANT_VALUE) {
 			limit = top.limit_val.GetConstantValue();
+		} else if (top.limit_val.Type() == LimitNodeType::CONSTANT_PERCENTAGE) {
+			limit_percentage = top.limit_val.GetConstantPercentage();
 		}
 		if (top.offset_val.Type() == LimitNodeType::CONSTANT_VALUE) {
 			offset = top.offset_val.GetConstantValue();
@@ -315,6 +319,8 @@ void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string>
 	suffix = ordering;
 	if (limit != DConstants::INVALID_INDEX) {
 		suffix += " LIMIT " + to_string(limit);
+	} else if (limit_percentage >= 0) {
+		suffix += " LIMIT " + Value::DOUBLE(limit_percentage).ToSQLString() + " PERCENT";
 	}
 	if (offset > 0) {
 		suffix += " OFFSET " + to_string(offset);
