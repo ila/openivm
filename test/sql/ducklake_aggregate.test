@@ -1384,7 +1384,7 @@ SELECT COUNT(*) FROM (
 0
 
 # DuckLake MERGE may use an equality key only when the pending delta contains
-# no NULL for that key. A downstream MV keeps this refresh in one data transaction.
+# no NULL for that key. The probe and MERGE share one data transaction.
 statement ok
 SET openivm_archive_compiled_sql = true;
 
@@ -1524,6 +1524,46 @@ WHERE p.view_sql_name = 'merge_keys_mv' AND p.operation = 'refresh' AND p.versio
   AND contains(s.sql, 'MERGE INTO');
 ----
 0	1
+
+# A standalone MV has the same optimization and snapshot guarantee.
+statement ok
+CREATE TABLE dl.standalone_merge_src (id INT, grp INT, amount INT);
+
+statement ok
+INSERT INTO dl.standalone_merge_src VALUES (1, 10, 2), (2, 20, 3);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.standalone_merge_mv AS
+    SELECT grp, SUM(amount) AS total, COUNT(*) AS cnt
+    FROM dl.standalone_merge_src GROUP BY grp;
+
+statement ok
+INSERT INTO dl.standalone_merge_src VALUES (3, 10, 5), (4, 30, 7);
+
+statement ok
+UPDATE dl.standalone_merge_src SET amount = 8 WHERE id = 2;
+
+statement ok
+DELETE FROM dl.standalone_merge_src WHERE id = 4;
+
+statement ok
+PRAGMA refresh('standalone_merge_mv');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT grp, SUM(amount), COUNT(*) FROM dl.standalone_merge_src GROUP BY grp
+        EXCEPT ALL SELECT grp, total, cnt FROM dl.standalone_merge_mv)),
+       (SELECT COUNT(*) FROM (SELECT grp, total, cnt FROM dl.standalone_merge_mv
+        EXCEPT ALL SELECT grp, SUM(amount), COUNT(*) FROM dl.standalone_merge_src GROUP BY grp));
+----
+0	0
+
+query I
+SELECT COUNT(*)
+FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING (view_name, operation, version)
+WHERE p.view_sql_name = 'standalone_merge_mv' AND p.operation = 'refresh'
+  AND contains(s.sql, 'MERGE INTO') AND contains(s.sql, 'v.grp = d.grp');
+----
+1
 
 statement ok
 SET openivm_archive_compiled_sql = false;

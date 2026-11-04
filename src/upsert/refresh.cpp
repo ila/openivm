@@ -408,8 +408,16 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		// committing a partly refreshed backing table that downstream DuckLake views would read.
 		// Downstream views that read delta_<mv> need it as well: rows committed for a change
 		// that never reached the backing table would be emitted again by the cascading recovery.
-		bool atomic_ducklake_data =
-		    cross_system && !split_native && (split_protocol || probe_meta.HasDownstreamViews(vn));
+		// The key probe and MERGE must observe the same pending delta. Grouped DuckLake
+		// views need a data transaction even when they have no downstream consumer.
+		bool ducklake_merge_candidate = false;
+		if (cross_system && !split_native && probe_meta.IsDuckLakeCatalog(view_catalog_name)) {
+			auto view_type = probe_meta.GetViewType(vn);
+			ducklake_merge_candidate =
+			    view_type == RefreshType::AGGREGATE_GROUP || view_type == RefreshType::AGGREGATE_HAVING;
+		}
+		bool atomic_ducklake_data = cross_system && !split_native &&
+		                            (split_protocol || ducklake_merge_candidate || probe_meta.HasDownstreamViews(vn));
 		// Source-delta cleanup outside the database the data transaction writes (or, for native
 		// data, outside the metadata catalog) is collected instead of inlined: one transaction
 		// cannot write two databases. Every data step that runs in a transaction collects it.
@@ -691,7 +699,6 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 
 		// Transactional DuckLake reads all happened before this point, so verify before
 		// committing anything; a changed source rolls this attempt back.
-		bool sources_verified = false;
 		// The DuckLake watermark per catalog: the pin, or the later snapshot through which the
 		// source check proved the sources unchanged.
 		auto watermark_snapshots = source_pins.snapshots;
@@ -702,7 +709,6 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		};
 		if (tx_open && !source_pins.sources.empty()) {
 			advance_watermarks(RequireUnchangedSources(context, source_pins, display_name));
-			sources_verified = true;
 		}
 		if (archive_enabled && tx_open && !cross_system) {
 			// Same transaction as the refresh: the archive is visible exactly when the
@@ -735,10 +741,10 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			MetadataLocator::FailPoint(context, "after_data_commit");
 		}
 		InjectConcurrentCommit(context, "concurrent_commit_after_data", attempt);
-		if (!sources_verified && !source_pins.sources.empty()) {
-			// DuckLake data statements committed one by one. Any source change since the pin
-			// may have been read by some of them, so the watermarks stay unwritten and the
-			// interruption marker set by meta_pre_sql makes the retry recompute the view.
+		if (!source_pins.sources.empty()) {
+			// Check again after the data commit. This catches source commits between the
+			// pre-commit check and watermark publication, and lets the watermark include
+			// this refresh's own DuckLake snapshot when the sources are unchanged.
 			advance_watermarks(RequireUnchangedSources(context, source_pins, display_name));
 		}
 		// Publication tables live in the MV's internal location.
