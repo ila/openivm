@@ -133,6 +133,6 @@ run any statement. See [refresh hooks](refresh_hooks.md).
 | `... does not exist in IVM metadata` right after `CREATE` | The statements were sent in one query string; see [batching statements](#batching-statements). |
 | A scheduled view stopped updating | Check that a process with the database open is still running, then `PRAGMA refresh_status('<view>')` for the effective interval and last refresh. |
 | A refresh is slower than recomputing | `PRAGMA refresh_cost('<view>')` compares the estimates; `SET openivm_profile_refresh = true` records per-step timings in `openivm_refresh_profile`. |
-| Unsure what a refresh runs | `SET openivm_files_path = '<dir>'` writes the compiled SQL; see [inspect the generated SQL](build/building.md#inspect-the-generated-sql). |
+| Unsure what a refresh runs | `SET openivm_archive_compiled_sql = true` records the executed SQL; see [archived compiled SQL](build/building.md#archived-compiled-sql). File output shows the pre-execution template. |
 
 For build and installation problems, see [building: troubleshooting](build/building.md#troubleshooting).

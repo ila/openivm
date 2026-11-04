@@ -200,6 +200,11 @@ that skips empty deltas may not compile a new file. Setting the path after CREAT
 does not retroactively create the setup files; do not replace an existing MV just
 to obtain an inspection file.
 
+For a transactional DuckLake aggregate refresh, OpenIVM may select a non-NULL
+MERGE key after the delta is built so DuckDB can filter the target scan. The
+refresh file contains the pre-execution SQL template. Enable the compiled SQL
+archive below to inspect the exact MERGE that ran.
+
 ### Archived compiled SQL
 
 Enable automatic archival before creating or refreshing a view:
