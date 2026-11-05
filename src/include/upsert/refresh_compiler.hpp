@@ -41,6 +41,7 @@ struct AggregateGroupsOptions {
 	vector<string> group_column_names;
 	string catalog_prefix;
 	bool insert_only = false;
+	bool use_ducklake_rowid_upsert = false;
 	vector<string> aggregate_types;
 	vector<LogicalType> column_types;
 	bool use_current_diff_affected_keys = false;

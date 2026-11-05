@@ -315,8 +315,12 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		// committing a partly refreshed backing table that downstream DuckLake views would read.
 		// Downstream views that read delta_<mv> need it as well: rows committed for a change
 		// that never reached the backing table would be emitted again by the cascading recovery.
-		bool atomic_ducklake_data =
-		    cross_system && !split_native && (split_protocol || probe_meta.HasDownstreamViews(vn));
+		// Grouped DuckLake views may stage rowids, then UPDATE and INSERT; those writes
+		// must commit together even when the view has no downstream dependents.
+		bool atomic_ducklake_data = cross_system && !split_native &&
+		                            (split_protocol || probe_meta.HasDownstreamViews(vn) ||
+		                             (probe_meta.IsDuckLakeCatalog(view_catalog_name) &&
+		                              probe_meta.GetViewType(vn) == RefreshType::AGGREGATE_GROUP));
 		// Source-delta cleanup outside the database the data transaction writes (or, for native
 		// data, outside the metadata catalog) is collected instead of inlined: one transaction
 		// cannot write two databases. Every data step that runs in a transaction collects it.

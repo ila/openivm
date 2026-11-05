@@ -901,6 +901,24 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 	                     SqlUtils::JoinQualifiedQuotedColumns(keys, "d") + ", " + insert_vals + ");\n";
 
 	string upsert_query = merge_query + "\n";
+	bool rowid_available = std::none_of(column_names.begin(), column_names.end(), [](const string &column) {
+		return StringUtil::CIEquals(column, "rowid") || StringUtil::CIEquals(column, "__openivm_target_rowid");
+	});
+	if (insert_only && options.use_ducklake_rowid_upsert && rowid_available && !has_match_count &&
+	    !(options.cascade_delta_specs && options.inline_cascade_delta)) {
+		// DuckLake MERGE scans the full target even for a small delta. Stage the
+		// matched rowids once, then let UPDATE and INSERT consume that small table.
+		string matched = SqlUtils::QuoteIdentifier("openivm_rowid_matches_" + view_name);
+		string target_rowid = SqlUtils::QuoteIdentifier("__openivm_target_rowid");
+		OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] staging DuckLake rowid upsert for '%s'\n", view_name.c_str());
+		upsert_query = "CREATE TEMP TABLE " + matched + " AS WITH refresh_cte AS (\n" + cte_body +
+		               ")\nSELECT d.*, v.rowid AS " + target_rowid + " FROM refresh_cte d LEFT JOIN " + data_table +
+		               " v ON " + on_clause + ";\n" + "UPDATE " + data_table + " v SET " + update_set + " FROM " +
+		               matched + " d WHERE v.rowid = d." + target_rowid + ";\n" + "INSERT INTO " + data_table + " (" +
+		               insert_cols + ") SELECT " + SqlUtils::JoinQualifiedQuotedColumns(keys, "d") + ", " +
+		               insert_vals + " FROM " + matched + " d WHERE d." + target_rowid + " IS NULL;\n" + "DROP TABLE " +
+		               matched + ";\n";
+	}
 	if (insert_only && options.cascade_delta_specs && options.inline_cascade_delta) {
 		// The inline companion emitted by refresh_sql.cpp is a compact aggregate-delta
 		// encoding (-1 NULL marker + positive delta). That is enough for downstream SUM/COUNT,

@@ -36,6 +36,15 @@ CREATE MATERIALIZED VIEW dl.sales_summary AS
     SELECT region, SUM(amount) AS total, COUNT(amount) AS cnt
     FROM dl.sales GROUP BY region;
 
+# The DuckLake insert-only aggregate path stages target rowids for UPDATE/INSERT.
+query I
+SELECT (COUNT(*) > 0)::INTEGER
+FROM openivm_compile_with_facts('dl.sales_summary',
+    '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}')
+WHERE contains(sql, 'openivm_rowid_matches_');
+----
+1
+
 query III
 SELECT region, total, cnt FROM dl.sales_summary ORDER BY region;
 ----
@@ -84,6 +93,52 @@ query I
 SELECT count(*) FROM (
     SELECT region, total, cnt FROM dl.sales_summary
     EXCEPT ALL SELECT region, SUM(amount) AS total, COUNT(amount) AS cnt FROM dl.sales GROUP BY region
+);
+----
+0
+
+# A new NULL key and an existing group share one insert-only refresh.
+statement ok
+INSERT INTO dl.sales VALUES (6, NULL, 5), (7, NULL, 7), (8, 'east', 3);
+
+statement ok
+PRAGMA refresh('sales_summary');
+
+query I
+SELECT count(*) FROM (
+    SELECT region, SUM(amount), COUNT(amount) FROM dl.sales GROUP BY region
+    EXCEPT ALL SELECT region, total, cnt FROM dl.sales_summary
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT region, total, cnt FROM dl.sales_summary
+    EXCEPT ALL SELECT region, SUM(amount), COUNT(amount) FROM dl.sales GROUP BY region
+);
+----
+0
+
+# Match that NULL group on the next refresh and insert another new group.
+statement ok
+INSERT INTO dl.sales VALUES (9, NULL, 11), (10, 'south', 13);
+
+statement ok
+PRAGMA refresh('sales_summary');
+
+query I
+SELECT count(*) FROM (
+    SELECT region, SUM(amount), COUNT(amount) FROM dl.sales GROUP BY region
+    EXCEPT ALL SELECT region, total, cnt FROM dl.sales_summary
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT region, total, cnt FROM dl.sales_summary
+    EXCEPT ALL SELECT region, SUM(amount), COUNT(amount) FROM dl.sales GROUP BY region
 );
 ----
 0
