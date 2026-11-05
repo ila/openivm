@@ -65,7 +65,19 @@ statement ok
 INSERT INTO dl.sales VALUES (4, 'east', 50);
 
 statement ok
+CREATE TEMP TABLE rowid_refresh_before AS SELECT id FROM dl.current_snapshot();
+
+statement ok
 PRAGMA refresh('sales_summary');
+
+# The staged UPDATE/INSERT commits as one DuckLake snapshot.
+query I
+SELECT id - (SELECT id FROM rowid_refresh_before) FROM dl.current_snapshot();
+----
+1
+
+statement ok
+DROP TABLE rowid_refresh_before;
 
 query I
 SELECT count(*) FROM (
