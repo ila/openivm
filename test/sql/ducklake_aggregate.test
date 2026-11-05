@@ -190,6 +190,84 @@ SELECT count(*) FROM (
 0
 
 # ==========================================
+# Rowid staging edge cases
+# ==========================================
+
+# Multiple nullable group keys must match one rowid each, including NULLs.
+statement ok
+CREATE TABLE dl.multi_key_sales (region VARCHAR, segment INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO dl.multi_key_sales VALUES ('east', 1, 10), ('east', NULL, 20), (NULL, 1, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.multi_key_sales_mv AS
+SELECT region, segment, SUM(amount) AS total, COUNT(*) AS cnt
+FROM dl.multi_key_sales GROUP BY region, segment;
+
+statement ok
+INSERT INTO dl.multi_key_sales VALUES ('east', 1, 2), ('east', NULL, 3), (NULL, 1, 4), (NULL, NULL, 5);
+
+statement ok
+PRAGMA refresh('multi_key_sales_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT region, segment, SUM(amount), COUNT(*) FROM dl.multi_key_sales GROUP BY region, segment
+    EXCEPT ALL SELECT region, segment, total, cnt FROM dl.multi_key_sales_mv
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT region, segment, total, cnt FROM dl.multi_key_sales_mv
+    EXCEPT ALL SELECT region, segment, SUM(amount), COUNT(*) FROM dl.multi_key_sales GROUP BY region, segment
+);
+----
+0
+
+# A physical rowid column hides DuckLake's virtual rowid and must use MERGE.
+statement ok
+CREATE TABLE dl.named_rowid_sales (rowid INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO dl.named_rowid_sales VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.named_rowid_sales_mv AS
+SELECT rowid, SUM(amount) AS total FROM dl.named_rowid_sales GROUP BY rowid;
+
+query I
+SELECT (COUNT(*) = 0)::INTEGER FROM openivm_compile_with_facts('dl.named_rowid_sales_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}')
+WHERE contains(sql, 'openivm_rowid_matches_');
+----
+1
+
+statement ok
+INSERT INTO dl.named_rowid_sales VALUES (1, 2), (2, 3);
+
+statement ok
+PRAGMA refresh('named_rowid_sales_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT rowid, SUM(amount) FROM dl.named_rowid_sales GROUP BY rowid
+    EXCEPT ALL SELECT rowid, total FROM dl.named_rowid_sales_mv
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT rowid, total FROM dl.named_rowid_sales_mv
+    EXCEPT ALL SELECT rowid, SUM(amount) FROM dl.named_rowid_sales GROUP BY rowid
+);
+----
+0
+
+# ==========================================
 # COUNT(*) ungrouped (simple/scalar aggregate)
 # ==========================================
 
