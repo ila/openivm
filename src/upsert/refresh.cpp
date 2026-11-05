@@ -317,7 +317,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		// that never reached the backing table would be emitted again by the cascading recovery.
 		// Grouped DuckLake views may stage rowids, then UPDATE and INSERT; those writes
 		// must commit together even when the view has no downstream dependents.
-		bool has_downstream = cross_system && !split_native && probe_meta.HasDownstreamViews(vn);
+		bool has_downstream = cross_system && !split_native && !split_protocol && probe_meta.HasDownstreamViews(vn);
 		bool standalone_ducklake_group = cross_system && !split_native && !split_protocol && !has_downstream &&
 		                                 probe_meta.IsDuckLakeCatalog(view_catalog_name) &&
 		                                 probe_meta.GetViewType(vn) == RefreshType::AGGREGATE_GROUP;
