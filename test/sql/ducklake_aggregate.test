@@ -227,6 +227,58 @@ SELECT count(*) FROM (
 ----
 0
 
+# Inserts into both sides of a join produce one grouped upsert per key.
+statement ok
+CREATE TABLE dl.rowid_join_left (k INTEGER, v INTEGER);
+
+statement ok
+CREATE TABLE dl.rowid_join_right (k INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO dl.rowid_join_left VALUES (1, 10);
+
+statement ok
+INSERT INTO dl.rowid_join_right VALUES (1, 2);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.rowid_join_mv AS
+SELECT l.k, SUM(l.v * r.w) AS total, COUNT(*) AS cnt
+FROM dl.rowid_join_left l JOIN dl.rowid_join_right r ON l.k = r.k GROUP BY l.k;
+
+query I
+SELECT (COUNT(*) > 0)::INTEGER FROM openivm_compile_with_facts('dl.rowid_join_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}')
+WHERE contains(sql, 'openivm_rowid_matches_');
+----
+1
+
+statement ok
+INSERT INTO dl.rowid_join_left VALUES (1, 3), (2, 4);
+
+statement ok
+INSERT INTO dl.rowid_join_right VALUES (1, 5), (2, 6);
+
+statement ok
+PRAGMA refresh('rowid_join_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT l.k, SUM(l.v * r.w), COUNT(*)
+    FROM dl.rowid_join_left l JOIN dl.rowid_join_right r ON l.k = r.k GROUP BY l.k
+    EXCEPT ALL SELECT k, total, cnt FROM dl.rowid_join_mv
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT k, total, cnt FROM dl.rowid_join_mv
+    EXCEPT ALL SELECT l.k, SUM(l.v * r.w), COUNT(*)
+    FROM dl.rowid_join_left l JOIN dl.rowid_join_right r ON l.k = r.k GROUP BY l.k
+);
+----
+0
+
 # A physical rowid column hides DuckLake's virtual rowid and must use MERGE.
 statement ok
 CREATE TABLE dl.named_rowid_sales (rowid INTEGER, amount INTEGER);
