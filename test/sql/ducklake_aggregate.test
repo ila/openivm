@@ -45,6 +45,15 @@ WHERE contains(sql, 'openivm_rowid_matches_');
 ----
 1
 
+# Compile-only output without an insert-only fact must not assume the rowid path.
+query I
+SELECT (COUNT(*) = 0)::INTEGER
+FROM openivm_compile_with_facts('dl.sales_summary',
+    '{"target_dialect":"duckdb","compile_only":true}')
+WHERE contains(sql, 'openivm_rowid_matches_');
+----
+1
+
 query III
 SELECT region, total, cnt FROM dl.sales_summary ORDER BY region;
 ----

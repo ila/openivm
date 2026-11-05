@@ -876,7 +876,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		options.group_column_names = group_cols;
 		options.catalog_prefix = internal_catalog_prefix;
 		options.insert_only = aggregate_insert_only_flag;
-		options.use_ducklake_rowid_upsert = target_is_ducklake && !source_has_full_outer &&
+		options.use_ducklake_rowid_upsert = target_is_ducklake && insert_only && !source_has_full_outer &&
 		                                    dispatch_refresh_type == RefreshType::AGGREGATE_GROUP &&
 		                                    active_facts.target_dialect == SqlDialect::DUCKDB;
 		options.aggregate_types = agg_types;
