@@ -605,7 +605,9 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		}
 	}
 	bool use_data_modifying_ctes = false;
-	if (!cross_system) {
+	// DuckDB's data-modifying CTEs cannot be replayed by Spark. The compile bridge
+	// can target Spark even when its temporary catalog is native DuckDB.
+	if (!cross_system && openivm::CompileFactsContextSlot::Get(*con.context).target_dialect == SqlDialect::DUCKDB) {
 		con.context->RunFunctionInTransaction([&]() {
 			use_data_modifying_ctes =
 			    Catalog::GetCatalog(*con.context, Identifier(view_catalog_name)).SupportsMultipleDMLCTEs();
