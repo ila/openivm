@@ -590,7 +590,7 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
 		coalesce_expr->GetChildrenMutable().push_back(
 		    make_uniq<BoundColumnRefExpression>(count_type, base_count_binding));
 		coalesce_expr->GetChildrenMutable().push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(0)));
-		return coalesce_expr;
+		return std::move(coalesce_expr);
 	};
 	auto mul_as_count_type = BoundCastExpression::AddCastToType(
 	    context, make_uniq<BoundColumnRefExpression>(mul_type, delta_mul_binding), count_type);
