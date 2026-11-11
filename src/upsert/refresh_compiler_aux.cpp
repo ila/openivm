@@ -750,8 +750,8 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 	sql += "CREATE OR REPLACE TEMP TABLE " + result_table + " AS " + suffix_query + ";\n";
 	sql += "INSERT INTO " + data_table + " (" + insert_cols + ") SELECT * FROM " + result_table + ";\n";
 	if (emit_cascade_delta) {
-		sql += "INSERT INTO " + delta_table + " SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM " + result_table +
-		       ";\n";
+		sql += "INSERT INTO " + delta_table + " SELECT *, CAST(1 AS INTEGER), " + string(openivm::UTC_NOW_SQL) +
+		       " FROM " + result_table + ";\n";
 	}
 	for (auto &table :
 	     {result_table, suffix_table, state_table, fallback_table, fast_table, bounds_table, affected_table}) {

@@ -133,6 +133,11 @@ if(NOT EMSCRIPTEN)
       duckdb_static ${EXTENSION_NAME} core_functions_extension
       parquet_extension duckdb_static)
 
+  # The generated loader references every statically linked extension.
+  if(DUCKDB_EXTENSION_ICU_SHOULD_LINK)
+    list(APPEND OPENIVM_LINK_LIBS icu_extension)
+  endif()
+
   if(DUCKDB_EXTENSION_JEMALLOC_SHOULD_LINK)
     list(APPEND OPENIVM_LINK_LIBS jemalloc_extension)
   endif()

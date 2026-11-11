@@ -6,6 +6,11 @@ duckdb_extension_load(openivm
     LOAD_TESTS
 )
 
+# ICU is linked into the test binary so `require icu` time zone tests
+# (refresh_timezone*.test) run in CI instead of being silently skipped.
+duckdb_extension_load(icu)
+duckdb_extension_statically_link(icu)
+
 # DuckLake tests install from this build's repository, including in CI where
 # no previously installed extension is available. Only vcpkg-enabled builds
 # have DuckLake's roaring dependency; the PostgreSQL and tidy jobs do not.

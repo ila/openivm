@@ -104,6 +104,8 @@ string SparkPortableRefreshSQL(string sql) {
 	}
 	sql = std::regex_replace(sql, quoted_cast_regex, "CAST($1 AS $2)");
 	sql = std::regex_replace(sql, bigint_cast_regex, "CAST($1 AS BIGINT)");
+	// UTC_NOW_SQL is DuckDB-only (epoch_us); Spark's current_timestamp() is already an absolute instant.
+	sql = SqlUtils::ReplaceAllOccurrences(sql, openivm::UTC_NOW_SQL, "current_timestamp()");
 	sql = std::regex_replace(sql, now_regex, "current_timestamp()");
 	sql = std::regex_replace(sql, null_safe_regex, " <=> ");
 	return sql;
@@ -1452,7 +1454,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	string transient_delta_name;
 	bool inline_mv_delta = false;
 	if (use_transient_mv_delta) {
-		string inline_relation = "(SELECT openivm_inline_delta.*, CAST(current_timestamp AS TIMESTAMP) AS " +
+		string inline_relation = "(SELECT openivm_inline_delta.*, " + string(openivm::UTC_NOW_SQL) + " AS " +
 		                         SqlUtils::QuoteIdentifier(string(openivm::TIMESTAMP_COL)) + " FROM (" +
 		                         inline_delta_select_query + ") openivm_inline_delta)";
 		auto inline_variants = SqlUtils::ReplaceEachPlainOccurrence(upsert_query, delta_view_name, inline_relation);
@@ -1482,8 +1484,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			if (!column_names.empty()) {
 				transient_delta_preamble += ", ";
 			}
-			transient_delta_preamble +=
-			    SqlUtils::QuoteIdentifier(string(openivm::TIMESTAMP_COL)) + " TIMESTAMP DEFAULT current_timestamp);\n";
+			transient_delta_preamble += SqlUtils::QuoteIdentifier(string(openivm::TIMESTAMP_COL)) +
+			                            " TIMESTAMP DEFAULT " + string(openivm::UTC_NOW_SQL) + ");\n";
 			for (auto sql : {&delta_query, &companion_query, &upsert_query, &fallback_upsert_query, &post_companion}) {
 				*sql = StringUtil::Replace(*sql, delta_view_name, transient_delta_name);
 			}

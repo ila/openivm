@@ -747,7 +747,7 @@ query II
 SELECT count(*) FILTER (WHERE starts_with(s.sql, '--') OR starts_with(s.sql, 'openivm_')),
        count(*) FILTER (WHERE starts_with(s.sql, 'create table if not exists ')
            AND contains(s.sql, 'openivm_delta_')
-           AND ends_with(s.sql, 'openivm_multiplicity INTEGER DEFAULT 1, openivm_timestamp TIMESTAMP DEFAULT now())'))
+           AND ends_with(s.sql, 'openivm_multiplicity INTEGER DEFAULT 1, openivm_timestamp TIMESTAMP DEFAULT make_timestamp(epoch_us(now())))'))
 FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING (view_name, operation, version)
 WHERE p.view_sql_name = 'mv_arch_lake' AND p.operation = 'create';
 ----
@@ -878,7 +878,7 @@ query II
 SELECT count(*) FILTER (WHERE starts_with(s.sql, '--') OR starts_with(s.sql, 'openivm_')),
        count(*) FILTER (WHERE starts_with(s.sql, 'create or replace table ')
            AND contains(s.sql, 'openivm_delta_')
-           AND ends_with(s.sql, 'openivm_multiplicity INTEGER DEFAULT 1, openivm_timestamp TIMESTAMP DEFAULT now())'))
+           AND ends_with(s.sql, 'openivm_multiplicity INTEGER DEFAULT 1, openivm_timestamp TIMESTAMP DEFAULT make_timestamp(epoch_us(now())))'))
 FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING (view_name, operation, version)
 WHERE p.view_sql_name = 'mv_arch_lake' AND p.operation = 'create' AND p.version = 2;
 ----

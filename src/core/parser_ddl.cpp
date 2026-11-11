@@ -370,7 +370,7 @@ static DeltaSchemaDDL BuildDeltaSchemaDDL(const vector<pair<string, string>> &so
 		columns.push_back(SqlUtils::QuoteIdentifier(column_name) + " " + column_type);
 	}
 	columns.push_back(string(openivm::MULTIPLICITY_COL) + " INTEGER DEFAULT 1");
-	columns.push_back(string(openivm::TIMESTAMP_COL) + " TIMESTAMP DEFAULT now()");
+	columns.push_back(string(openivm::TIMESTAMP_COL) + " TIMESTAMP DEFAULT " + string(openivm::UTC_NOW_SQL));
 	DeltaSchemaDDL result;
 	result.sql = string(on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT  ? "create or replace table "
 	                    : on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT ? "create table if not exists "

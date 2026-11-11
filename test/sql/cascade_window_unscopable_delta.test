@@ -250,9 +250,9 @@ SELECT * FROM openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_;
 
 statement ok
 INSERT INTO openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_
-SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_
+SELECT *, CAST(-1 AS INTEGER), make_timestamp(epoch_us(now())) FROM openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_
 UNION ALL
-SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_;
+SELECT *, CAST(1 AS INTEGER), make_timestamp(epoch_us(now())) FROM openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_;
 
 # The compiled program now also publishes the visible boundary consumed by
 # descendants. Preserve the raw-state delta checks below, and deliver the same
@@ -442,9 +442,9 @@ SELECT * FROM openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d7
 
 statement ok
 INSERT INTO openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_
-SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_
+SELECT *, CAST(-1 AS INTEGER), make_timestamp(epoch_us(now())) FROM openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_
 UNION ALL
-SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_;
+SELECT *, CAST(1 AS INTEGER), make_timestamp(epoch_us(now())) FROM openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_;
 
 statement ok
 DROP TABLE IF EXISTS openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_;
