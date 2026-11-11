@@ -23,7 +23,7 @@
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
-#include "duckdb/planner/operator/logical_simple.hpp"
+#include "duckdb/planner/operator/logical_alter.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
@@ -90,15 +90,16 @@ private:
 // Restores the snapshotted rows. Native catalogs replace them by primary key; remote SQL
 // catalogs have no INSERT OR REPLACE, so the rows sharing their key are deleted and then
 // reinserted (the caller runs both in one transaction).
-static string BuildRestoreRowsSQL(MaterializedQueryResult &rows, const string &table_name,
-                                  const vector<string> &key_columns, bool native) {
+static string BuildRestoreRowsSQL(QueryResult &rows, const string &table_name, const vector<string> &key_columns,
+                                  bool native) {
 	if (rows.RowCount() == 0) {
 		return "";
 	}
+	auto names = IdentifiersToStrings(rows.GetNames());
 	vector<idx_t> key_indexes;
 	for (auto &key : key_columns) {
-		for (idx_t col = 0; col < rows.names.size(); col++) {
-			if (StringUtil::CIEquals(rows.names[col], key)) {
+		for (idx_t col = 0; col < names.size(); col++) {
+			if (StringUtil::CIEquals(names[col], key)) {
 				key_indexes.push_back(col);
 				break;
 			}
@@ -107,20 +108,21 @@ static string BuildRestoreRowsSQL(MaterializedQueryResult &rows, const string &t
 	if (key_indexes.size() != key_columns.size()) {
 		throw CatalogException("OpenIVM metadata snapshot of %s lacks its key columns", table_name);
 	}
-	string columns = SqlUtils::JoinQuotedColumns(rows.names);
+	string columns = SqlUtils::JoinQuotedColumns(names);
 	vector<string> row_values;
 	vector<string> row_keys;
 	for (idx_t row = 0; row < rows.RowCount(); row++) {
 		vector<string> cells;
 		for (idx_t col = 0; col < rows.ColumnCount(); col++) {
-			cells.push_back(rows.GetValue(col, row).ToSQLString());
+			cells.push_back(rows.Collection().GetValue(col, row).ToSQLString());
 		}
 		row_values.push_back("(" + StringUtil::Join(cells, ", ") + ")");
 		row_keys.push_back("(" +
 		                   StringUtil::Join(key_indexes, key_indexes.size(), " AND ",
 		                                    [&](idx_t col) {
-			                                    return SqlUtils::QuoteIdentifier(rows.names[col]) +
-			                                           " IS NOT DISTINCT FROM " + rows.GetValue(col, row).ToSQLString();
+			                                    return SqlUtils::QuoteIdentifier(names[col]) +
+			                                           " IS NOT DISTINCT FROM " +
+			                                           rows.Collection().GetValue(col, row).ToSQLString();
 		                                    }) +
 		                   ")");
 	}
@@ -161,10 +163,8 @@ static void AlterDeltaInCallerTransaction(ClientContext &context, AlterTableInfo
                                           const string &catalog_name, const string &schema_name,
                                           const string &delta_name) {
 	auto delta_alter = source_alter.Copy();
-	delta_alter->catalog = catalog_name;
-	delta_alter->schema = schema_name;
-	delta_alter->name = delta_name;
-	auto &catalog = Catalog::GetCatalog(context, catalog_name);
+	delta_alter->SetQualifiedName(Identifier(catalog_name), Identifier(schema_name), Identifier(delta_name));
+	auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
 	MetaTransaction::Get(context).ModifyDatabase(catalog.GetAttached(), DatabaseModificationType::ALTER_TABLE);
 	catalog.Alter(context, *delta_alter);
 }
@@ -187,8 +187,8 @@ static optional_ptr<TableCatalogEntry> GetNativeDMLTable(LogicalOperator &dml) {
 	default:
 		throw InternalException("OpenIVM expected a source DML operator");
 	}
-	if (table->name.empty() || IncrementalTableNames::IsMaintenanceTable(table->name) ||
-	    !table->catalog.IsDuckCatalog()) {
+	if (table->name.GetIdentifierName().empty() ||
+	    IncrementalTableNames::IsMaintenanceTable(table->name.GetIdentifierName()) || !table->catalog.IsDuckCatalog()) {
 		return nullptr;
 	}
 	return table;
@@ -219,13 +219,13 @@ static void ResolveInsertDefaults(OptimizerExtensionInput &input, LogicalInsert 
 }
 
 static idx_t FindExpressionBindingIndex(LogicalOperator &child, const Expression &expression) {
-	if (expression.type != ExpressionType::BOUND_COLUMN_REF) {
+	if (expression.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		throw InternalException("OpenIVM expected a bound row-id column reference");
 	}
 	auto &column_ref = expression.Cast<BoundColumnRefExpression>();
 	auto bindings = child.GetColumnBindings();
 	for (idx_t index = 0; index < bindings.size(); index++) {
-		if (bindings[index] == column_ref.binding) {
+		if (bindings[index] == column_ref.Binding()) {
 			return index;
 		}
 	}
@@ -235,7 +235,7 @@ static idx_t FindExpressionBindingIndex(LogicalOperator &child, const Expression
 static void ResolveUpdateDefaults(OptimizerExtensionInput &input, LogicalUpdate &update) {
 	bool has_default = false;
 	for (auto &expression : update.expressions) {
-		has_default = has_default || expression->type == ExpressionType::VALUE_DEFAULT;
+		has_default = has_default || expression->GetExpressionType() == ExpressionType::VALUE_DEFAULT;
 	}
 	if (!has_default) {
 		return;
@@ -257,7 +257,7 @@ static void ResolveUpdateDefaults(OptimizerExtensionInput &input, LogicalUpdate 
 
 	vector<idx_t> default_indexes(update.expressions.size(), DConstants::INVALID_INDEX);
 	for (idx_t index = 0; index < update.expressions.size(); index++) {
-		if (update.expressions[index]->type != ExpressionType::VALUE_DEFAULT) {
+		if (update.expressions[index]->GetExpressionType() != ExpressionType::VALUE_DEFAULT) {
 			continue;
 		}
 		default_indexes[index] = projection_expressions.size();
@@ -267,7 +267,7 @@ static void ResolveUpdateDefaults(OptimizerExtensionInput &input, LogicalUpdate 
 	const auto row_id_output_index = projection_expressions.size();
 	projection_expressions.push_back(make_uniq<BoundColumnRefExpression>(child_types.back(), child_bindings.back()));
 	for (idx_t index = 0; index < update.expressions.size(); index++) {
-		auto return_type = update.expressions[index]->return_type;
+		auto return_type = update.expressions[index]->GetReturnType();
 		idx_t output_index;
 		if (default_indexes[index] != DConstants::INVALID_INDEX) {
 			output_index = default_indexes[index];
@@ -275,8 +275,8 @@ static void ResolveUpdateDefaults(OptimizerExtensionInput &input, LogicalUpdate 
 			output_index = FindExpressionBindingIndex(*update.children[0], *update.expressions[index]);
 			D_ASSERT(output_index + 1 < child_bindings.size());
 		}
-		update.expressions[index] =
-		    make_uniq<BoundColumnRefExpression>(return_type, ColumnBinding(projection_index, output_index));
+		update.expressions[index] = make_uniq<BoundColumnRefExpression>(
+		    return_type, ColumnBinding(TableIndex(projection_index), ProjectionIndex(output_index)));
 	}
 
 	auto projection = make_uniq<LogicalProjection>(projection_index, std::move(projection_expressions));
@@ -303,18 +303,25 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		auto &info = create.info->Base();
 		// MV lifecycle programs publish their own signed output changes. Their
 		// backing/publication rebuilds are not replacements of user sources.
-		if (IncrementalTableNames::IsMaintenanceTable(info.table)) {
+		if (IncrementalTableNames::IsMaintenanceTable(info.GetQualifiedName().Name().GetIdentifierName())) {
 			return;
 		}
-		auto old_table = Catalog::GetEntry<TableCatalogEntry>(input.context, catalog.GetName(), create.schema.name,
-		                                                      info.table, OnEntryNotFound::RETURN_NULL);
+		auto old_table = Catalog::GetEntry<TableCatalogEntry>(
+		    input.context,
+		    QualifiedName(Identifier(catalog.GetName().GetIdentifierName()),
+		                  Identifier(create.schema.name.GetIdentifierName()),
+		                  Identifier(info.GetQualifiedName().Name().GetIdentifierName())),
+		    OnEntryNotFound::RETURN_NULL);
 		if (old_table && info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
 			return;
 		}
-		auto delta = TransactionalMVLockState::Get(input.context)
-		                 .FindSourceDeltaForWrite(catalog.GetName(), create.schema.name, info.table);
-		auto token =
-		    RefreshMetadata::SourceGeneration(input.context, catalog.GetName(), create.schema.name, info.table);
+		auto delta =
+		    TransactionalMVLockState::Get(input.context)
+		        .FindSourceDeltaForWrite(catalog.GetName().GetIdentifierName(), create.schema.name.GetIdentifierName(),
+		                                 info.GetQualifiedName().Name().GetIdentifierName());
+		auto token = RefreshMetadata::SourceGeneration(input.context, catalog.GetName().GetIdentifierName(),
+		                                               create.schema.name.GetIdentifierName(),
+		                                               info.GetQualifiedName().Name().GetIdentifierName());
 		if (delta) {
 			idx_t count = 0;
 			for (auto &column : delta->GetColumns().Physical()) {
@@ -326,13 +333,13 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 				    info.columns.GetColumn(column.Name()).Type() != column.Type()) {
 					throw BinderException("OpenIVM replacement schema is incompatible with retained deltas for source "
 					                      "'%s'; drop dependent materialized views before changing its schema",
-					                      info.table);
+					                      info.GetQualifiedName().Name().GetIdentifierName());
 				}
 			}
 			if (count != info.columns.LogicalColumnCount()) {
 				throw BinderException("OpenIVM replacement schema is incompatible with retained deltas for source "
 				                      "'%s'; drop dependent materialized views before changing its schema",
-				                      info.table);
+				                      info.GetQualifiedName().Name().GetIdentifierName());
 			}
 		}
 		if (delta || !token.empty() || !create.children.empty() ||
@@ -346,7 +353,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 
 	// Handle ALTER TABLE: sync delta table schema or block if referenced column is affected
 	if (root->type == LogicalOperatorType::LOGICAL_ALTER) {
-		auto *simple = dynamic_cast<LogicalSimple *>(root);
+		auto *simple = dynamic_cast<LogicalAlter *>(root);
 		if (!simple) {
 			return;
 		}
@@ -355,22 +362,28 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			return;
 		}
 
-		auto source = Catalog::GetEntry<TableCatalogEntry>(input.context, alter_info->catalog, alter_info->schema,
-		                                                   alter_info->name, OnEntryNotFound::RETURN_NULL);
+		auto source = Catalog::GetEntry<TableCatalogEntry>(
+		    input.context,
+		    QualifiedName(Identifier(alter_info->GetQualifiedName().Catalog().GetIdentifierName()),
+		                  Identifier(alter_info->GetQualifiedName().Schema().GetIdentifierName()),
+		                  Identifier(alter_info->GetQualifiedName().Name().GetIdentifierName())),
+		    OnEntryNotFound::RETURN_NULL);
 		if (!source) {
 			return;
 		}
 		// SQL identifiers are case-insensitive; metadata stores the catalog spelling.
-		string table_name = source->name;
+		string table_name = source->name.GetIdentifierName();
 		string delta_name = SqlUtils::DeltaName(table_name);
-		auto source_locus = std::make_pair(source->ParentCatalog().GetName(), source->schema.name);
+		auto source_locus = std::make_pair(source->ParentCatalog().GetName().GetIdentifierName(),
+		                                   source->schema.name.GetIdentifierName());
 
-		TransactionalMVLockState::Get(input.context).AcquireMutationLock();
 		// Resolve only the source's delta table in the caller transaction. Scanning
 		// information_schema touches unrelated external catalogs and can silently
-		// skip schema synchronization when one of them is unavailable.
-		auto delta_entry = RefreshMetadata::FindSourceDeltaForMutation(input.context, source_locus.first,
-		                                                               source_locus.second, table_name);
+		// skip schema synchronization when one of them is unavailable. Source
+		// admission keeps an untracked ALTER local; tracked ownership escalates to
+		// the mutation gate and is rechecked there.
+		auto delta_entry = TransactionalMVLockState::Get(input.context)
+		                       .FindSourceDeltaForWrite(source_locus.first, source_locus.second, table_name);
 		auto wrap_generation = [&]() {
 			if (source->catalog.IsDuckCatalog()) {
 				auto wrapper = make_uniq<LogicalSourceLifecycle>(source, delta_entry);
@@ -383,7 +396,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			return;
 		}
 		// The physical delta may sit in an internal schema; metadata still keys it by delta_name.
-		auto delta_locus = std::make_pair(delta_entry->schema.name, delta_entry->name);
+		auto delta_locus =
+		    std::make_pair(delta_entry->schema.name.GetIdentifierName(), delta_entry->name.GetIdentifierName());
 
 		switch (alter_info->alter_table_type) {
 		case AlterTableType::RENAME_TABLE:
@@ -410,7 +424,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			if (!remove_info) {
 				break;
 			}
-			string col_name = remove_info->removed_column;
+			string col_name = remove_info->removed_column.GetIdentifierName();
 			for (auto &location : RefreshMetadata::MetadataLocations(input.context, openivm::DELTA_TABLES_TABLE)) {
 				Connection con(*input.context.db);
 				SnapshotSchemaEvolutionMetadata(input.context, con, location);
@@ -432,8 +446,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			if (!rename_info) {
 				break;
 			}
-			string old_name = rename_info->old_name;
-			string new_name = rename_info->new_name;
+			string old_name = rename_info->old_name.GetIdentifierName();
+			string new_name = rename_info->new_name.GetIdentifierName();
 			auto dependent_view_predicate =
 			    "view_name IN (SELECT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
 			    RefreshMetadata::SourcePredicate(delta_name, source_locus.first, source_locus.second) + ")";
@@ -478,8 +492,9 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		return;
 	}
 
-	// SQL EXECUTE runs a cached plan that this rule does not see again; gate it as below.
-	if (root->type == LogicalOperatorType::LOGICAL_EXECUTE) {
+	// A cached EXECUTE has no logical child. A rebound EXECUTE does: capture
+	// its DML below just like a directly submitted statement.
+	if (root->type == LogicalOperatorType::LOGICAL_EXECUTE && root->children.empty()) {
 		auto &prepared = root->Cast<LogicalExecute>().prepared;
 		if (prepared && prepared->physical_plan) {
 			AdmitPlanMutations(input.context, prepared->physical_plan->Root());
@@ -506,8 +521,10 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 	if (!table) {
 		return;
 	}
-	auto delta_table = TransactionalMVLockState::Get(input.context)
-	                       .FindSourceDeltaForWrite(table->catalog.GetName(), table->schema.name, table->name);
+	auto delta_table =
+	    TransactionalMVLockState::Get(input.context)
+	        .FindSourceDeltaForWrite(table->catalog.GetName().GetIdentifierName(),
+	                                 table->schema.name.GetIdentifierName(), table->name.GetIdentifierName());
 	if (delta_table) {
 		switch (dml->type) {
 		case LogicalOperatorType::LOGICAL_INSERT: {

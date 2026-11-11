@@ -59,9 +59,11 @@ SELECT COUNT(*) FROM openivm_compile_with_facts(
 query I
 SELECT CASE
            WHEN contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_affected___openivm_mv_6d656d6f7279_6d61696e_637770635f6d76_ AS') AND
-                contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_old___openivm_mv_6d656d6f7279_6d61696e_637770635f6d76_ AS') AND
-                contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_new___openivm_mv_6d656d6f7279_6d61696e_637770635f6d76_ AS') AND
+                contains(content, 'openivm_old___openivm_mv_6d656d6f7279_6d61696e_637770635f6d76_ AS MATERIALIZED (SELECT') AND
+                contains(content, 'openivm_new___openivm_mv_6d656d6f7279_6d61696e_637770635f6d76_ AS MATERIALIZED (SELECT') AND
                 contains(content, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_637770635f6d76_') AND
+                contains(content, 'AS MATERIALIZED (DELETE FROM') AND
+                contains(content, 'AS MATERIALIZED (INSERT INTO') AND
                 NOT contains(content, 'SELECT NULL::')
            THEN 1 ELSE 0
        END

@@ -7,7 +7,7 @@ require openivm
 require parquet
 
 statement ok
-INSTALL ducklake;
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository';
 
 statement ok
 LOAD ducklake;
@@ -707,7 +707,7 @@ DELETE FROM dl.cost_range WHERE k = 2;
 query IIIIII
 PRAGMA refresh_cost('cost_range_mv');
 ----
-incremental	6.175631	22.000000	6.175631	22.000000	0
+incremental	19.229420	30.000000	19.229420	30.000000	0
 
 statement ok
 PRAGMA refresh('cost_range_mv');

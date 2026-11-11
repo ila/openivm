@@ -2,6 +2,7 @@
 #define OPENIVM_DELTA_PLAN_FRAGMENT_HPP
 
 #include "duckdb.hpp"
+#include "duckdb/planner/column_binding.hpp"
 
 namespace duckdb {
 

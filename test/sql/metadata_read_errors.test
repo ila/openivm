@@ -26,7 +26,7 @@ LOAD parquet;
 
 # DuckLake setup happens before any metadata table is altered, like the other DuckLake tests
 statement ok
-INSTALL ducklake;
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository';
 
 statement ok
 LOAD ducklake;

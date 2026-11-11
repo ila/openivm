@@ -652,3 +652,78 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# DML CTEs snapshot affected partitions before replacing rows and publishing deltas.
+statement ok
+SET openivm_cascade_refresh='downstream';
+SET openivm_disable_daemon=true;
+SET openivm_archive_compiled_sql=true;
+CREATE TABLE cte_window_source(id INTEGER,k INTEGER,v INTEGER);
+INSERT INTO cte_window_source VALUES (1,1,10),(2,1,20),(3,NULL,30),(4,2,NULL);
+CREATE VIEW cte_window_expected AS
+SELECT *,row_number() OVER(PARTITION BY k ORDER BY v NULLS LAST,id) rn FROM cte_window_source;
+CREATE MATERIALIZED VIEW cte_window_mv AS
+SELECT *,row_number() OVER(PARTITION BY k ORDER BY v NULLS LAST,id) rn FROM cte_window_source;
+CREATE MATERIALIZED VIEW cte_window_child AS SELECT k,count(*) c FROM cte_window_mv GROUP BY k;
+
+statement ok
+INSERT INTO cte_window_source VALUES (5,1,15),(5,1,15),(6,NULL,40);
+UPDATE cte_window_source SET v=v+1 WHERE id=1;
+DELETE FROM cte_window_source WHERE id IN (2,6);
+UPDATE cte_window_source SET v=NULL WHERE id=5;
+
+statement ok
+PRAGMA refresh_pipeline('cte_window_mv');
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM cte_window_mv EXCEPT ALL SELECT * FROM cte_window_expected) UNION ALL
+ (SELECT * FROM cte_window_expected EXCEPT ALL SELECT * FROM cte_window_mv) UNION ALL
+ (SELECT NULL,k,c,NULL FROM cte_window_child EXCEPT ALL
+  SELECT NULL,k,count(*),NULL FROM cte_window_expected GROUP BY k) UNION ALL
+ (SELECT NULL,k,count(*),NULL FROM cte_window_expected GROUP BY k EXCEPT ALL
+  SELECT NULL,k,c,NULL FROM cte_window_child)
+);
+----
+0
+
+query I
+SELECT count(*)>0 FROM openivm_compiled_statements
+WHERE operation='refresh' AND sql LIKE '%AS MATERIALIZED (DELETE FROM%';
+----
+true
+
+statement ok
+BEGIN;
+DELETE FROM cte_window_source WHERE k=1;
+UPDATE cte_window_source SET k=2 WHERE k IS NULL;
+
+statement ok
+PRAGMA refresh_pipeline('cte_window_mv');
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM cte_window_mv EXCEPT ALL SELECT * FROM cte_window_expected) UNION ALL
+ (SELECT * FROM cte_window_expected EXCEPT ALL SELECT * FROM cte_window_mv) UNION ALL
+ (SELECT NULL,k,c,NULL FROM cte_window_child EXCEPT ALL
+  SELECT NULL,k,count(*),NULL FROM cte_window_expected GROUP BY k) UNION ALL
+ (SELECT NULL,k,count(*),NULL FROM cte_window_expected GROUP BY k EXCEPT ALL
+  SELECT NULL,k,c,NULL FROM cte_window_child)
+);
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM cte_window_mv EXCEPT ALL SELECT * FROM cte_window_expected) UNION ALL
+ (SELECT * FROM cte_window_expected EXCEPT ALL SELECT * FROM cte_window_mv) UNION ALL
+ (SELECT NULL,k,c,NULL FROM cte_window_child EXCEPT ALL
+  SELECT NULL,k,count(*),NULL FROM cte_window_expected GROUP BY k) UNION ALL
+ (SELECT NULL,k,count(*),NULL FROM cte_window_expected GROUP BY k EXCEPT ALL
+  SELECT NULL,k,c,NULL FROM cte_window_child)
+);
+----
+0

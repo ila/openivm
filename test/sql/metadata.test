@@ -946,7 +946,7 @@ ${outcome};
 
 query I
 SELECT count(DISTINCT operation)=CASE WHEN '${outcome}'='COMMIT' THEN 2 ELSE 0 END
-FROM openivm_compiled_programs WHERE view_sql_name=lower('new_${outcome}');
+FROM openivm_compiled_programs WHERE view_sql_name='new_${outcome}';
 ----
 true
 

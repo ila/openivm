@@ -3,6 +3,8 @@
 
 #include "duckdb.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/common/sql_identifier.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "lpts_pipeline.hpp"
 
 #include <string>
@@ -22,6 +24,10 @@ struct SessionLocation {
 
 class SqlUtils {
 public:
+	static EntryLookupInfo QualifyLookup(const EntryLookupInfo &lookup, const Identifier &catalog,
+	                                     const Identifier &schema) {
+		return EntryLookupInfo(lookup, QualifiedName(catalog, schema, lookup.GetEntryIdentifier()));
+	}
 	// Visit real relation references, excluding CTE names in their lexical scope.
 	static void VisitSourceReferences(SQLStatement &statement, const std::function<void(BaseTableRef &)> &callback);
 	static void RewriteSourceReferences(SQLStatement &statement,
@@ -40,7 +46,10 @@ public:
 	// Empty replacement keeps a reference unchanged; visit all references in one scan.
 	static string RewriteTableReferences(const string &sql,
 	                                     const std::function<string(const vector<string> &)> &rewrite);
-	static string FullName(const string &catalog, const string &schema, const string &table);
+	template <class CATALOG, class SCHEMA, class TABLE>
+	static string FullName(const CATALOG &catalog, const SCHEMA &schema, const TABLE &table) {
+		return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteIdentifier(table);
+	}
 	/// Compare SQL expressions holding catalog identifiers using DuckDB's ASCII-only case folding.
 	static string IdentifierEqualsSQL(const string &left, const string &right);
 	static string QualifiedPrefix(const string &catalog, const string &schema);
@@ -52,11 +61,13 @@ public:
 	                                    const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id);
 	static bool GetBoolSetting(ClientContext &context, const string &setting_name, bool default_value) {
 		Value setting_value;
-		if (context.TryGetCurrentSetting(setting_name, setting_value) && !setting_value.IsNull()) {
+		if (context.TryGetCurrentSetting(Identifier(setting_name), setting_value) && !setting_value.IsNull()) {
 			return setting_value.GetValue<bool>();
 		}
 		return default_value;
 	}
+	// Copy a registered extension setting to a helper connection without changing the database default.
+	static void CopySessionSetting(ClientContext &from, ClientContext &to, const string &name);
 	/// The caller's default catalog and schema; an unset session catalog is the default database.
 	static SessionLocation SessionDefaultLocation(ClientContext &context);
 	/// `DELETE FROM <table> WHERE <column> = '<view_name>'` for per-view metadata rows.
@@ -107,8 +118,9 @@ public:
 	static int64_t ExtractRefreshInterval(string &query);
 
 	/// Quote an identifier for safe use in generated SQL (handles reserved words and special chars).
-	static string QuoteIdentifier(const string &name) {
-		return KeywordHelper::WriteOptionallyQuoted(name);
+	template <class T>
+	static string QuoteIdentifier(const T &name) {
+		return SQLIdentifier::ToString(name);
 	}
 
 	/// Escape a string value for use inside single-quoted SQL literals.

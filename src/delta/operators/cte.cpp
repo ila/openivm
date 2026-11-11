@@ -9,7 +9,7 @@ namespace duckdb {
 
 namespace {
 
-static void UpdateCteRefsWithMul(LogicalOperator *node, idx_t cte_table_index, const LogicalType &mul_type) {
+static void UpdateCteRefsWithMul(LogicalOperator *node, TableIndex cte_table_index, const LogicalType &mul_type) {
 	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &ref = node->Cast<LogicalCTERef>();
 		if (ref.cte_index == cte_table_index &&
@@ -17,7 +17,7 @@ static void UpdateCteRefsWithMul(LogicalOperator *node, idx_t cte_table_index, c
 			ref.chunk_types.push_back(mul_type);
 			ref.bound_columns.push_back(openivm::MULTIPLICITY_COL);
 			OPENIVM_DEBUG_PRINT("[CTE]   Updated CTE_REF cte_index=%lu with mul column\n",
-			                    (unsigned long)cte_table_index);
+			                    (unsigned long)cte_table_index.index);
 		}
 	}
 	for (auto &child : node->children) {
@@ -32,13 +32,13 @@ DeltaPlanFragment CompileCteDelta(DeltaOperatorInput input) {
 		LogDeltaOperatorStrategy(input, DeltaOperatorStrategy::CTE_MATERIALIZED);
 		// CTE wrapper: children[0] = CTE definition, children[1] = consumer.
 		auto &cte = input.plan->Cast<LogicalCTE>();
-		idx_t cte_table_index = cte.table_index;
+		TableIndex cte_table_index = cte.table_index;
 
 		auto def_mul = input.CompileChild(input.plan->children[0], input.root);
 		input.plan->children[0] = std::move(def_mul.op);
 		cte.column_count = input.plan->children[0]->GetColumnBindings().size();
 
-		OPENIVM_DEBUG_PRINT("[CTE] Looking for CTE_REFs with cte_index=%lu\n", (unsigned long)cte_table_index);
+		OPENIVM_DEBUG_PRINT("[CTE] Looking for CTE_REFs with cte_index=%lu\n", (unsigned long)cte_table_index.index);
 		UpdateCteRefsWithMul(input.plan.get(), cte_table_index, input.mul_type);
 
 		auto cons_mul = input.CompileChild(input.plan->children[1], input.root);

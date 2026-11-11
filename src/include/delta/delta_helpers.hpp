@@ -36,7 +36,8 @@ DeltaSourceState &LoadDeltaWatermark(Connection &con, const string &view_name, T
 void PopulateDuckLakeChangeScanParameters(LogicalGet &get);
 
 DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binder &binder, LogicalGet *old_get,
-                                  const string &view_name, DeltaSourceCache *cache = nullptr);
+                                  const string &view_name, DeltaSourceCache *cache = nullptr,
+                                  bool honor_source_projection = false);
 
 } // namespace duckdb
 
