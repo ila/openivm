@@ -63,6 +63,318 @@ CREATE MATERIALIZED VIEW mv_random AS SELECT x, RANDOM() AS r FROM t3;
 statement ok
 CREATE MATERIALIZED VIEW mv_now AS SELECT x, NOW() AS ts FROM t3;
 
+# DuckDB 2.0 can fold a nested SQL value function before logical-plan analysis.
+statement ok
+CREATE MATERIALIZED VIEW mv_nested_now AS
+    SELECT x, DATE_DIFF('day', TIMESTAMP '2020-01-01', CURRENT_TIMESTAMP) AS age_days FROM t3;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'mv_nested_now';
+----
+3
+
+# A changing SQL value function must survive CREATE-time plan serialization.
+# These time zones always have different local dates at the same instant.
+statement ok
+SET TimeZone='Pacific/Kiritimati';
+
+statement ok
+CREATE TABLE t_date AS SELECT * FROM t3;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_nested_date AS
+    SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) AS age_days FROM t_date;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'mv_nested_date';
+----
+3
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_nested_date EXCEPT ALL
+     SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) FROM t_date)
+    UNION ALL
+    (SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) FROM t_date EXCEPT ALL
+     SELECT * FROM mv_nested_date)
+);
+----
+0
+
+statement ok
+SET TimeZone='Pacific/Honolulu';
+
+statement ok
+CREATE MATERIALIZED VIEW mv_nested_date_west AS
+    SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) AS age_days FROM t_date;
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_nested_date_west EXCEPT ALL
+     SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) FROM t_date)
+    UNION ALL
+    (SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) FROM t_date EXCEPT ALL
+     SELECT * FROM mv_nested_date_west)
+);
+----
+0
+
+statement ok
+INSERT INTO t_date VALUES (4);
+
+statement ok
+PRAGMA refresh('mv_nested_date_west');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_nested_date_west EXCEPT ALL
+     SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) FROM t_date)
+    UNION ALL
+    (SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) FROM t_date EXCEPT ALL
+     SELECT * FROM mv_nested_date_west)
+);
+----
+0
+
+statement ok
+SET TimeZone='Pacific/Kiritimati';
+
+statement ok
+PRAGMA refresh('mv_nested_date');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_nested_date EXCEPT ALL
+     SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) FROM t_date)
+    UNION ALL
+    (SELECT x, DATE_DIFF('day', DATE '2020-01-01', CURRENT_DATE) FROM t_date EXCEPT ALL
+     SELECT * FROM mv_nested_date)
+);
+----
+0
+
+statement ok
+SET TimeZone='UTC';
+
+# An ordered percentage limit is published over unlimited incremental state.
+statement ok
+CREATE TABLE t_percent(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO t_percent VALUES (1,10),(2,20),(3,30),(4,40);
+
+statement ok
+CREATE VIEW expected_percent AS
+    SELECT k FROM t_percent GROUP BY k ORDER BY SUM(v) DESC, k LIMIT 50 PERCENT;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_percent AS
+    SELECT k FROM t_percent GROUP BY k ORDER BY SUM(v) DESC, k LIMIT 50 PERCENT;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'mv_percent';
+----
+0
+
+query I
+SELECT k FROM mv_percent;
+----
+4
+3
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_percent EXCEPT ALL SELECT * FROM expected_percent)
+    UNION ALL
+    (SELECT * FROM expected_percent EXCEPT ALL SELECT * FROM mv_percent)
+);
+----
+0
+
+statement ok
+INSERT INTO t_percent VALUES (5,50),(6,60);
+DELETE FROM t_percent WHERE k=4;
+UPDATE t_percent SET v=70 WHERE k=2;
+
+statement ok
+PRAGMA refresh('mv_percent');
+
+query I
+SELECT k FROM mv_percent;
+----
+2
+6
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_percent EXCEPT ALL SELECT * FROM expected_percent)
+    UNION ALL
+    (SELECT * FROM expected_percent EXCEPT ALL SELECT * FROM mv_percent)
+);
+----
+0
+
+# Full-refresh fallback must preserve a sort value that is absent from the output.
+statement ok
+SET TimeZone='Pacific/Kiritimati';
+
+statement ok
+CREATE TABLE t_hidden_order(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO t_hidden_order VALUES (1,10),(2,30),(3,20);
+
+statement ok
+CREATE VIEW expected_hidden_date_order AS
+    SELECT k FROM t_hidden_order GROUP BY k
+    ORDER BY CASE WHEN DATE_DIFF('day', (CURRENT_TIMESTAMP AT TIME ZONE 'Pacific/Honolulu')::DATE,
+                                 CURRENT_DATE)=0 THEN SUM(v) ELSE -SUM(v) END DESC, k LIMIT 2;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_hidden_date_order AS
+    SELECT k FROM t_hidden_order GROUP BY k
+    ORDER BY CASE WHEN DATE_DIFF('day', (CURRENT_TIMESTAMP AT TIME ZONE 'Pacific/Honolulu')::DATE,
+                                 CURRENT_DATE)=0 THEN SUM(v) ELSE -SUM(v) END DESC, k LIMIT 2;
+
+statement ok
+CREATE VIEW expected_hidden_date_percent AS
+    SELECT k FROM t_hidden_order GROUP BY k
+    ORDER BY CASE WHEN DATE_DIFF('day', (CURRENT_TIMESTAMP AT TIME ZONE 'Pacific/Honolulu')::DATE,
+                                 CURRENT_DATE)=0 THEN SUM(v) ELSE -SUM(v) END DESC, k LIMIT 67 PERCENT;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_hidden_date_percent AS
+    SELECT k FROM t_hidden_order GROUP BY k
+    ORDER BY CASE WHEN DATE_DIFF('day', (CURRENT_TIMESTAMP AT TIME ZONE 'Pacific/Honolulu')::DATE,
+                                 CURRENT_DATE)=0 THEN SUM(v) ELSE -SUM(v) END DESC, k LIMIT 67 PERCENT;
+
+query I
+SELECT k FROM mv_hidden_date_order;
+----
+1
+3
+
+query I
+SELECT k FROM mv_hidden_date_percent;
+----
+1
+3
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_hidden_date_order EXCEPT ALL SELECT * FROM expected_hidden_date_order)
+    UNION ALL
+    (SELECT * FROM expected_hidden_date_order EXCEPT ALL SELECT * FROM mv_hidden_date_order)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_hidden_date_percent EXCEPT ALL SELECT * FROM expected_hidden_date_percent)
+    UNION ALL
+    (SELECT * FROM expected_hidden_date_percent EXCEPT ALL SELECT * FROM mv_hidden_date_percent)
+);
+----
+0
+
+statement ok
+SET TimeZone='Pacific/Honolulu';
+
+statement ok
+UPDATE t_hidden_order SET v=45 WHERE k=1;
+DELETE FROM t_hidden_order WHERE k=2;
+INSERT INTO t_hidden_order VALUES (4,50);
+
+statement ok
+PRAGMA refresh('mv_hidden_date_order');
+
+statement ok
+PRAGMA refresh('mv_hidden_date_percent');
+
+query I
+SELECT k FROM mv_hidden_date_order;
+----
+4
+1
+
+query I
+SELECT k FROM mv_hidden_date_percent;
+----
+4
+1
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_hidden_date_order EXCEPT ALL SELECT * FROM expected_hidden_date_order)
+    UNION ALL
+    (SELECT * FROM expected_hidden_date_order EXCEPT ALL SELECT * FROM mv_hidden_date_order)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_hidden_date_percent EXCEPT ALL SELECT * FROM expected_hidden_date_percent)
+    UNION ALL
+    (SELECT * FROM expected_hidden_date_percent EXCEPT ALL SELECT * FROM mv_hidden_date_percent)
+);
+----
+0
+
+statement ok
+SET TimeZone='UTC';
+
+statement ok
+CREATE MACRO nested_now() AS CURRENT_TIMESTAMP;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_macro_now AS
+    SELECT x, DATE_DIFF('day', TIMESTAMP '2020-01-01', nested_now()) AS age_days FROM t3;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'mv_macro_now';
+----
+3
+
+statement ok
+CREATE MACRO default_now(ts := CURRENT_TIMESTAMP) AS ts;
+
+# DuckDB evaluates macro defaults at CREATE MACRO time and stores this one as a timestamp literal.
+statement ok
+CREATE MATERIALIZED VIEW mv_macro_default_now AS SELECT x, default_now() AS observed_at FROM t3;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'mv_macro_default_now';
+----
+2
+
+# An explicit stable value remains incremental too.
+statement ok
+CREATE MATERIALIZED VIEW mv_macro_explicit_time AS
+    SELECT x, default_now(TIMESTAMP '2020-01-01') AS observed_at FROM t3;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'mv_macro_explicit_time';
+----
+2
+
+# A same-named source column is not the CURRENT_TIMESTAMP SQL value function.
+statement ok
+CREATE TABLE runtime_name_source (current_timestamp TIMESTAMP);
+
+statement ok
+INSERT INTO runtime_name_source VALUES (TIMESTAMP '2020-01-02');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_runtime_name_column AS
+    SELECT DATE_DIFF('day', TIMESTAMP '2020-01-01', current_timestamp) AS age_days FROM runtime_name_source;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'mv_runtime_name_column';
+----
+2
+
 statement ok
 CREATE SEQUENCE volatile_unnest_seq START 1;
 
@@ -287,6 +599,78 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# Blocking set operations stay on full refresh without requesting branch-local
+# hidden FULL OUTER JOIN state.
+statement ok
+CREATE TABLE setop_left(id INT, payload VARCHAR);
+
+statement ok
+CREATE TABLE setop_right(id INT, payload VARCHAR);
+
+statement ok
+CREATE TABLE setop_probe(id INT);
+
+statement ok
+INSERT INTO setop_left VALUES (1, 'left'), (2, 'both'), (4, 'duplicate');
+
+statement ok
+INSERT INTO setop_right VALUES (2, 'both'), (3, 'right'), (4, 'duplicate');
+
+statement ok
+INSERT INTO setop_probe VALUES (1), (2), (2), (3), (4);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_full_outer_intersect AS
+    SELECT COALESCE(l.id, r.id) AS id
+    FROM setop_left l FULL OUTER JOIN setop_right r ON l.id = r.id
+    INTERSECT ALL
+    SELECT id FROM setop_probe;
+
+query I
+SELECT type FROM openivm_views WHERE view_name LIKE '%6d765f66756c6c5f6f757465725f696e74657273656374%';
+----
+3
+
+# Batch conflicting source changes before one refresh.
+statement ok
+INSERT INTO setop_left VALUES (3, 'new match'), (5, 'new left');
+
+statement ok
+DELETE FROM setop_right WHERE id IN (2, 4);
+
+statement ok
+UPDATE setop_probe SET id = 5 WHERE id = 1;
+
+statement ok
+INSERT INTO setop_probe VALUES (3), (4);
+
+statement ok
+PRAGMA refresh('mv_full_outer_intersect');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT COALESCE(l.id, r.id) AS id
+     FROM setop_left l FULL OUTER JOIN setop_right r ON l.id = r.id
+     INTERSECT ALL
+     SELECT id FROM setop_probe)
+    EXCEPT ALL
+    SELECT id FROM mv_full_outer_intersect
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM mv_full_outer_intersect
+    EXCEPT ALL
+    (SELECT COALESCE(l.id, r.id) AS id
+     FROM setop_left l FULL OUTER JOIN setop_right r ON l.id = r.id
+     INTERSECT ALL
+     SELECT id FROM setop_probe)
+);
+----
+0
+
 # ==========================================
 # DISTINCT — incremental classification
 # ==========================================
@@ -347,15 +731,12 @@ SELECT type, group_columns FROM openivm_views WHERE view_name = '__openivm_mv_6d
 ----
 5	dept=dept
 
-statement ok
+statement error
 CREATE MATERIALIZED VIEW mv_window_volatile AS
     SELECT id, dept, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY random()) AS rn
     FROM w_src;
-
-query I
-SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f77696e646f775f766f6c6174696c65_';
 ----
-3
+ORDER BY window expressions cannot be volatile
 
 statement ok
 INSERT INTO w_src VALUES (4, 'eng', 25), (5, 'ops', 1);

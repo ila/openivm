@@ -8,7 +8,8 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 set(LPTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lpts")
-include_directories(src/include ${LPTS_DIR}/src/include ${LPTS_DIR}/third_party/ducklake/src/include)
+include_directories(src/include ${LPTS_DIR}/src/include
+                    ${LPTS_DIR}/third_party/ducklake/src/include)
 
 set(EXTENSION_SOURCES
     src/openivm_extension.cpp
@@ -91,28 +92,33 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # into the SQL unittest executable. Mull's path filters restrict candidates to
 # OpenIVM-owned src/ files; DuckDB and the loadable extension remain ordinary
 # optimized code.
-set(OPENIVM_MULL_PLUGIN "" CACHE FILEPATH "Path to the Mull LLVM IR frontend plugin")
-set(OPENIVM_MULL_CONFIG "" CACHE FILEPATH "Path to the Mull mutation configuration")
+set(OPENIVM_MULL_PLUGIN
+    ""
+    CACHE FILEPATH "Path to the Mull LLVM IR frontend plugin")
+set(OPENIVM_MULL_CONFIG
+    ""
+    CACHE FILEPATH "Path to the Mull mutation configuration")
 if(OPENIVM_MULL_PLUGIN)
-    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        message(FATAL_ERROR "OPENIVM_MULL_PLUGIN requires a Clang C++ compiler")
-    endif()
-    if(NOT EXISTS "${OPENIVM_MULL_PLUGIN}")
-        message(FATAL_ERROR "Mull LLVM IR frontend not found: ${OPENIVM_MULL_PLUGIN}")
-    endif()
-    if(NOT EXISTS "${OPENIVM_MULL_CONFIG}")
-        message(FATAL_ERROR "Mull configuration not found: ${OPENIVM_MULL_CONFIG}")
-    endif()
-    file(SHA256 "${OPENIVM_MULL_CONFIG}" OPENIVM_MULL_CONFIG_FINGERPRINT)
-    target_compile_options(${EXTENSION_NAME} PRIVATE
-        -O1
-        -g
-        -grecord-command-line
-        "-fpass-plugin=${OPENIVM_MULL_PLUGIN}")
-    # Make a config change visible to Ninja's command-line dependency tracking.
-    # This re-instruments the extension without rebuilding DuckDB.
-    target_compile_definitions(${EXTENSION_NAME} PRIVATE
-        "OPENIVM_MULL_CONFIG_FINGERPRINT=${OPENIVM_MULL_CONFIG_FINGERPRINT}")
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "OPENIVM_MULL_PLUGIN requires a Clang C++ compiler")
+  endif()
+  if(NOT EXISTS "${OPENIVM_MULL_PLUGIN}")
+    message(
+      FATAL_ERROR "Mull LLVM IR frontend not found: ${OPENIVM_MULL_PLUGIN}")
+  endif()
+  if(NOT EXISTS "${OPENIVM_MULL_CONFIG}")
+    message(FATAL_ERROR "Mull configuration not found: ${OPENIVM_MULL_CONFIG}")
+  endif()
+  file(SHA256 "${OPENIVM_MULL_CONFIG}" OPENIVM_MULL_CONFIG_FINGERPRINT)
+  target_compile_options(
+    ${EXTENSION_NAME} PRIVATE -O1 -g -grecord-command-line
+                              "-fpass-plugin=${OPENIVM_MULL_PLUGIN}")
+  # Make a config change visible to Ninja's command-line dependency tracking.
+  # This re-instruments the extension without rebuilding DuckDB.
+  target_compile_definitions(
+    ${EXTENSION_NAME}
+    PRIVATE "OPENIVM_MULL_CONFIG_FINGERPRINT=${OPENIVM_MULL_CONFIG_FINGERPRINT}"
+  )
 endif()
 
 install(
@@ -123,69 +129,86 @@ install(
 
 # Integration tests run on all native platforms, including Windows.
 if(NOT EMSCRIPTEN)
-    set(OPENIVM_LINK_LIBS
-        duckdb_static
-        duckdb_generated_extension_loader
-        ${EXTENSION_NAME}
-        core_functions_extension
-        parquet_extension
-        duckdb_static)
+  set(OPENIVM_LINK_LIBS
+      duckdb_static ${EXTENSION_NAME} core_functions_extension
+      parquet_extension duckdb_static)
 
-    # extension_config.cmake loads ICU statically, so the generated loader needs it.
-    # The target is defined after this subdirectory is processed, so TARGET cannot be used.
-    if(DUCKDB_EXTENSION_ICU_SHOULD_LINK)
-        list(APPEND OPENIVM_LINK_LIBS icu_extension)
-    endif()
+  # The generated loader references every statically linked extension.
+  if(DUCKDB_EXTENSION_ICU_SHOULD_LINK)
+    list(APPEND OPENIVM_LINK_LIBS icu_extension)
+  endif()
 
-    if(DUCKDB_EXTENSION_JEMALLOC_SHOULD_LINK)
-        list(APPEND OPENIVM_LINK_LIBS jemalloc_extension)
-    endif()
+  if(DUCKDB_EXTENSION_JEMALLOC_SHOULD_LINK)
+    list(APPEND OPENIVM_LINK_LIBS jemalloc_extension)
+  endif()
 
-    add_executable(scheduler_catalog_test test/integration/scheduler_catalog_test.cpp)
-    target_link_libraries(scheduler_catalog_test ${OPENIVM_LINK_LIBS})
+  add_executable(scheduler_catalog_test
+                 test/integration/scheduler_catalog_test.cpp)
+  target_link_libraries(scheduler_catalog_test ${OPENIVM_LINK_LIBS})
 
-    add_executable(benchmark_metadata_test test/integration/benchmark_metadata_test.cpp)
-    target_link_libraries(benchmark_metadata_test ${OPENIVM_LINK_LIBS})
-    target_include_directories(benchmark_metadata_test PUBLIC benchmark/src)
+  add_executable(benchmark_metadata_test
+                 test/integration/benchmark_metadata_test.cpp)
+  target_link_libraries(benchmark_metadata_test ${OPENIVM_LINK_LIBS})
+  target_include_directories(benchmark_metadata_test PUBLIC benchmark/src)
 
-    add_executable(source_delta_publication_test test/integration/source_delta_publication_test.cpp)
-    target_link_libraries(source_delta_publication_test ${OPENIVM_LINK_LIBS})
+  add_executable(source_delta_publication_test
+                 test/integration/source_delta_publication_test.cpp)
+  target_link_libraries(source_delta_publication_test ${OPENIVM_LINK_LIBS})
 endif()
 
 # Benchmark tools are currently supported on Unix native platforms.
 if(NOT EMSCRIPTEN AND NOT WIN32)
-    # TPC-C data generation tool
-    add_executable(tpcc_setup benchmark/src/tpcc_setup.cpp)
-    target_link_libraries(tpcc_setup ${OPENIVM_LINK_LIBS})
-    target_include_directories(tpcc_setup PUBLIC benchmark)
+  # TPC-C data generation tool
+  add_executable(tpcc_setup benchmark/src/tpcc_setup.cpp)
+  target_link_libraries(tpcc_setup ${OPENIVM_LINK_LIBS})
+  target_include_directories(tpcc_setup PUBLIC benchmark)
 
-    # Shared TPC-C helpers used by rewriter_benchmark, daemon_benchmark, and flag_benchmark.
-    add_library(tpcc_helpers STATIC benchmark/src/tpcc_helpers.cpp)
-    target_link_libraries(tpcc_helpers ${OPENIVM_LINK_LIBS})
-    target_include_directories(tpcc_helpers PUBLIC benchmark/src)
+  # Shared TPC-C helpers used by rewriter_benchmark, daemon_benchmark, and
+  # flag_benchmark.
+  add_library(tpcc_helpers STATIC benchmark/src/tpcc_helpers.cpp)
+  target_link_libraries(tpcc_helpers ${OPENIVM_LINK_LIBS})
+  target_include_directories(tpcc_helpers PUBLIC benchmark/src)
 
-    # TPC-DI schema + data helpers (used only by rewriter_benchmark).
-    add_library(tpcdi_helpers STATIC benchmark/src/tpcdi_helpers.cpp)
-    target_link_libraries(tpcdi_helpers ${OPENIVM_LINK_LIBS})
-    target_include_directories(tpcdi_helpers PUBLIC benchmark/src)
+  # TPC-DI schema + data helpers (used only by rewriter_benchmark).
+  add_library(tpcdi_helpers STATIC benchmark/src/tpcdi_helpers.cpp)
+  target_link_libraries(tpcdi_helpers ${OPENIVM_LINK_LIBS})
+  target_include_directories(tpcdi_helpers PUBLIC benchmark/src)
 
-    # IVM query benchmark harness (supports --workload tpcc|tpcdi)
-    add_executable(rewriter_benchmark benchmark/src/rewriter_benchmark.cpp)
-    target_link_libraries(rewriter_benchmark tpcc_helpers tpcdi_helpers ${OPENIVM_LINK_LIBS})
-    target_include_directories(rewriter_benchmark PUBLIC benchmark benchmark/src)
+  # IVM query benchmark harness (supports --workload tpcc|tpcdi)
+  add_executable(rewriter_benchmark benchmark/src/rewriter_benchmark.cpp)
+  target_link_libraries(rewriter_benchmark tpcc_helpers tpcdi_helpers
+                        ${OPENIVM_LINK_LIBS})
+  target_include_directories(rewriter_benchmark PUBLIC benchmark benchmark/src)
 
-    # Refresh-daemon / cascade / pipeline benchmark
-    add_executable(daemon_benchmark benchmark/src/daemon_benchmark.cpp)
-    target_link_libraries(daemon_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
-    target_include_directories(daemon_benchmark PUBLIC benchmark benchmark/src)
+  # Refresh-daemon / cascade / pipeline benchmark
+  add_executable(daemon_benchmark benchmark/src/daemon_benchmark.cpp)
+  target_link_libraries(daemon_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
+  target_include_directories(daemon_benchmark PUBLIC benchmark benchmark/src)
 
-    # Optimization-flag performance benchmark (Phase 2)
-    add_executable(flag_benchmark benchmark/src/flag_benchmark.cpp)
-    target_link_libraries(flag_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
-    target_include_directories(flag_benchmark PUBLIC benchmark benchmark/src)
+  # Optimization-flag performance benchmark (Phase 2)
+  add_executable(flag_benchmark benchmark/src/flag_benchmark.cpp)
+  target_link_libraries(flag_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
+  target_include_directories(flag_benchmark PUBLIC benchmark benchmark/src)
 
-    # Cost-model accuracy benchmark
-    add_executable(cost_model_benchmark benchmark/src/cost_model_benchmark.cpp)
-    target_link_libraries(cost_model_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
-    target_include_directories(cost_model_benchmark PUBLIC benchmark benchmark/src)
+  # Cost-model accuracy benchmark
+  add_executable(cost_model_benchmark benchmark/src/cost_model_benchmark.cpp)
+  target_link_libraries(cost_model_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
+  target_include_directories(cost_model_benchmark PUBLIC benchmark
+                                                         benchmark/src)
 endif()
+
+# DuckDB 2.0 registers statically linked extensions per executable.
+foreach(
+  OPENIVM_APP
+  scheduler_catalog_test
+  benchmark_metadata_test
+  source_delta_publication_test
+  tpcc_setup
+  rewriter_benchmark
+  daemon_benchmark
+  flag_benchmark
+  cost_model_benchmark)
+  if(TARGET ${OPENIVM_APP})
+    link_extension_libraries(${OPENIVM_APP} "")
+  endif()
+endforeach()

@@ -417,7 +417,7 @@ SELECT c_id, total FROM tt_fallback_alias ORDER BY c_id;
 2	20
 
 query I
-SELECT CASE WHEN sql_string LIKE '%tt_orders p AT (VERSION => 366)%' THEN 1 ELSE 0 END
+SELECT CASE WHEN sql_string LIKE '%tt_orders AS p AT (VERSION => 366)%' THEN 1 ELSE 0 END
 FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f66616c6c6261636b5f616c696173_';
 ----
 1
@@ -514,8 +514,8 @@ us	18
 
 # The stored SQL is the text shape: alias between the relation and its qualifier, one per relation.
 query I
-SELECT CASE WHEN sql_string LIKE '%tt_orders o AT (VERSION => 366)%'
-             AND sql_string LIKE '%tt_customers c AT (VERSION => 12)%'
+SELECT CASE WHEN sql_string LIKE '%tt_orders AS o AT (VERSION => 366)%'
+             AND sql_string LIKE '%tt_customers AS c AT (VERSION => 12)%'
             THEN 1 ELSE 0 END
 FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f746578745f6a6f696e_';
 ----

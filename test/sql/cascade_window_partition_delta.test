@@ -55,8 +55,7 @@ WHERE stmt_kind = 'data';
 1
 
 # ==========================================
-# Compile-only: force_view_delta_cascade=true must emit old/new temp
-# tables and a signed INSERT INTO openivm_delta_cw_mv with both legs.
+# Compile-only: force_view_delta_cascade=true must materialize old/new CTEs and a signed INSERT INTO openivm_delta_cw_mv with both legs.
 # ==========================================
 
 query IT
@@ -71,14 +70,16 @@ LIMIT 1;
 
 query I
 SELECT CASE WHEN
-       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_ AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_ AS%'
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_old___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_ AS MATERIALIZED (SELECT%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_new___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_ AS MATERIALIZED (SELECT%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%UNION ALL%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%AS MATERIALIZED (DELETE FROM%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%AS MATERIALIZED (INSERT INTO%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_old___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_new___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%DROP TABLE IF EXISTS openivm_old___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%DROP TABLE IF EXISTS openivm_new___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'cw_mv',
@@ -94,7 +95,7 @@ WHERE stmt_kind = 'data';
 # openivm_data_cw_mv and the user-visible MV stays bidirectionally
 # consistent with the base ROW_NUMBER query. Signed-delta emission into
 # openivm_delta_cw_mv requires facts.force_view_delta_cascade=true and is
-# covered by spark-ext integration tests.
+# covered by the chained window regression in window.test.
 # ==========================================
 
 statement ok

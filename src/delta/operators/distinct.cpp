@@ -54,8 +54,8 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
 	}
 	groups.push_back(make_uniq<BoundColumnRefExpression>(openivm::MULTIPLICITY_COL, input.mul_type, input_mul_binding));
 	auto agg_node = MakeGroupedAggregate(binder, std::move(groups), std::move(aggregates), std::move(rewritten_child));
-	const idx_t group_index = agg_node->group_index;
-	ColumnBinding mod_mul_binding(group_index, agg_node->groups.size() - 1);
+	const TableIndex group_index = agg_node->group_index;
+	ColumnBinding mod_mul_binding {group_index, ProjectionIndex(agg_node->groups.size() - 1)};
 
 	// Remap parent references: each original DISTINCT output binding (child's i-th binding)
 	// is replaced with the new aggregate's group output binding (group_index, group_position).
@@ -75,7 +75,7 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
 		if (child_bindings[i] == input_mul_binding) {
 			continue; // multiplicity is not in the parent's original bindings
 		}
-		ColumnBinding new_binding(group_index, group_position);
+		ColumnBinding new_binding {group_index, ProjectionIndex(group_position)};
 		replacer.replacement_bindings.emplace_back(original_bindings[original_position], new_binding);
 		original_position++;
 		group_position++;
@@ -89,8 +89,8 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
 
 	OPENIVM_DEBUG_PRINT("[DeltaDistinct] Done, replaced with AGGREGATE (%zu groups + 1 count), mul_binding: "
 	                    "table=%lu col=%lu\n",
-	                    agg_node->groups.size() - 1, (unsigned long)mod_mul_binding.table_index,
-	                    (unsigned long)mod_mul_binding.column_index);
+	                    agg_node->groups.size() - 1, (unsigned long)mod_mul_binding.table_index.index,
+	                    (unsigned long)mod_mul_binding.column_index.GetIndex());
 
 	return {std::move(agg_node), mod_mul_binding};
 }

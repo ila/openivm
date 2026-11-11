@@ -256,8 +256,8 @@ public:
 			return;
 		}
 
-		int wcount = wres->GetValue(0, 0).GetValue<int>();
-		int ccount = cres->GetValue(0, 0).GetValue<int>();
+		int wcount = wres->Collection().GetValue(0, 0).GetValue<int>();
+		int ccount = cres->Collection().GetValue(0, 0).GetValue<int>();
 
 		if (wcount == 0 || ccount == 0) {
 			Log("Error: Invalid data for transactions. Skipping.");
@@ -318,7 +318,7 @@ public:
 		Log("Verifying data integrity...");
 
 		auto GetCount = [this](const std::string &table) {
-			return conn.Query("SELECT COUNT(*) FROM " + table)->GetValue(0, 0).GetValue<int64_t>();
+			return conn.Query("SELECT COUNT(*) FROM " + table)->Collection().GetValue(0, 0).GetValue<int64_t>();
 		};
 
 		Log("Final row counts:");

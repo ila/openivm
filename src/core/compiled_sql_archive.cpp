@@ -14,7 +14,7 @@ namespace duckdb {
 
 bool CompiledSQLArchiveEnabled(ClientContext &context) {
 	Value value;
-	return context.TryGetCurrentSetting("openivm_archive_compiled_sql", value) && !value.IsNull() &&
+	return context.TryGetCurrentSetting(Identifier("openivm_archive_compiled_sql"), value) && !value.IsNull() &&
 	       value.GetValue<bool>();
 }
 
@@ -39,7 +39,7 @@ static string ArchiveTableName(const string &catalog, const string &schema, cons
 static vector<string> ArchiveRetentionStatements(ClientContext &context, const CompiledProgram &program,
                                                  const string &catalog, const string &schema) {
 	Value retention;
-	if (!context.TryGetCurrentSetting("openivm_compiled_sql_retention", retention) || retention.IsNull()) {
+	if (!context.TryGetCurrentSetting(Identifier("openivm_compiled_sql_retention"), retention) || retention.IsNull()) {
 		throw InternalException("Compiled SQL archive retention setting is missing");
 	}
 	auto programs = ArchiveTableName(catalog, schema, openivm::COMPILED_PROGRAMS_TABLE);
@@ -147,25 +147,27 @@ string WriteCompiledProgram(ClientContext &context, Connection &con, const Compi
 	// Same rules as BuildCompiledSQLArchiveStatements, but with bound parameters: DuckDB
 	// parses long string literals slowly, and refresh programs are several KB each.
 	auto execute = [&](const string &sql, vector<Value> parameters, string &error) {
-		unique_ptr<MaterializedQueryResult> materialized;
+		unique_ptr<QueryResult> materialized;
 		auto prepared = con.Prepare(sql);
 		if (prepared->HasError()) {
 			error = prepared->GetError();
 			return materialized;
 		}
-		auto result = prepared->Execute(parameters, false);
+		auto result = prepared->Execute(parameters);
 		if (result->HasError()) {
 			error = result->GetError();
 			return materialized;
 		}
-		materialized = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(result));
+		materialized = unique_ptr_cast<QueryResult, QueryResult>(std::move(result));
 		return materialized;
 	};
 	string error;
 	// Databases created before the archive existed get its tables on first use.
 	auto resolved_schema = schema.empty() ? string(DEFAULT_SCHEMA) : schema;
-	if (!con.TableInfo(catalog, resolved_schema, openivm::COMPILED_PROGRAMS_TABLE) ||
-	    !con.TableInfo(catalog, resolved_schema, openivm::COMPILED_STATEMENTS_TABLE)) {
+	if (!con.TableInfo(Identifier(catalog), Identifier(resolved_schema),
+	                   Identifier(openivm::COMPILED_PROGRAMS_TABLE)) ||
+	    !con.TableInfo(Identifier(catalog), Identifier(resolved_schema),
+	                   Identifier(openivm::COMPILED_STATEMENTS_TABLE))) {
 		for (auto &ddl : CompiledSQLArchiveSchemaDDL(catalog, schema)) {
 			auto created = con.Query(ddl);
 			if (created->HasError()) {
@@ -187,11 +189,11 @@ string WriteCompiledProgram(ClientContext &context, Connection &con, const Compi
 	bool changed = true;
 	int32_t version = 1;
 	if (stored->RowCount() > 0) {
-		version = stored->GetValue(0, 0).GetValue<int32_t>();
+		version = stored->Collection().GetValue(0, 0).GetValue<int32_t>();
 		// Verbatim comparison: same count, order, and text.
 		changed = stored->RowCount() != program.statements.size();
 		for (idx_t row = 0; !changed && row < stored->RowCount(); row++) {
-			auto value = stored->GetValue(1, row);
+			auto value = stored->Collection().GetValue(1, row);
 			changed = value.IsNull() || StringValue::Get(value) != program.statements[row];
 		}
 		if (changed) {
@@ -233,7 +235,7 @@ string WriteCompiledProgram(ClientContext &context, Connection &con, const Compi
 			return error;
 		}
 		// A version row deleted by hand is described again, as in the SQL form.
-		if (updated->GetValue(0, 0).GetValue<int64_t>() == 0 && !describe_version()) {
+		if (updated->Collection().GetValue(0, 0).GetValue<int64_t>() == 0 && !describe_version()) {
 			return error;
 		}
 	}

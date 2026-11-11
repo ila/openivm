@@ -1,3 +1,5 @@
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/extension_statement.hpp"
 #include "duckdb.hpp"
 #include "core/parser.hpp"
 #include "core/parser_create_mv_helpers.hpp"
@@ -47,6 +49,15 @@ public:
 } // namespace duckdb
 
 using namespace duckdb;
+
+static ParserExtensionParseResult ParseMaterializedViewStatement(ClientContext &context, const string &sql) {
+	Parser parser(context);
+	parser.ParseQuery(sql);
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::EXTENSION_STATEMENT) {
+		throw InvalidInputException("Publication fixture expected one materialized-view statement");
+	}
+	return ParserExtensionParseResult(std::move(parser.statements[0]->Cast<ExtensionStatement>().parse_data));
+}
 
 static void Execute(Connection &con, const string &sql) {
 	// Flush before execution so a coordinator timeout identifies the blocked
@@ -155,8 +166,8 @@ static void TestPublication(bool explicit_transaction) {
 	// Stop exactly after planning has committed the physical source delta,
 	// before the first view's ownership metadata is published.
 	first.context->transaction.BeginTransaction();
-	auto parsed = ParseMaterializedViewStatement("CREATE MATERIALIZED VIEW first_mv AS SELECT * FROM source;",
-	                                             SqlDialect::DUCKDB);
+	auto parsed =
+	    ParseMaterializedViewStatement(*first.context, "CREATE MATERIALIZED VIEW first_mv AS SELECT * FROM source;");
 	auto planned = MaterializedViewParserExtension::PlanFunction(nullptr, *first.context, std::move(parsed.parse_data));
 	Execute(observer, "SELECT CASE WHEN (SELECT count(*) FROM duckdb_tables() WHERE schema_name='Internal Space' "
 	                  "AND table_name='openivm_delta_6d61696e_source')=1 "
@@ -233,8 +244,8 @@ static void TestDMLDuringPublication(bool dedicated_schema, const string &first_
 	                     "; CREATE SCHEMA \"Source.Space\"; CREATE TABLE " + source + "(i INTEGER); INSERT INTO " +
 	                     source + " VALUES (1),(1),(2),(3);");
 	creator.context->transaction.BeginTransaction();
-	auto parsed = ParseMaterializedViewStatement(
-	    "CREATE MATERIALIZED VIEW " + view + " AS SELECT * FROM " + source + ";", SqlDialect::DUCKDB);
+	auto parsed = ParseMaterializedViewStatement(*creator.context, "CREATE MATERIALIZED VIEW " + view +
+	                                                                   " AS SELECT * FROM " + source + ";");
 	auto planned =
 	    MaterializedViewParserExtension::PlanFunction(nullptr, *creator.context, std::move(parsed.parse_data));
 	Execute(observer, "SELECT CASE WHEN (SELECT count(*) FROM duckdb_tables() WHERE schema_name=" +
@@ -324,8 +335,8 @@ static void TestDropDuringPublication(bool explicit_transaction, bool staged_dro
 	}
 	Execute(creator, "CREATE MATERIALIZED VIEW " + dropped_view + " AS SELECT * FROM source;");
 	creator.context->transaction.BeginTransaction();
-	auto parsed = ParseMaterializedViewStatement("CREATE MATERIALIZED VIEW second_mv AS SELECT * FROM source;",
-	                                             SqlDialect::DUCKDB);
+	auto parsed =
+	    ParseMaterializedViewStatement(*creator.context, "CREATE MATERIALIZED VIEW second_mv AS SELECT * FROM source;");
 	auto planned =
 	    MaterializedViewParserExtension::PlanFunction(nullptr, *creator.context, std::move(parsed.parse_data));
 	if (explicit_transaction) {

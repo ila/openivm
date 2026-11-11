@@ -60,7 +60,8 @@ DeltaPlanFragment CompileFilterDelta(DeltaOperatorInput input) {
 		plan_as_filter->projection_map.emplace_back(mul_index);
 	}
 	OPENIVM_DEBUG_PRINT("[DeltaFilter] Done, mul_binding: table=%lu col=%lu\n",
-	                    (unsigned long)child_mul_binding.table_index, (unsigned long)child_mul_binding.column_index);
+	                    (unsigned long)child_mul_binding.table_index.index,
+	                    (unsigned long)child_mul_binding.column_index.GetIndex());
 	return {std::move(plan_as_filter), child_mul_binding};
 }
 

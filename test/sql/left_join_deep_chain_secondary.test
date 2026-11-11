@@ -121,10 +121,9 @@ SELECT nation, n_ord, n_line, n_supp, n_part FROM mv5
 0
 
 # Repeated guards for the same leaf/key pair share one transition-count plan.
-# In this 3-leaf chain the serialized plan has three transition definitions
-# (one in the outer join compilation and two across its nested compilation),
-# with five current_count references each. Cloning per inclusion/exclusion term
-# produced more copies.
+# In this 3-leaf chain the serialized plan has one transition definition for
+# each LEFT JOIN edge (b by aid and c by bid), with five current_count references
+# each. Cloning per inclusion/exclusion term or nested compilation produces more copies.
 statement ok
 CREATE TABLE transition_share_a (id INTEGER);
 
@@ -166,7 +165,7 @@ query I
 SELECT len(regexp_extract_all(content, 'current_count'))
 FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_7472616e736974696f6e5f73686172655f6d76_.sql');
 ----
-15
+10
 
 query I
 SELECT count(*) FROM (

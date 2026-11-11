@@ -129,8 +129,8 @@ void RefreshDaemon::Run() {
 					auto elapsed_result = con.Query("SELECT EXTRACT(EPOCH FROM (" + string(openivm::UTC_NOW_SQL) +
 					                                " - '" + sv.last_update + "'::TIMESTAMP))");
 					if (!elapsed_result->HasError() && elapsed_result->RowCount() > 0 &&
-					    !elapsed_result->GetValue(0, 0).IsNull()) {
-						auto elapsed_seconds = elapsed_result->GetValue(0, 0).GetValue<double>();
+					    !elapsed_result->Collection().GetValue(0, 0).IsNull()) {
+						auto elapsed_seconds = elapsed_result->Collection().GetValue(0, 0).GetValue<double>();
 						if (elapsed_seconds < static_cast<double>(interval)) {
 							continue; // not due yet
 						}

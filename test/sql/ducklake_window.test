@@ -7,7 +7,7 @@ require openivm
 require parquet
 
 statement ok
-INSTALL ducklake;
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository';
 
 statement ok
 LOAD ducklake;
@@ -78,6 +78,91 @@ SELECT count(*) FROM (
         H_AMOUNT / NULLIF(SUM(H_AMOUNT) OVER (PARTITION BY H_W_ID), 0) AS share
     FROM dl.history_win
     WHERE H_AMOUNT > 0
+);
+----
+0
+
+# Differently partitioned windows must recompute a scope that is broad enough
+# for every window. In particular, changing one district can change the rank of
+# rows in every district sharing the same warehouse and credit code.
+statement ok
+CREATE TABLE dl.window_multi_scope (
+    w INT,
+    d INT,
+    c INT,
+    credit VARCHAR,
+    amount INT
+);
+
+statement ok
+INSERT INTO dl.window_multi_scope VALUES
+    (1, 1, 1, 'GC', 100),
+    (1, 2, 2, 'GC', 90),
+    (1, 3, 3, 'BC', 80),
+    (2, 1, 1, 'GC', 70);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_window_multi_scope AS
+SELECT
+    w,
+    d,
+    c,
+    credit,
+    amount,
+    SUM(amount) OVER (PARTITION BY w, d, c) AS customer_amount,
+    DENSE_RANK() OVER (PARTITION BY w, credit ORDER BY amount DESC, c) AS credit_rank,
+    COUNT(*) OVER (PARTITION BY w, d) AS district_rows
+FROM dl.window_multi_scope;
+
+query I
+SELECT group_columns FROM openivm_views
+WHERE view_sql_name = 'mv_window_multi_scope' AND view_catalog = 'dl';
+----
+w=w
+
+# Batch conflicting operations before a single refresh. The inserted GC row is
+# updated before refresh, while another GC row is updated and then deleted.
+statement ok
+INSERT INTO dl.window_multi_scope VALUES (1, 4, 4, 'GC', 110);
+UPDATE dl.window_multi_scope SET amount = 120 WHERE w = 1 AND d = 4 AND c = 4;
+UPDATE dl.window_multi_scope SET amount = 95 WHERE w = 1 AND d = 2 AND c = 2;
+DELETE FROM dl.window_multi_scope WHERE w = 1 AND d = 2 AND c = 2;
+
+statement ok
+PRAGMA refresh('mv_window_multi_scope');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM dl.mv_window_multi_scope
+    EXCEPT ALL
+    SELECT
+        w,
+        d,
+        c,
+        credit,
+        amount,
+        SUM(amount) OVER (PARTITION BY w, d, c),
+        DENSE_RANK() OVER (PARTITION BY w, credit ORDER BY amount DESC, c),
+        COUNT(*) OVER (PARTITION BY w, d)
+    FROM dl.window_multi_scope
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        w,
+        d,
+        c,
+        credit,
+        amount,
+        SUM(amount) OVER (PARTITION BY w, d, c),
+        DENSE_RANK() OVER (PARTITION BY w, credit ORDER BY amount DESC, c),
+        COUNT(*) OVER (PARTITION BY w, d)
+    FROM dl.window_multi_scope
+    EXCEPT ALL
+    SELECT * FROM dl.mv_window_multi_scope
 );
 ----
 0

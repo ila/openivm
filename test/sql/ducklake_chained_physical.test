@@ -9,7 +9,7 @@ require parquet
 load __TEST_DIR__/ducklake_chained_physical_main.db
 
 statement ok
-INSTALL ducklake;
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository';
 
 statement ok
 LOAD ducklake;
