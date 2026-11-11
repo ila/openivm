@@ -303,7 +303,7 @@ struct JoinPlanFacts {
 	string ducklake_fallback_reason;
 	bool has_outer_join = false;
 	bool only_inner_joins = true;
-	bool only_inner_or_left_joins = true;
+	bool only_inner_or_one_sided_outer_joins = true;
 };
 
 // Collect join leaves and the properties needed to select a compilation strategy. Non-join wrappers remain leaves,
@@ -348,8 +348,9 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 		if (!join || join->join_type != JoinType::INNER) {
 			facts.only_inner_joins = false;
 		}
-		if (!join || (join->join_type != JoinType::INNER && join->join_type != JoinType::LEFT)) {
-			facts.only_inner_or_left_joins = false;
+		if (!join || (join->join_type != JoinType::INNER && join->join_type != JoinType::LEFT &&
+		              join->join_type != JoinType::RIGHT)) {
+			facts.only_inner_or_one_sided_outer_joins = false;
 		}
 	}
 	if ((collect_leaf || collect_ducklake_leaf) && is_join_tree_node) {
@@ -1866,12 +1867,11 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	                          SqlUtils::GetBoolSetting(context, "openivm_regular_nterm", true);
 	bool regular_nterm;
 	if (has_left_join) {
-		// LEFT-JOIN telescoping: the regular N-term delta extends to LEFT joins via
-		// per-term demotion of only the outer join whose NULL-supplying side carries
-		// that term's delta (see BuildRegularJoinTerms). FULL OUTER / RIGHT shapes and
+		// One-sided outer-join telescoping demotes only the join whose NULL-supplying
+		// side carries that term's delta (see BuildRegularJoinTerms). FULL OUTER shapes and
 		// the inclusion-exclusion FK-pruning path are out of scope; NULL-padded row
 		// correctness is completed by BuildLeftJoinProjectionRefresh in the upsert layer.
-		regular_nterm = regular_nterm_base && join_facts.only_inner_or_left_joins &&
+		regular_nterm = regular_nterm_base && join_facts.only_inner_or_one_sided_outer_joins &&
 		                SqlUtils::GetBoolSetting(context, "openivm_regular_nterm_left", true);
 	} else {
 		regular_nterm = regular_nterm_base && join_facts.only_inner_joins &&
