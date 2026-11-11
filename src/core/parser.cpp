@@ -428,9 +428,17 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// original MV's user-facing view/data table.
 		auto metadata_state = TransactionalMVMetadataState::TryGet(context);
 		bool pending_drop = metadata_state && metadata_state->HasPendingViewDrop(view_name);
-		if (!pending_drop && (RelationExists(context, view_target_catalog, view_target_schema, view_name) ||
-		                      RelationExists(context, internal_target_catalog, internal_target_schema, data_table))) {
-			throw CatalogException("Table with name \"" + view_name + "\" already exists!");
+		bool already_exists =
+		    !pending_drop && (RelationExists(context, view_target_catalog, view_target_schema, view_name) ||
+		                      RelationExists(context, view_target_catalog, view_target_schema, sql_view_name) ||
+		                      RelationExists(context, internal_target_catalog, internal_target_schema, data_table));
+		// The mutation gate is held and an autocommit snapshot was renewed after admission, so a CREATE
+		// that committed earlier is visible here. Name the user's view, not its internal key. A
+		// write-write conflict that still reaches the physical CREATE is translated by the lifecycle
+		// executor (parser_ddl.cpp).
+		if (already_exists) {
+			throw CatalogException("materialized view \"%s\" already exists in \"%s\".\"%s\"", sql_view_name,
+			                       view_target_catalog, view_target_schema);
 		}
 	}
 

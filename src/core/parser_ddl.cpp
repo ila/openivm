@@ -1121,6 +1121,48 @@ private:
 	vector<string> settings;
 };
 
+// A concurrent duplicate CREATE can lose on the physical data table with DuckDB's write-write
+// conflict, which names the internal table. Its key encodes the lowercase catalog, schema and
+// view name in hex, so recover the user-facing name. Returns empty if this is not that conflict.
+static string DuplicateCreateMessage(const string &error) {
+	if (error.find("write-write conflict on create") == string::npos) {
+		return string();
+	}
+	static const string KEY_PREFIX = "openivm_data___openivm_mv_";
+	auto start = error.find(KEY_PREFIX);
+	if (start == string::npos) {
+		return string();
+	}
+	vector<string> parts;
+	string current;
+	for (auto i = start + KEY_PREFIX.size(); i < error.size() && parts.size() < 3; i++) {
+		char c = error[i];
+		if (c == '_') {
+			parts.push_back(std::move(current));
+			current.clear();
+		} else if (std::isxdigit(static_cast<unsigned char>(c))) {
+			current += c;
+		} else {
+			return string();
+		}
+	}
+	if (parts.size() != 3) {
+		return string();
+	}
+	vector<string> decoded;
+	for (auto &part : parts) {
+		if (part.empty() || part.size() % 2 != 0) {
+			return string();
+		}
+		string name;
+		for (idx_t i = 0; i < part.size(); i += 2) {
+			name += static_cast<char>(std::stoi(part.substr(i, 2), nullptr, 16));
+		}
+		decoded.push_back(std::move(name));
+	}
+	return "materialized view \"" + decoded[2] + "\" already exists in \"" + decoded[0] + "\".\"" + decoded[1] + "\"";
+}
+
 struct LifecycleStepState {
 	unique_ptr<PhysicalPlan> plan;
 	PipelineBuildState build_state;
@@ -1257,7 +1299,11 @@ public:
 		} catch (std::exception &ex) {
 			// A late bind failure is an execution failure of this whole lifecycle,
 			// even when DuckDB would normally permit committing after a binder error.
-			ValidChecker::Invalidate(client.ActiveTransaction(), ex.what());
+			auto duplicate = DuplicateCreateMessage(ex.what());
+			ValidChecker::Invalidate(client.ActiveTransaction(), duplicate.empty() ? string(ex.what()) : duplicate);
+			if (!duplicate.empty()) {
+				throw CatalogException("%s", duplicate);
+			}
 			throw;
 		}
 		state.metrics.reset();
