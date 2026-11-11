@@ -78,7 +78,7 @@ unique_ptr<LogicalOperator> AssembleJoinUnionAll(vector<unique_ptr<LogicalOperat
 		vector<ColumnBinding> bindings;
 		auto table_index = binder.GenerateTableIndex();
 		for (idx_t i = 0; i < types.size(); i++) {
-			bindings.emplace_back(table_index, i);
+			bindings.emplace_back(table_index, ProjectionIndex(i));
 		}
 		auto empty = make_uniq<LogicalEmptyResult>(types, std::move(bindings));
 		empty->ResolveOperatorTypes();

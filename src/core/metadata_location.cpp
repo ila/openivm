@@ -76,15 +76,16 @@ AttachedCatalog DescribeCatalog(Connection &con, const string &catalog) {
 		return info;
 	}
 	info.found = true;
-	info.name = result->GetValue(0, 0).ToString();
-	info.type = result->GetValue(1, 0).IsNull() ? "" : result->GetValue(1, 0).ToString();
-	info.read_only = !result->GetValue(2, 0).IsNull() && result->GetValue(2, 0).GetValue<bool>();
+	info.name = result->Collection().GetValue(0, 0).ToString();
+	info.type = result->Collection().GetValue(1, 0).IsNull() ? "" : result->Collection().GetValue(1, 0).ToString();
+	info.read_only =
+	    !result->Collection().GetValue(2, 0).IsNull() && result->Collection().GetValue(2, 0).GetValue<bool>();
 	return info;
 }
 
 string SettingText(ClientContext &context, const char *name) {
 	Value value;
-	if (!context.TryGetCurrentSetting(name, value) || value.IsNull()) {
+	if (!context.TryGetCurrentSetting(Identifier(name), value) || value.IsNull()) {
 		return "";
 	}
 	return value.ToString();
@@ -119,7 +120,7 @@ bool ReadMarker(Connection &con, const string &catalog, MetadataLocation &out) {
 	if (!info.found || !StringUtil::CIEquals(info.type, NATIVE_CATALOG_TYPE)) {
 		return false;
 	}
-	if (!con.TableInfo(info.name, DEFAULT_SCHEMA, openivm::METADATA_MARKER_TABLE)) {
+	if (!con.TableInfo(Identifier(info.name), Identifier(DEFAULT_SCHEMA), Identifier(openivm::METADATA_MARKER_TABLE))) {
 		return false;
 	}
 	auto marker = SqlUtils::FullName(info.name, DEFAULT_SCHEMA, openivm::METADATA_MARKER_TABLE);
@@ -127,11 +128,12 @@ bool ReadMarker(Connection &con, const string &catalog, MetadataLocation &out) {
 	if (rows->HasError()) {
 		throw CatalogException("OpenIVM could not read metadata location marker %s: %s", marker, rows->GetError());
 	}
-	if (rows->RowCount() != 1 || rows->GetValue(0, 0).IsNull() || rows->GetValue(1, 0).IsNull()) {
+	if (rows->RowCount() != 1 || rows->Collection().GetValue(0, 0).IsNull() ||
+	    rows->Collection().GetValue(1, 0).IsNull()) {
 		throw CatalogException("OpenIVM metadata location marker %s must contain exactly one non-NULL row", marker);
 	}
-	auto target_catalog = rows->GetValue(0, 0).ToString();
-	auto target_schema = rows->GetValue(1, 0).ToString();
+	auto target_catalog = rows->Collection().GetValue(0, 0).ToString();
+	auto target_schema = rows->Collection().GetValue(1, 0).ToString();
 	auto target = DescribeCatalog(con, target_catalog);
 	if (!target.found) {
 		throw CatalogException("OpenIVM metadata for materialized views in catalog '%s' is stored in %s.%s, which is "
@@ -141,7 +143,8 @@ bool ReadMarker(Connection &con, const string &catalog, MetadataLocation &out) {
 	RequireSupportedType(target);
 	if (!StringUtil::CIEquals(target.type, NATIVE_CATALOG_TYPE)) {
 		unordered_set<string> visited;
-		while (con.TableInfo(target.name, target_schema, openivm::METADATA_REDIRECT_TABLE)) {
+		while (con.TableInfo(Identifier(target.name), Identifier(target_schema),
+		                     Identifier(openivm::METADATA_REDIRECT_TABLE))) {
 			if (!visited.insert(StringUtil::Lower(target_schema)).second) {
 				throw CatalogException("OpenIVM metadata schema redirect cycle in catalog '%s'", target.name);
 			}
@@ -150,11 +153,11 @@ bool ReadMarker(Connection &con, const string &catalog, MetadataLocation &out) {
 			if (redirect->HasError()) {
 				throw CatalogException(redirect->GetError());
 			}
-			if (redirect->RowCount() != 1 || redirect->GetValue(0, 0).IsNull()) {
+			if (redirect->RowCount() != 1 || redirect->Collection().GetValue(0, 0).IsNull()) {
 				throw CatalogException("OpenIVM metadata redirect in '%s.%s' must contain one non-NULL schema",
 				                       target.name, target_schema);
 			}
-			target_schema = redirect->GetValue(0, 0).ToString();
+			target_schema = redirect->Collection().GetValue(0, 0).ToString();
 		}
 	}
 	out = FromCatalog(target,
@@ -178,8 +181,9 @@ MetadataLocation MetadataLocator::At(Connection &con, const string &catalog, con
 }
 
 MetadataLocation MetadataLocator::Resolve(ClientContext &context, Connection &con, const string &view_catalog) {
-	auto catalog =
-	    view_catalog.empty() ? ClientData::Get(context).catalog_search_path->GetDefault().catalog : view_catalog;
+	auto catalog = view_catalog.empty()
+	                   ? ClientData::Get(context).catalog_search_path->GetDefault().GetCatalog().GetIdentifierName()
+	                   : view_catalog;
 	auto info = DescribeCatalog(con, catalog);
 	if (!info.found || !StringUtil::CIEquals(info.type, NATIVE_CATALOG_TYPE)) {
 		info = DescribeCatalog(con, PhysicalDefaultCatalog(DatabaseInstance::GetDatabase(context)));
@@ -251,7 +255,7 @@ vector<MetadataLocation> MetadataLocator::All(Connection &con, const string &tab
 				return;
 			}
 		}
-		if (!con.TableInfo(location.catalog, location.schema, table)) {
+		if (!con.TableInfo(Identifier(location.catalog), Identifier(location.schema), Identifier(table))) {
 			return;
 		}
 		result.push_back(location);
@@ -267,9 +271,10 @@ vector<MetadataLocation> MetadataLocator::All(Connection &con, const string &tab
 	for (idx_t row = 0; row < rows->RowCount(); row++) {
 		AttachedCatalog info;
 		info.found = true;
-		info.name = rows->GetValue(0, row).ToString();
+		info.name = rows->Collection().GetValue(0, row).ToString();
 		info.type = NATIVE_CATALOG_TYPE;
-		info.read_only = !rows->GetValue(1, row).IsNull() && rows->GetValue(1, row).GetValue<bool>();
+		info.read_only =
+		    !rows->Collection().GetValue(1, row).IsNull() && rows->Collection().GetValue(1, row).GetValue<bool>();
 		MetadataLocation marked;
 		if (ReadMarker(con, info.name, marked)) {
 			add(marked);
@@ -286,7 +291,8 @@ void MetadataLocator::ValidateExclusive(Connection &con, const MetadataLocation 
 		return;
 	}
 	for (auto &other : All(con)) {
-		if (other.Matches(location) || !con.TableInfo(other.catalog, other.schema, openivm::VIEWS_TABLE)) {
+		if (other.Matches(location) ||
+		    !con.TableInfo(Identifier(other.catalog), Identifier(other.schema), Identifier(openivm::VIEWS_TABLE))) {
 			continue;
 		}
 		auto count = con.Query("SELECT count(*) FROM " + other.Table(openivm::VIEWS_TABLE));
@@ -294,7 +300,7 @@ void MetadataLocator::ValidateExclusive(Connection &con, const MetadataLocation 
 			throw CatalogException("OpenIVM could not inspect metadata in %s: %s", other.DisplayName(),
 			                       count->GetError());
 		}
-		auto registered = count->GetValue(0, 0).GetValue<int64_t>();
+		auto registered = count->Collection().GetValue(0, 0).GetValue<int64_t>();
 		if (registered > 0) {
 			throw CatalogException(
 			    "openivm_metadata_catalog/openivm_metadata_schema select %s, but %s materialized view(s) are already "
@@ -364,12 +370,12 @@ bool MetadataLocator::IsNativeCatalog(Connection &con, const string &catalog) {
 
 string MetadataLocator::PhysicalDefaultCatalog(DatabaseInstance &db) {
 	Connection con(db);
-	return DatabaseManager::GetDefaultDatabase(*con.context);
+	return DatabaseManager::GetDefaultDatabase(*con.context).GetIdentifierName();
 }
 
 int64_t MetadataLocator::LeaseSeconds(ClientContext &context) {
 	Value value;
-	if (context.TryGetCurrentSetting(openivm::METADATA_LEASE_SETTING, value) && !value.IsNull()) {
+	if (context.TryGetCurrentSetting(Identifier(openivm::METADATA_LEASE_SETTING), value) && !value.IsNull()) {
 		// A zero lease would expire before the first statement.
 		return MaxValue<int64_t>(1, value.GetValue<int64_t>());
 	}
@@ -421,11 +427,12 @@ string ReadServerClock(Connection &con, const LeaseRow &row, string &server_now,
 	if (clock->HasError()) {
 		return "could not read the PostgreSQL server clock: " + clock->GetError();
 	}
-	if (clock->RowCount() != 1 || clock->GetValue(0, 0).IsNull() || clock->GetValue(1, 0).IsNull()) {
+	if (clock->RowCount() != 1 || clock->Collection().GetValue(0, 0).IsNull() ||
+	    clock->Collection().GetValue(1, 0).IsNull()) {
 		return "the PostgreSQL server clock returned no time";
 	}
-	server_now = clock->GetValue(0, 0).DefaultCastAs(LogicalType::TIMESTAMP).ToSQLString();
-	lease_until = clock->GetValue(1, 0).DefaultCastAs(LogicalType::TIMESTAMP).ToSQLString();
+	server_now = clock->Collection().GetValue(0, 0).DefaultCastAs(LogicalType::TIMESTAMP).ToSQLString();
+	lease_until = clock->Collection().GetValue(1, 0).DefaultCastAs(LogicalType::TIMESTAMP).ToSQLString();
 	return "";
 }
 
@@ -443,8 +450,8 @@ string RenewLeaseRow(Connection &con, const LeaseRow &row, bool &owned) {
 	if (renewed->HasError()) {
 		return renewed->GetError();
 	}
-	owned = renewed->RowCount() == 1 && !renewed->GetValue(0, 0).IsNull() &&
-	        renewed->GetValue(0, 0).GetValue<int64_t>() == 1;
+	owned = renewed->RowCount() == 1 && !renewed->Collection().GetValue(0, 0).IsNull() &&
+	        renewed->Collection().GetValue(0, 0).GetValue<int64_t>() == 1;
 	return "";
 }
 
@@ -554,8 +561,8 @@ RefreshLease::RefreshLease(ClientContext &context, const MetadataLocation &locat
 	if (result->HasError()) {
 		string holder = "unknown";
 		auto current = con.Query("SELECT lease_until FROM " + row.table + " WHERE view_name = " + view_literal);
-		if (!current->HasError() && current->RowCount() > 0 && !current->GetValue(0, 0).IsNull()) {
-			holder = current->GetValue(0, 0).ToString();
+		if (!current->HasError() && current->RowCount() > 0 && !current->Collection().GetValue(0, 0).IsNull()) {
+			holder = current->Collection().GetValue(0, 0).ToString();
 		}
 		throw TransactionException("Materialized view '%s' is locked by another OpenIVM client sharing "
 		                           "metadata catalog %s (lease held until %s UTC, PostgreSQL server time). Retry "

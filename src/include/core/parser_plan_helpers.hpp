@@ -39,11 +39,6 @@ struct SourceTableInfo {
 	string schema_name;
 };
 
-struct BaseColumnRef {
-	string table;
-	string column;
-};
-
 struct OccurrenceColumnRef {
 	string table;
 	idx_t occurrence = 0;
@@ -53,7 +48,7 @@ struct OccurrenceColumnRef {
 struct ProjectionSourceOccurrence {
 	string table;
 	idx_t occurrence = 0;
-	idx_t table_index = 0;
+	TableIndex table_index {0};
 };
 
 struct ProjectionLineageEdge {
@@ -65,7 +60,7 @@ struct CreateMVPlanNodeFacts {
 	LogicalOperator *plan_node = nullptr;
 	vector<idx_t> child_ids;
 	vector<idx_t> group_column_search_ids;
-	vector<idx_t> subtree_table_indices;
+	vector<TableIndex> subtree_table_indices;
 	vector<string> subtree_base_tables;
 	bool subtree_base_tables_complete = true;
 	bool contains_table_function = false;
@@ -86,19 +81,19 @@ struct CreateMVPlanFacts {
 	vector<LogicalJoin *> outer_joins;
 	vector<LogicalWindow *> windows;
 	unordered_map<const LogicalOperator *, idx_t> plan_node_ids;
-	unordered_map<idx_t, LogicalProjection *> projections_by_index;
-	unordered_map<idx_t, LogicalGet *> gets_by_index;
-	unordered_map<idx_t, LogicalSetOperation *> setops_by_index;
-	unordered_map<idx_t, LogicalCTERef *> cte_refs_by_table_index;
-	unordered_map<idx_t, LogicalOperator *> cte_defs_by_index;
+	unordered_map<TableIndex, LogicalProjection *> projections_by_index;
+	unordered_map<TableIndex, LogicalGet *> gets_by_index;
+	unordered_map<TableIndex, LogicalSetOperation *> setops_by_index;
+	unordered_map<TableIndex, LogicalCTERef *> cte_refs_by_table_index;
+	unordered_map<TableIndex, LogicalOperator *> cte_defs_by_index;
 	unordered_map<string, string> join_parents;
 	vector<BoundColumnRefExpression *> join_refs;
 	unordered_set<string> single_delim_key_bindings;
-	unordered_map<idx_t, ProjectionSourceOccurrence> occurrence_by_index;
+	unordered_map<TableIndex, ProjectionSourceOccurrence> occurrence_by_index;
 	vector<ProjectionSourceOccurrence> source_occurrences;
 	vector<ProjectionLineageEdge> projection_lineage_edges;
 	unordered_map<const LogicalOperator *, string> first_table_name;
-	unordered_map<idx_t, int> cte_refs_under_join_count;
+	unordered_map<TableIndex, int> cte_refs_under_join_count;
 	bool has_union_before_aggregate = false;
 	bool has_unsupported_set_operation = false;
 	bool has_repeated_cte_ref_under_join = false;
@@ -122,12 +117,13 @@ string QualifyCreateSourceTable(ClientContext &context, const string &table_name
                                 const string &default_schema);
 string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query);
 CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &current_catalog);
-bool ResolvesToOutputBinding(idx_t table_index, idx_t column_index, idx_t group_index, size_t group_count,
-                             const CreateMVPlanFacts &facts, bool through_casts, int depth = 0);
+bool ResolvesToOutputBinding(TableIndex table_index, ProjectionIndex column_index, TableIndex group_index,
+                             size_t group_count, const CreateMVPlanFacts &facts, bool through_casts, int depth = 0);
 bool ProducesAtMostOneRow(LogicalOperator &node);
 bool IsRedundantDistinctOverGroupKeys(LogicalOperator &node);
-void AddJoinKeyColumn(const unique_ptr<Expression> &expr, unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols);
-bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, idx_t group_index);
+void AddJoinKeyColumn(const unique_ptr<Expression> &expr,
+                      unordered_map<TableIndex, unordered_set<ProjectionIndex>> &join_key_cols);
+bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, TableIndex group_index);
 // delta_view_catalog_prefix must be the same prefix the view's delta table was created with
 // (internal_catalog_prefix). Without it the generated INSERT targets an unqualified delta table,
 // which fails for MVs whose state lives in another catalog -- e.g. DuckLake-backed views, where the
@@ -142,7 +138,7 @@ RefreshMetadata::LeftJoinSecondaryMeta BuildLeftJoinSecondaryDeltaSQL(ClientCont
                                                                       const string &view_name,
                                                                       const string &delta_view_catalog_prefix);
 bool OuterJoinPreservedSideHasTableFunction(const CreateMVPlanFacts &facts);
-vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, idx_t group_index, size_t group_count,
+vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, TableIndex group_index, size_t group_count,
                                       const vector<string> &output_names);
 vector<string> DeriveScalarDelimKeyColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names);
 vector<string> DeriveAggregateGroupColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names,

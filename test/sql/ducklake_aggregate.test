@@ -7,7 +7,7 @@ require openivm
 require parquet
 
 statement ok
-INSTALL ducklake;
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository';
 
 statement ok
 LOAD ducklake;
@@ -36,6 +36,24 @@ CREATE MATERIALIZED VIEW dl.sales_summary AS
     SELECT region, SUM(amount) AS total, COUNT(amount) AS cnt
     FROM dl.sales GROUP BY region;
 
+# The DuckLake insert-only aggregate path stages target rowids for UPDATE/INSERT.
+query I
+SELECT (COUNT(*) > 0)::INTEGER
+FROM openivm_compile_with_facts('dl.sales_summary',
+    '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}')
+WHERE contains(sql, 'openivm_rowid_matches_');
+----
+1
+
+# Compile-only output without an insert-only fact must not assume the rowid path.
+query I
+SELECT (COUNT(*) = 0)::INTEGER
+FROM openivm_compile_with_facts('dl.sales_summary',
+    '{"target_dialect":"duckdb","compile_only":true}')
+WHERE contains(sql, 'openivm_rowid_matches_');
+----
+1
+
 query III
 SELECT region, total, cnt FROM dl.sales_summary ORDER BY region;
 ----
@@ -47,7 +65,19 @@ statement ok
 INSERT INTO dl.sales VALUES (4, 'east', 50);
 
 statement ok
+CREATE TEMP TABLE rowid_refresh_before AS SELECT id FROM dl.current_snapshot();
+
+statement ok
 PRAGMA refresh('sales_summary');
+
+# The staged UPDATE/INSERT commits as one DuckLake snapshot.
+query I
+SELECT id - (SELECT id FROM rowid_refresh_before) FROM dl.current_snapshot();
+----
+1
+
+statement ok
+DROP TABLE rowid_refresh_before;
 
 query I
 SELECT count(*) FROM (
@@ -84,6 +114,52 @@ query I
 SELECT count(*) FROM (
     SELECT region, total, cnt FROM dl.sales_summary
     EXCEPT ALL SELECT region, SUM(amount) AS total, COUNT(amount) AS cnt FROM dl.sales GROUP BY region
+);
+----
+0
+
+# A new NULL key and an existing group share one insert-only refresh.
+statement ok
+INSERT INTO dl.sales VALUES (6, NULL, 5), (7, NULL, 7), (8, 'east', 3);
+
+statement ok
+PRAGMA refresh('sales_summary');
+
+query I
+SELECT count(*) FROM (
+    SELECT region, SUM(amount), COUNT(amount) FROM dl.sales GROUP BY region
+    EXCEPT ALL SELECT region, total, cnt FROM dl.sales_summary
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT region, total, cnt FROM dl.sales_summary
+    EXCEPT ALL SELECT region, SUM(amount), COUNT(amount) FROM dl.sales GROUP BY region
+);
+----
+0
+
+# Match that NULL group on the next refresh and insert another new group.
+statement ok
+INSERT INTO dl.sales VALUES (9, NULL, 11), (10, 'south', 13);
+
+statement ok
+PRAGMA refresh('sales_summary');
+
+query I
+SELECT count(*) FROM (
+    SELECT region, SUM(amount), COUNT(amount) FROM dl.sales GROUP BY region
+    EXCEPT ALL SELECT region, total, cnt FROM dl.sales_summary
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT region, total, cnt FROM dl.sales_summary
+    EXCEPT ALL SELECT region, SUM(amount), COUNT(amount) FROM dl.sales GROUP BY region
 );
 ----
 0
@@ -130,6 +206,136 @@ query I
 SELECT count(*) FROM (
     SELECT region, total, cnt FROM dl.sales_summary
     EXCEPT ALL SELECT region, SUM(amount) AS total, COUNT(amount) AS cnt FROM dl.sales GROUP BY region
+);
+----
+0
+
+# ==========================================
+# Rowid staging edge cases
+# ==========================================
+
+# Multiple nullable group keys must match one rowid each, including NULLs.
+statement ok
+CREATE TABLE dl.multi_key_sales (region VARCHAR, segment INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO dl.multi_key_sales VALUES ('east', 1, 10), ('east', NULL, 20), (NULL, 1, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.multi_key_sales_mv AS
+SELECT region, segment, SUM(amount) AS total, COUNT(*) AS cnt
+FROM dl.multi_key_sales GROUP BY region, segment;
+
+statement ok
+INSERT INTO dl.multi_key_sales VALUES ('east', 1, 2), ('east', NULL, 3), (NULL, 1, 4), (NULL, NULL, 5);
+
+statement ok
+PRAGMA refresh('multi_key_sales_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT region, segment, SUM(amount), COUNT(*) FROM dl.multi_key_sales GROUP BY region, segment
+    EXCEPT ALL SELECT region, segment, total, cnt FROM dl.multi_key_sales_mv
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT region, segment, total, cnt FROM dl.multi_key_sales_mv
+    EXCEPT ALL SELECT region, segment, SUM(amount), COUNT(*) FROM dl.multi_key_sales GROUP BY region, segment
+);
+----
+0
+
+# Inserts into both sides of a join produce one grouped upsert per key.
+statement ok
+CREATE TABLE dl.rowid_join_left (k INTEGER, v INTEGER);
+
+statement ok
+CREATE TABLE dl.rowid_join_right (k INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO dl.rowid_join_left VALUES (1, 10);
+
+statement ok
+INSERT INTO dl.rowid_join_right VALUES (1, 2);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.rowid_join_mv AS
+SELECT l.k, SUM(l.v * r.w) AS total, COUNT(*) AS cnt
+FROM dl.rowid_join_left l JOIN dl.rowid_join_right r ON l.k = r.k GROUP BY l.k;
+
+query I
+SELECT (COUNT(*) > 0)::INTEGER FROM openivm_compile_with_facts('dl.rowid_join_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}')
+WHERE contains(sql, 'openivm_rowid_matches_');
+----
+1
+
+statement ok
+INSERT INTO dl.rowid_join_left VALUES (1, 3), (2, 4);
+
+statement ok
+INSERT INTO dl.rowid_join_right VALUES (1, 5), (2, 6);
+
+statement ok
+PRAGMA refresh('rowid_join_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT l.k, SUM(l.v * r.w), COUNT(*)
+    FROM dl.rowid_join_left l JOIN dl.rowid_join_right r ON l.k = r.k GROUP BY l.k
+    EXCEPT ALL SELECT k, total, cnt FROM dl.rowid_join_mv
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT k, total, cnt FROM dl.rowid_join_mv
+    EXCEPT ALL SELECT l.k, SUM(l.v * r.w), COUNT(*)
+    FROM dl.rowid_join_left l JOIN dl.rowid_join_right r ON l.k = r.k GROUP BY l.k
+);
+----
+0
+
+# A physical rowid column hides DuckLake's virtual rowid and must use MERGE.
+statement ok
+CREATE TABLE dl.named_rowid_sales (rowid INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO dl.named_rowid_sales VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.named_rowid_sales_mv AS
+SELECT rowid, SUM(amount) AS total FROM dl.named_rowid_sales GROUP BY rowid;
+
+query I
+SELECT (COUNT(*) = 0)::INTEGER FROM openivm_compile_with_facts('dl.named_rowid_sales_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}')
+WHERE contains(sql, 'openivm_rowid_matches_');
+----
+1
+
+statement ok
+INSERT INTO dl.named_rowid_sales VALUES (1, 2), (2, 3);
+
+statement ok
+PRAGMA refresh('named_rowid_sales_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT rowid, SUM(amount) FROM dl.named_rowid_sales GROUP BY rowid
+    EXCEPT ALL SELECT rowid, total FROM dl.named_rowid_sales_mv
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT rowid, total FROM dl.named_rowid_sales_mv
+    EXCEPT ALL SELECT rowid, SUM(amount) FROM dl.named_rowid_sales GROUP BY rowid
 );
 ----
 0
@@ -1379,6 +1585,130 @@ SELECT COUNT(*) FROM (
     SELECT grp, SUM(amount) FROM dl.sum_null_state GROUP BY grp
     EXCEPT ALL
     SELECT grp, total FROM dl.sum_null_state_mv
+);
+----
+0
+
+# Nested FULL OUTER joins expose derived aliases that cannot be mapped to one
+# physical table by the single-join affected-group shortcut.
+statement ok
+CREATE TABLE dl.nested_foj_left (id INT, grp INT);
+
+statement ok
+CREATE TABLE dl.nested_foj_middle (id INT, grp INT);
+
+statement ok
+CREATE TABLE dl.nested_foj_right (id INT, grp INT);
+
+statement ok
+INSERT INTO dl.nested_foj_left VALUES (1, 10), (2, 20);
+
+statement ok
+INSERT INTO dl.nested_foj_middle VALUES (2, 20), (3, 30);
+
+statement ok
+INSERT INTO dl.nested_foj_right VALUES (3, 30), (4, 40);
+
+# The source query fits a deliberately small user limit, while its generated
+# staged lifecycle program does not. OpenIVM must scope its larger internal
+# allowance and restore the caller's setting after creation.
+statement ok
+SET max_expression_depth = 64;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.nested_foj_mv AS
+WITH left_middle AS (
+    SELECT COALESCE(l.id, m.id) AS joined_id,
+           COALESCE(l.grp, m.grp) AS joined_grp
+    FROM dl.nested_foj_left l
+    FULL OUTER JOIN dl.nested_foj_middle m ON l.id = m.id
+), all_sources AS (
+    SELECT COALESCE(lm.joined_id, r.id) AS joined_id,
+           COALESCE(lm.joined_grp, r.grp) AS joined_grp
+    FROM left_middle lm
+    FULL OUTER JOIN dl.nested_foj_right r ON lm.joined_id = r.id
+)
+SELECT joined_grp, COUNT(*) AS row_count
+FROM all_sources
+GROUP BY joined_grp;
+
+query I
+SELECT current_setting('max_expression_depth')::BIGINT;
+----
+64
+
+statement ok
+SET max_expression_depth = 1000;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'nested_foj_mv';
+----
+6
+
+# Batch conflicting changes across every side before one refresh.
+statement ok
+UPDATE dl.nested_foj_left SET grp = 21 WHERE id = 2;
+
+statement ok
+DELETE FROM dl.nested_foj_middle WHERE id = 3;
+
+statement ok
+INSERT INTO dl.nested_foj_middle VALUES (4, 41), (5, 50);
+
+statement ok
+UPDATE dl.nested_foj_right SET grp = 31 WHERE id = 3;
+
+statement ok
+INSERT INTO dl.nested_foj_right VALUES (5, 50), (6, 60);
+
+statement ok
+DELETE FROM dl.nested_foj_right WHERE id = 6;
+
+statement ok
+PRAGMA refresh('nested_foj_mv');
+
+query I
+WITH expected AS (
+    WITH left_middle AS (
+        SELECT COALESCE(l.id, m.id) AS joined_id,
+               COALESCE(l.grp, m.grp) AS joined_grp
+        FROM dl.nested_foj_left l
+        FULL OUTER JOIN dl.nested_foj_middle m ON l.id = m.id
+    ), all_sources AS (
+        SELECT COALESCE(lm.joined_id, r.id) AS joined_id,
+               COALESCE(lm.joined_grp, r.grp) AS joined_grp
+        FROM left_middle lm
+        FULL OUTER JOIN dl.nested_foj_right r ON lm.joined_id = r.id
+    )
+    SELECT joined_grp, COUNT(*) AS row_count FROM all_sources GROUP BY joined_grp
+)
+SELECT COUNT(*) FROM (
+    SELECT * FROM dl.nested_foj_mv
+    EXCEPT ALL
+    SELECT * FROM expected
+);
+----
+0
+
+query I
+WITH expected AS (
+    WITH left_middle AS (
+        SELECT COALESCE(l.id, m.id) AS joined_id,
+               COALESCE(l.grp, m.grp) AS joined_grp
+        FROM dl.nested_foj_left l
+        FULL OUTER JOIN dl.nested_foj_middle m ON l.id = m.id
+    ), all_sources AS (
+        SELECT COALESCE(lm.joined_id, r.id) AS joined_id,
+               COALESCE(lm.joined_grp, r.grp) AS joined_grp
+        FROM left_middle lm
+        FULL OUTER JOIN dl.nested_foj_right r ON lm.joined_id = r.id
+    )
+    SELECT joined_grp, COUNT(*) AS row_count FROM all_sources GROUP BY joined_grp
+)
+SELECT COUNT(*) FROM (
+    SELECT * FROM expected
+    EXCEPT ALL
+    SELECT * FROM dl.nested_foj_mv
 );
 ----
 0

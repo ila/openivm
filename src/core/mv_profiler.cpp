@@ -17,7 +17,8 @@ MVProfiler::MVProfiler(ClientContext &context, string total_step, string view_na
                      : string()),
       total_start(std::chrono::steady_clock::now()) {
 	Value retention;
-	if (enabled && context.TryGetCurrentSetting("openivm_profile_retention_days", retention) && !retention.IsNull()) {
+	if (enabled && context.TryGetCurrentSetting(Identifier("openivm_profile_retention_days"), retention) &&
+	    !retention.IsNull()) {
 		retention_days = std::max<int64_t>(0, retention.GetValue<int64_t>());
 	}
 }

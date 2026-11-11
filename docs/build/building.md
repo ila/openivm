@@ -1,6 +1,6 @@
 # Building and running OpenIVM
 
-OpenIVM currently requires **DuckDB v1.5.4** and must be built from source.
+OpenIVM currently requires **DuckDB v2.0.0** and must be built from source.
 The build below produces both a DuckDB command-line
 program with OpenIVM built in and a loadable extension.
 
@@ -94,7 +94,7 @@ This opens or creates a persistent database in the current directory. Calling ju
 `duckdb` may start a different installation. At the DuckDB prompt, run:
 
 ```sql
-SELECT version(); -- expected: v1.5.4
+SELECT version(); -- expected: v2.0.0
 SELECT extension_name, loaded
 FROM duckdb_extensions()
 WHERE extension_name = 'openivm'; -- expected: openivm | true
@@ -362,21 +362,22 @@ DuckLake uses a different snapshot-based change-tracking path; see
 
 The **extension version requirement** and the **database file format** are separate:
 
-- OpenIVM must run with its matching DuckDB v1.5.4 build. A locally compiled
+- OpenIVM must run with its matching DuckDB v2.0.0 build. A locally compiled
   extension cannot be loaded into an arbitrary DuckDB version.
 - DuckDB supports reading older database formats, with backward compatibility
-  established from v0.10. A database does not need to have been created with v1.5.4
+  established from v0.10. A database does not need to have been created with v2.0.0
   to be usable here.
 - Reading a file written by a newer DuckDB release depends on the storage features
   used; forward compatibility is not guaranteed. `ATTACH` does not convert an
   incompatible format.
 
 See DuckDB's [storage compatibility documentation](https://duckdb.org/docs/stable/internals/storage).
-Files created with DuckDB v1.1.2 and v1.2.1 were tested with the v1.5.4 OpenIVM
-build, both opened directly and attached. Each case passed MV creation, mixed-DML
-refresh, and another refresh after closing and reopening the process. Results were
-checked against full recomputation with `EXCEPT ALL` in both directions. These checks
-do not cover every file version, extension-defined type, or stored SQL definition.
+The previous DuckDB v1.5.4 build was tested against files created with v1.1.2 and
+v1.2.1, including attach, refresh, and reopen. Those results do not establish
+compatibility of every stored definition or extension-defined type with v2.0.0.
+Keep a backup when upgrading an existing database, and verify refresh results
+against the original query. A newly created v2.0.0 database may use storage features
+that older DuckDB releases cannot read.
 
 If the file is incompatible, open it with a DuckDB version that can read it, export
 the required tables to Parquet, and import them into a new database using the
@@ -385,13 +386,12 @@ file until the imported data and queries have been verified.
 
 ## Loading the extension into another DuckDB client
 
-**This extension will not load into any other DuckDB version.** It is compiled for
-**v1.5.4**; v1.1.2 and v1.2.1 clients were both tested and rejected it with a version
-mismatch, even with unsigned extensions enabled. This is separate from opening
-older database files using the v1.5.4 executable.
+**The compiled extension requires DuckDB v2.0.0.** It cannot be loaded into a
+v1.5.4 client, even with unsigned extensions enabled. Opening an older database
+file with the v2.0.0 executable is a separate operation.
 
 The built CLI is the simplest starting point. For a separate compatible DuckDB
-v1.5.4 CLI, enable unsigned local extensions when launching it:
+v2.0.0 CLI, enable unsigned local extensions when launching it:
 
 ```bash
 duckdb -unsigned /absolute/path/to/test.duckdb

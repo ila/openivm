@@ -72,31 +72,71 @@ static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator
 		size_t child_side = leaf_path[depth];
 		auto &child = *parent->children[child_side];
 		idx_t mul_idx = FindBindingPosition(child, mul_binding, "DuckLakeJoin");
+		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Propagating multiplicity through %s child=%zu width=%zu mul=%zu\n",
+		                    parent->GetName().c_str(), child_side, child.GetColumnBindings().size(),
+		                    static_cast<size_t>(mul_idx));
+		auto shift_parent_projection = [&](idx_t insertion_idx) {
+			ShiftAncestorProjectionMap(ancestors, leaf_path, depth, insertion_idx, 1);
+		};
 
 		if (parent->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 			auto &projection = parent->Cast<LogicalProjection>();
 			projection.expressions.push_back(make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, mul_binding));
-			mul_binding = ColumnBinding(projection.table_index, projection.expressions.size() - 1);
+			mul_binding =
+			    ColumnBinding(TableIndex(projection.table_index), ProjectionIndex(projection.expressions.size() - 1));
 			continue;
 		}
 		if (parent->type == LogicalOperatorType::LOGICAL_FILTER) {
 			auto &filter = parent->Cast<LogicalFilter>();
-			if (!filter.projection_map.empty() && std::find(filter.projection_map.begin(), filter.projection_map.end(),
-			                                                mul_idx) == filter.projection_map.end()) {
-				filter.projection_map.push_back(mul_idx);
+			if (filter.projection_map.empty()) {
+				shift_parent_projection(mul_idx);
+			} else {
+				auto exposed = filter.GetColumnBindings();
+				if (std::find(exposed.begin(), exposed.end(), mul_binding) == exposed.end()) {
+					filter.projection_map.push_back(ProjectionIndex(mul_idx));
+				}
 			}
+			filter.ResolveOperatorTypes();
 			continue;
 		}
 		if (parent->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
-			// LogicalCrossProduct exposes both children's bindings unchanged.
+			// A new left column shifts the right side in any ancestor's positional map.
+			idx_t insertion_idx = mul_idx;
+			if (child_side == 1) {
+				insertion_idx += parent->children[0]->GetColumnBindings().size();
+			}
+			shift_parent_projection(insertion_idx);
+			parent->ResolveOperatorTypes();
 			continue;
 		}
 		if (auto *join = dynamic_cast<LogicalJoin *>(parent)) {
 			auto &projection_map = child_side == 0 ? join->left_projection_map : join->right_projection_map;
-			if (!projection_map.empty() &&
-			    std::find(projection_map.begin(), projection_map.end(), mul_idx) == projection_map.end()) {
-				projection_map.push_back(mul_idx);
+			OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Join projection map before multiplicity:");
+			for (auto projection : projection_map) {
+				OPENIVM_DEBUG_PRINT(" %zu", static_cast<size_t>(projection.GetIndex()));
 			}
+			OPENIVM_DEBUG_PRINT("\n");
+			if (projection_map.empty()) {
+				idx_t insertion_idx = mul_idx;
+				if (child_side == 1) {
+					insertion_idx += join->children[0]->GetColumnBindings().size();
+				}
+				shift_parent_projection(insertion_idx);
+			} else {
+				// Numeric map positions can alias a different column after a deeper join grows.
+				auto exposed = join->GetColumnBindings();
+				if (std::find(exposed.begin(), exposed.end(), mul_binding) == exposed.end()) {
+					idx_t insertion_idx = projection_map.size();
+					if (child_side == 1) {
+						insertion_idx += join->left_projection_map.empty()
+						                     ? join->children[0]->GetColumnBindings().size()
+						                     : join->left_projection_map.size();
+					}
+					projection_map.push_back(ProjectionIndex(mul_idx));
+					shift_parent_projection(insertion_idx);
+				}
+			}
+			join->ResolveOperatorTypes();
 			continue;
 		}
 		throw InternalException("DuckLakeJoin: unsupported ancestor %s in flattened path", parent->GetName());
@@ -132,22 +172,24 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		                                            input.context.view + "': " + snapshot_result->GetError());
 	}
 	for (idx_t row = 0; row < snapshot_result->RowCount(); row++) {
-		if (snapshot_result->GetValue(0, row).IsNull() || snapshot_result->GetValue(1, row).IsNull()) {
+		if (snapshot_result->Collection().GetValue(0, row).IsNull() ||
+		    snapshot_result->Collection().GetValue(1, row).IsNull()) {
 			continue;
 		}
-		auto catalog = snapshot_result->GetValue(2, row).ToString();
-		auto schema = snapshot_result->GetValue(3, row).ToString();
-		auto name = RefreshMetadata::SourceTableName(snapshot_result->GetValue(0, row).ToString(), catalog, schema);
+		auto catalog = snapshot_result->Collection().GetValue(2, row).ToString();
+		auto schema = snapshot_result->Collection().GetValue(3, row).ToString();
+		auto name = RefreshMetadata::SourceTableName(snapshot_result->Collection().GetValue(0, row).ToString(), catalog,
+		                                             schema);
 		stored_snapshots[StringUtil::Lower(SqlUtils::FullName(catalog, schema, name))] =
-		    snapshot_result->GetValue(1, row).GetValue<int64_t>();
+		    snapshot_result->Collection().GetValue(1, row).GetValue<int64_t>();
 	}
 	for (size_t i = 0; i < N; i++) {
 		auto *get = GetLeafScan(leaves[i]);
 		D_ASSERT(get);
 		auto table_ref = get->GetTable();
-		string table_name = table_ref.get()->name;
-		table_catalogs[i] = table_ref->ParentCatalog().GetName();
-		table_schemas[i] = table_ref->schema.name;
+		string table_name = table_ref.get()->name.GetIdentifierName();
+		table_catalogs[i] = table_ref->ParentCatalog().GetName().GetIdentifierName();
+		table_schemas[i] = table_ref->schema.name.GetIdentifierName();
 		table_names[i] = table_name;
 		auto stored_snapshot = stored_snapshots.find(
 		    StringUtil::Lower(SqlUtils::FullName(table_catalogs[i], table_schemas[i], table_name)));
@@ -160,7 +202,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		auto &source_state = source_cache[table_ref.get()];
 		source_state.last_snapshot = old_snapshots[i];
 		source_state.has_last_snapshot = true;
-		if (get->function.name == "ducklake_scan" && get->function.function_info) {
+		if (get->function.GetName().GetIdentifierName() == "ducklake_scan" && get->function.function_info) {
 			auto &func_info = get->function.function_info->Cast<DuckLakeFunctionInfo>();
 			current_snapshots[i] = static_cast<int64_t>(func_info.snapshot.snapshot_id);
 		}
@@ -293,13 +335,14 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		// entire subtree. Flattened leaves are always bare GETs under pass-through wrappers.
 		auto &delta_leaf_node = GetNodeAtPath(term, leaves[i].path);
 		D_ASSERT(!flattened_leaves || delta_leaf_node->type == LogicalOperatorType::LOGICAL_GET);
+		auto original_leaf_width = delta_leaf_node->GetColumnBindings().size();
 		auto delta = CompileRegularLeafDelta(input, context, binder, delta_leaf_node, term_root, source_cache);
 		delta_leaf_node = std::move(delta.op);
 		ColumnBinding mul_binding = delta.mul_binding;
 		if (flattened_leaves) {
 			mul_binding = PropagateMultiplicityThroughPath(term, leaves[i].path, mul_binding);
 		} else {
-			UpdateParentProjectionMap(term, leaves[i], mul_binding);
+			UpdateParentProjectionMap(term, leaves[i], mul_binding, original_leaf_width);
 		}
 
 		// Telescoping: pin leaves j > i to old snapshot (AT VERSION).
@@ -307,11 +350,12 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		for (size_t j = i + 1; j < N; j++) {
 			auto &leaf_node = GetNodeAtPath(term, leaves[j].path);
 			auto *old_get = FindGetInSubtree(leaf_node.get());
-			if (old_get && old_get->function.name == "ducklake_scan" && old_get->function.function_info) {
+			if (old_get && old_get->function.GetName().GetIdentifierName() == "ducklake_scan" &&
+			    old_get->function.function_info) {
 				auto &func_info = old_get->function.function_info->Cast<DuckLakeFunctionInfo>();
 				func_info.snapshot.snapshot_id = static_cast<idx_t>(old_snapshots[j]);
 				OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Pinned leaf %zu (table_index=%lu) to old snapshot %ld\n", j,
-				                    (unsigned long)old_get->table_index, (long)old_snapshots[j]);
+				                    (unsigned long)old_get->table_index.index, (long)old_snapshots[j]);
 			}
 		}
 

@@ -1164,7 +1164,8 @@ reuse_window_2 AS (
 		rw1.customer_reuse_amount,
 		DENSE_RANK() OVER (
 			PARTITION BY rw1.warehouse_id, rw1.credit_code
-			ORDER BY rw1.customer_reuse_amount DESC, rw1.customer_id ASC
+			-- The amount is currency stored as DOUBLE; round away summation-order noise before ranking.
+			ORDER BY ROUND(rw1.customer_reuse_amount, 2) DESC, rw1.customer_id ASC
 		) AS credit_reuse_rank,
 		COUNT(*) OVER (
 			PARTITION BY rw1.warehouse_id, rw1.district_id, rw1.fulfillment_state

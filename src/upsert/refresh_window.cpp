@@ -4,6 +4,7 @@
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "rules/column_hider.hpp"
 
 namespace duckdb {
@@ -123,7 +124,7 @@ static string DescribeColumnType(Connection &con, const string &table_sql, const
 	if (result->HasError() || result->RowCount() == 0) {
 		return "";
 	}
-	return StringUtil::Upper(result->GetValue(1, 0).ToString());
+	return StringUtil::Upper(result->Collection().GetValue(1, 0).ToString());
 }
 
 static bool LookupCastMetadataIsSafe(Connection &con, const string &delta_table, const string &source_col,
@@ -603,9 +604,19 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 			running_window_column_names = std::move(data_cols);
 		}
 	}
+	bool use_data_modifying_ctes = false;
+	// DuckDB's data-modifying CTEs cannot be replayed by Spark. The compile bridge
+	// can target Spark even when its temporary catalog is native DuckDB.
+	if (!cross_system && openivm::CompileFactsContextSlot::Get(*con.context).target_dialect == SqlDialect::DUCKDB) {
+		con.context->RunFunctionInTransaction([&]() {
+			use_data_modifying_ctes =
+			    Catalog::GetCatalog(*con.context, Identifier(view_catalog_name)).SupportsMultipleDMLCTEs();
+		});
+	}
 	return CompileWindowRecompute(view_name, view_query_sql, delta_ts_filter, internal_catalog_prefix, partition_cols,
 	                              partition_delta_specs, emit_cascade_delta, affected_keys_sql,
-	                              running_window_column_names, running_window_incremental, uses_running_suffix);
+	                              running_window_column_names, running_window_incremental, uses_running_suffix,
+	                              use_data_modifying_ctes);
 }
 
 } // namespace duckdb

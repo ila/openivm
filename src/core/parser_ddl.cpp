@@ -1,3 +1,4 @@
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "core/parser_ddl.hpp"
 #include "core/mv_profiler.hpp"
 
@@ -9,6 +10,7 @@
 #include "core/published_view.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/refresh_metadata.hpp"
+#include "core/scoped_optimizer_settings.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -35,7 +37,7 @@
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
-#include "duckdb/planner/operator/logical_simple.hpp"
+#include "duckdb/planner/operator/logical_drop.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
@@ -387,12 +389,13 @@ DeltaSchemaDDL BuildCreateDeltaFromDataSQL(Connection &conn, const string &delta
 	}
 	vector<pair<string, string>> columns;
 	for (idx_t row = 0; row < described->RowCount(); row++) {
-		if (described->GetValue(0, row).IsNull() || described->GetValue(1, row).IsNull()) {
+		if (described->Collection().GetValue(0, row).IsNull() || described->Collection().GetValue(1, row).IsNull()) {
 			throw CatalogException(
 			    "Could not derive IVM delta schema from data table '%s': DESCRIBE returned a NULL column name or type",
 			    data_table);
 		}
-		columns.emplace_back(described->GetValue(0, row).ToString(), described->GetValue(1, row).ToString());
+		columns.emplace_back(described->Collection().GetValue(0, row).ToString(),
+		                     described->Collection().GetValue(1, row).ToString());
 	}
 	return BuildDeltaSchemaDDL(columns, delta_table, data_table,
 	                           replace ? OnCreateConflict::REPLACE_ON_CONFLICT : OnCreateConflict::IGNORE_ON_CONFLICT);
@@ -424,6 +427,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	}
 	auto &db = DatabaseInstance::GetDatabase(context);
 	auto conn = make_uniq<Connection>(db);
+	SqlUtils::CopySessionSetting(context, *conn->context, "TimeZone");
 	auto &helper_lock_state = TransactionalMVLockState::Get(*conn->context);
 	helper_lock_state.SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 	MutationLockGuard mutation_guard(context);
@@ -446,6 +450,10 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	auto preserve_result = conn->Query("SET preserve_insertion_order=false");
 	if (preserve_result->HasError()) {
 		throw CatalogException("Failed to configure OpenIVM DDL connection: " + preserve_result->GetError());
+	}
+	auto depth_result = conn->Query("SET max_expression_depth=10000");
+	if (depth_result->HasError()) {
+		throw CatalogException("Failed to configure OpenIVM DDL connection: " + depth_result->GetError());
 	}
 	vector<string> cleanup_ddl;
 	// The program to archive, as compiled, and the SQL each executor operation ran.
@@ -501,7 +509,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		OPENIVM_DEBUG_PRINT("[DDLExecutorExecuteFunction] Executing DDL batch (%lu statements): %s\n",
 		                    (unsigned long)pending_ddl.size(), query.c_str());
 		auto ddl_start = std::chrono::steady_clock::now();
-		unique_ptr<MaterializedQueryResult> r;
+		unique_ptr<QueryResult> r;
 		if (profiler.Enabled() || (lifecycle_leases && lifecycle_leases->Active())) {
 			auto statements = SqlUtils::SplitSQLStatements(query);
 			for (idx_t i = 0; i < statements.size(); i++) {
@@ -692,7 +700,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 }
 
 unique_ptr<FunctionData> DDLExecutorBindFunction(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<DDLExecutorBindData>(true);
 	for (auto &param : input.inputs) {
 		auto q = param.GetValue<string>();
@@ -712,8 +720,8 @@ void DDLExecutorExecuteFunction(ClientContext &context, TableFunctionInput &data
 		return;
 	}
 	ExecuteDDL(context, bind_data.ddl);
-	output.SetValue(0, 0, Value::BOOLEAN(bind_data.result));
-	output.SetCardinality(1);
+	output.data[0].SetValue(0, Value::BOOLEAN(bind_data.result));
+	output.SetCardinalityUnsafe(1);
 	gdata.offset++;
 }
 
@@ -741,7 +749,7 @@ void TransactionalMVMetadataState::Register(ClientContext &context, const vector
 	// microsecond before it so rows inserted into a newly created MV delta
 	// table during this same transaction satisfy the compiler's strict `>`
 	// watermark predicate.
-	transaction_timestamp -= 1;
+	transaction_timestamp.value -= 1;
 	auto timestamp_sql = Value::TIMESTAMP(transaction_timestamp).ToSQLString() + "::TIMESTAMP";
 	for (auto &parameter : parameters) {
 		auto statement = parameter.GetValue<string>();
@@ -826,11 +834,12 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 		for (auto &table : TransactionalMetadataTables()) {
 			DropInfo drop;
 			drop.type = CatalogType::TABLE_ENTRY;
-			drop.catalog = "temp";
-			drop.schema = DEFAULT_SCHEMA;
-			drop.name = table;
+			drop.SetCatalog(Identifier("temp"));
+			drop.SetSchema(Identifier(DEFAULT_SCHEMA));
+			drop.SetName(Identifier(table));
 			drop.if_not_found = OnEntryNotFound::RETURN_NULL;
-			Catalog::GetCatalog(*connection.context, drop.catalog).DropEntry(*connection.context, drop);
+			Catalog::GetCatalog(*connection.context, Identifier(drop.GetQualifiedName().Catalog().GetIdentifierName()))
+			    .DropEntry(*connection.context, drop);
 		}
 	});
 	OPENIVM_DEBUG_PRINT("[TRANSACTIONAL METADATA] Replay catalog='%s', schema='%s', statements=%zu\n",
@@ -910,14 +919,15 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 	auto dependencies = connection.Query("SELECT parent_view, child_view FROM " + string(openivm::MV_DEPS_TABLE));
 	if (!dependencies->HasError()) {
 		for (idx_t row = 0; row < dependencies->RowCount(); row++) {
-			add_dependency(dependencies->GetValue(0, row).ToString(), dependencies->GetValue(1, row).ToString());
+			add_dependency(dependencies->Collection().GetValue(0, row).ToString(),
+			               dependencies->Collection().GetValue(1, row).ToString());
 		}
 	}
 	unordered_set<string> registered_views;
 	auto views = connection.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE));
 	if (!views->HasError()) {
 		for (idx_t row = 0; row < views->RowCount(); row++) {
-			registered_views.insert(views->GetValue(0, row).ToString());
+			registered_views.insert(views->Collection().GetValue(0, row).ToString());
 		}
 	}
 	auto delta_dependencies =
@@ -926,8 +936,8 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 		static const string delta_prefix(openivm::DELTA_PREFIX);
 		static const string data_prefix(openivm::DATA_TABLE_PREFIX);
 		for (idx_t row = 0; row < delta_dependencies->RowCount(); row++) {
-			auto child = delta_dependencies->GetValue(0, row).ToString();
-			auto table = delta_dependencies->GetValue(1, row).ToString();
+			auto child = delta_dependencies->Collection().GetValue(0, row).ToString();
+			auto table = delta_dependencies->Collection().GetValue(1, row).ToString();
 			string parent;
 			if (StringUtil::StartsWith(table, delta_prefix)) {
 				parent = table.substr(delta_prefix.size());
@@ -1068,7 +1078,7 @@ ScalarFunction SourceWatermarkFunction() {
 	return ScalarFunction(OPENIVM_RECORD_SOURCE_WATERMARK_FUNCTION,
 	                      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::TIMESTAMP,
 	                       LogicalType::TIMESTAMP},
-	                      LogicalType::TIMESTAMP, RecordSourceWatermark, nullptr, nullptr, nullptr, nullptr,
+	                      LogicalType::TIMESTAMP, RecordSourceWatermark, nullptr, nullptr, nullptr,
 	                      LogicalType::INVALID, FunctionStability::VOLATILE);
 }
 
@@ -1099,16 +1109,16 @@ public:
 class LifecycleMetricsScope {
 public:
 	explicit LifecycleMetricsScope(ClientContext &context) : config(ClientConfig::GetConfig(context)) {
-		settings.swap(config.profiler_settings);
+		settings.swap(config.tracked_metrics);
 	}
 
 	~LifecycleMetricsScope() {
-		settings.swap(config.profiler_settings);
+		settings.swap(config.tracked_metrics);
 	}
 
 private:
 	ClientConfig &config;
-	profiler_settings_t settings;
+	vector<string> settings;
 };
 
 // A concurrent duplicate CREATE can lose on the physical data table with DuckDB's write-write
@@ -1202,15 +1212,15 @@ public:
 		if (staged) {
 			MutationLockGuard guard(client);
 			ExecuteStagedDDL(client, {Value(program)});
-			chunk.SetValue(0, 0, Value::BOOLEAN(true));
-			chunk.SetCardinality(1);
+			chunk.data[0].SetValue(0, Value::BOOLEAN(true));
+			chunk.SetCardinalityUnsafe(1);
 			state.finished = true;
 			return SourceResultType::FINISHED;
 		}
 		auto &executor = Executor::Get(client);
 		state.metrics = make_uniq<LifecycleMetricsScope>(client);
 		try {
-			ParserOptions options = client.GetParserOptions();
+			ParserOptions options = ParserOptions::Builtin();
 			options.extensions = nullptr;
 			Parser parser(options);
 			parser.ParseQuery(program);
@@ -1237,7 +1247,7 @@ public:
 				Planner planner(client);
 				planner.CreatePlan(std::move(statement));
 				for (auto &entry : planner.properties.modified_databases) {
-					auto &database = Catalog::GetCatalog(client, entry.first).GetAttached();
+					auto &database = Catalog::GetCatalog(client, Identifier(entry.first)).GetAttached();
 					if (database.IsReadOnly()) {
 						throw InvalidInputException(
 						    "Cannot execute OpenIVM lifecycle writes on read-only database '%s'", entry.first);
@@ -1297,8 +1307,8 @@ public:
 			throw;
 		}
 		state.metrics.reset();
-		chunk.SetValue(0, 0, Value::BOOLEAN(true));
-		chunk.SetCardinality(1);
+		chunk.data[0].SetValue(0, Value::BOOLEAN(true));
+		chunk.SetCardinalityUnsafe(1);
 		state.finished = true;
 		return SourceResultType::FINISHED;
 	}
@@ -1314,7 +1324,7 @@ private:
 
 class LogicalLifecycleProgram : public LogicalExtensionOperator {
 public:
-	LogicalLifecycleProgram(idx_t table_index, string program, bool staged = false)
+	LogicalLifecycleProgram(TableIndex table_index, string program, bool staged = false)
 	    : table_index(table_index), program(std::move(program)), staged(staged) {
 	}
 
@@ -1326,7 +1336,7 @@ public:
 		return GenerateColumnBindings(table_index, 1);
 	}
 
-	vector<idx_t> GetTableIndex() const override {
+	vector<TableIndex> GetTableIndex() const override {
 		return {table_index};
 	}
 
@@ -1349,7 +1359,7 @@ protected:
 	}
 
 private:
-	const idx_t table_index;
+	const TableIndex table_index;
 	const string program;
 	const bool staged;
 };
@@ -1365,15 +1375,17 @@ unique_ptr<LogicalOperator> BindLifecycleProgram(ClientContext &context, Binder 
 	return make_uniq<LogicalLifecycleProgram>(binder.GenerateTableIndex(), program);
 }
 
-unique_ptr<LogicalOperator> BindLifecycleProgram(ClientContext &context, Binder &binder, idx_t bind_index,
+unique_ptr<LogicalOperator> BindLifecycleProgram(ClientContext &context, Binder &binder, TableIndex bind_index,
                                                  const string &program, bool staged) {
 	binder.GetStatementProperties().always_require_rebind = true;
 	return make_uniq<LogicalLifecycleProgram>(bind_index, program, staged);
 }
 
 static string BuildDropEntryStatement(const DropInfo &drop_info, const string &function) {
-	return "SELECT * FROM " + function + "('" + SqlUtils::EscapeValue(drop_info.catalog) + "', '" +
-	       SqlUtils::EscapeValue(drop_info.schema) + "', '" + SqlUtils::EscapeValue(drop_info.name) + "', " +
+	return "SELECT * FROM " + function + "('" +
+	       SqlUtils::EscapeValue(drop_info.GetQualifiedName().Catalog().GetIdentifierName()) + "', '" +
+	       SqlUtils::EscapeValue(drop_info.GetQualifiedName().Schema().GetIdentifierName()) + "', '" +
+	       SqlUtils::EscapeValue(drop_info.GetQualifiedName().Name().GetIdentifierName()) + "', " +
 	       (drop_info.cascade ? "true" : "false") + ", " +
 	       (drop_info.if_not_found == OnEntryNotFound::RETURN_NULL ? "true" : "false") + ")";
 }
@@ -1404,16 +1416,20 @@ struct DropViewGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> BindDropEntry(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names,
+                                              vector<LogicalType> &return_types, vector<Identifier> &names,
                                               CatalogType type) {
 	if (input.inputs.size() != 5) {
 		throw InternalException("OpenIVM DROP executor expected five arguments");
 	}
 	auto result = make_uniq<DropViewBindData>();
 	result->info.type = type;
-	result->info.catalog = StringValue::Get(input.inputs[0]);
-	result->info.schema = StringValue::Get(input.inputs[1]);
-	result->info.name = StringValue::Get(input.inputs[2]);
+	result->info.SetCatalog(Identifier(StringValue::Get(input.inputs[0])));
+	result->info.SetSchema(Identifier(StringValue::Get(input.inputs[1])));
+	result->info.SetName(Identifier(StringValue::Get(input.inputs[2])));
+	if (type == CatalogType::SCHEMA_ENTRY) {
+		result->info.SetQualifiedName(QualifiedName::FromPath(
+		    {Identifier(StringValue::Get(input.inputs[0])), Identifier(StringValue::Get(input.inputs[2]))}));
+	}
 	result->info.cascade = BooleanValue::Get(input.inputs[3]);
 	result->info.if_not_found =
 	    BooleanValue::Get(input.inputs[4]) ? OnEntryNotFound::RETURN_NULL : OnEntryNotFound::THROW_EXCEPTION;
@@ -1426,27 +1442,25 @@ static unique_ptr<FunctionData> BindDropEntry(ClientContext &context, TableFunct
 	DropStatement drop;
 	drop.info = make_uniq<DropInfo>(result->info);
 	auto bound = input.binder->Bind(static_cast<SQLStatement &>(drop));
-	auto &resolved = bound.plan->Cast<LogicalSimple>().info->Cast<DropInfo>();
-	result->info.catalog = resolved.catalog;
-	result->info.schema = resolved.schema;
-	result->info.name = resolved.name;
+	auto &resolved = bound.plan->Cast<LogicalDrop>().info->Cast<DropInfo>();
+	result->info.SetQualifiedName(resolved.GetQualifiedName());
 	return_types.push_back(LogicalType::BOOLEAN);
 	names.emplace_back("Success");
 	return std::move(result);
 }
 
 static unique_ptr<FunctionData> BindDropView(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return BindDropEntry(context, input, return_types, names, CatalogType::VIEW_ENTRY);
 }
 
 static unique_ptr<FunctionData> BindDropTable(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return BindDropEntry(context, input, return_types, names, CatalogType::TABLE_ENTRY);
 }
 
 static unique_ptr<FunctionData> BindDropSchema(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return BindDropEntry(context, input, return_types, names, CatalogType::SCHEMA_ENTRY);
 }
 
@@ -1460,15 +1474,24 @@ static void ExecuteDropView(ClientContext &context, TableFunctionInput &input, D
 		return;
 	}
 	auto &bind_data = input.bind_data->Cast<DropViewBindData>();
-	auto &catalog = Catalog::GetCatalog(context, bind_data.info.catalog);
+	auto &catalog = Catalog::GetCatalog(context, bind_data.info.type == CatalogType::SCHEMA_ENTRY
+	                                                 ? bind_data.info.GetQualifiedName().Path().front()
+	                                                 : bind_data.info.GetQualifiedName().Catalog());
 	DropInfo info(bind_data.info);
 	bool source_delta_drop =
-	    info.type == CatalogType::TABLE_ENTRY && SqlUtils::IsDelta(info.name) &&
-	    Catalog::GetEntry(context, info.catalog, info.schema, EntryLookupInfo(CatalogType::TABLE_ENTRY, info.name),
-	                      OnEntryNotFound::RETURN_NULL);
+	    info.type == CatalogType::TABLE_ENTRY &&
+	    SqlUtils::IsDelta(info.GetQualifiedName().Name().GetIdentifierName()) &&
+	    Catalog::GetEntry(
+	        context,
+	        SqlUtils::QualifyLookup(
+	            EntryLookupInfo(CatalogType::TABLE_ENTRY,
+	                            QualifiedName(Identifier(info.GetQualifiedName().Name().GetIdentifierName()))),
+	            Identifier(info.GetQualifiedName().Catalog().GetIdentifierName()),
+	            Identifier(info.GetQualifiedName().Schema().GetIdentifierName())),
+	        OnEntryNotFound::RETURN_NULL);
 	vector<reference<TableCatalogEntry>> schema_tables;
 	if (info.type == CatalogType::SCHEMA_ENTRY && info.cascade && catalog.IsDuckCatalog()) {
-		auto schema = catalog.GetSchema(context, info.name, OnEntryNotFound::RETURN_NULL);
+		auto schema = catalog.GetSchema(context, info.GetQualifiedName().Name(), OnEntryNotFound::RETURN_NULL);
 		if (schema) {
 			schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
 				if (entry.type == CatalogType::TABLE_ENTRY) {
@@ -1478,15 +1501,19 @@ static void ExecuteDropView(ClientContext &context, TableFunctionInput &input, D
 		}
 	}
 	if (catalog.IsDuckCatalog() && (info.type == CatalogType::TABLE_ENTRY || info.type == CatalogType::SCHEMA_ENTRY)) {
-		RefreshMetadata::InvalidateSourceGeneration(context, catalog.GetName(),
-		                                            info.type == CatalogType::SCHEMA_ENTRY ? info.name : info.schema,
-		                                            info.name, info.type == CatalogType::SCHEMA_ENTRY);
+		RefreshMetadata::InvalidateSourceGeneration(
+		    context, catalog.GetName().GetIdentifierName(),
+		    info.type == CatalogType::SCHEMA_ENTRY ? info.GetQualifiedName().Name().GetIdentifierName()
+		                                           : info.GetQualifiedName().Schema().GetIdentifierName(),
+		    info.GetQualifiedName().Name().GetIdentifierName(), info.type == CatalogType::SCHEMA_ENTRY);
 	}
 	catalog.DropEntry(context, info);
 	if (catalog.IsDuckCatalog() && (info.type == CatalogType::TABLE_ENTRY || info.type == CatalogType::SCHEMA_ENTRY)) {
-		RefreshMetadata::RemoveSourceDeltaMapping(context, catalog.GetName(),
-		                                          info.type == CatalogType::SCHEMA_ENTRY ? info.name : info.schema,
-		                                          info.name, info.type == CatalogType::SCHEMA_ENTRY);
+		RefreshMetadata::RemoveSourceDeltaMapping(
+		    context, catalog.GetName().GetIdentifierName(),
+		    info.type == CatalogType::SCHEMA_ENTRY ? info.GetQualifiedName().Name().GetIdentifierName()
+		                                           : info.GetQualifiedName().Schema().GetIdentifierName(),
+		    info.GetQualifiedName().Name().GetIdentifierName(), info.type == CatalogType::SCHEMA_ENTRY);
 	}
 	// Native schema CASCADE drops through CatalogSet, bypassing the local-storage
 	// cleanup in DuckSchemaEntry::DropEntry. Discard pending appends only after a
@@ -1497,23 +1524,29 @@ static void ExecuteDropView(ClientContext &context, TableFunctionInput &input, D
 	}
 	if (!schema_tables.empty()) {
 		OPENIVM_DEBUG_PRINT("[DROP] Discarded local storage for %zu schema tables in %s.%s\n", schema_tables.size(),
-		                    catalog.GetName().c_str(), info.name.c_str());
+		                    catalog.GetName().GetIdentifierName().c_str(),
+		                    info.GetQualifiedName().Name().GetIdentifierName().c_str());
 	}
 	if (info.type == CatalogType::SCHEMA_ENTRY) {
 		// Match PhysicalDrop's search-path handling when dropping the current schema.
 		auto &current = ClientData::Get(context).catalog_search_path->GetDefault();
-		if (StringUtil::CIEquals(catalog.GetName(), current.catalog) &&
-		    StringUtil::CIEquals(info.name, current.schema)) {
+		if (StringUtil::CIEquals(catalog.GetName().GetIdentifierName(), current.GetCatalog().GetIdentifierName()) &&
+		    StringUtil::CIEquals(info.GetQualifiedName().Name().GetIdentifierName(),
+		                         current.GetSchema().GetIdentifierName())) {
 			SchemaSetting::SetLocal(context, DEFAULT_SCHEMA);
 		}
 	}
 	if (source_delta_drop) {
-		TransactionalMVLockState::Get(context).RecordSourceDeltaDrop(info.catalog, info.schema, info.name);
+		TransactionalMVLockState::Get(context).RecordSourceDeltaDrop(
+		    info.GetQualifiedName().Catalog().GetIdentifierName(), info.GetQualifiedName().Schema().GetIdentifierName(),
+		    info.GetQualifiedName().Name().GetIdentifierName());
 		OPENIVM_DEBUG_PRINT("[DROP] Recorded transaction-local source delta removal %s\n",
-		                    SqlUtils::FullName(info.catalog, info.schema, info.name).c_str());
+		                    SqlUtils::FullName(info.GetQualifiedName().Catalog(), info.GetQualifiedName().Schema(),
+		                                       info.GetQualifiedName().Name())
+		                        .c_str());
 	}
-	output.SetValue(0, 0, Value::BOOLEAN(true));
-	output.SetCardinality(1);
+	output.data[0].SetValue(0, Value::BOOLEAN(true));
+	output.SetCardinalityUnsafe(1);
 	state.finished = true;
 }
 
@@ -1532,7 +1565,7 @@ vector<string> RenderTransactionalStatement(const string &input, const string &m
 		        Value(operation.data_table).ToSQLString() + ", " + (operation.replace ? "true" : "false") + ")"};
 	}
 	try {
-		Parser parser;
+		auto parser = Parser::GetBuiltinParser();
 		parser.ParseQuery(statement);
 		if (parser.statements.size() == 1 && parser.statements[0]->type == StatementType::DROP_STATEMENT) {
 			auto &drop = parser.statements[0]->Cast<DropStatement>();
@@ -1563,10 +1596,11 @@ TableFunction CreateDeltaFromDataFunction() {
 		if (parts.empty() || parts.size() > 3) {
 			throw InternalException("Invalid OpenIVM delta source '%s'", data_table);
 		}
-		string catalog = parts.size() == 3 ? parts[0] : string();
-		string schema = parts.size() >= 2 ? parts[parts.size() - 2] : string();
+		Identifier catalog(parts.size() == 3 ? parts[0] : string());
+		Identifier schema(parts.size() >= 2 ? parts[parts.size() - 2] : string());
 		Binder::BindSchemaOrCatalog(context, catalog, schema);
-		auto &table = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, parts.back());
+		auto &table = Catalog::GetEntry<TableCatalogEntry>(
+		    context, QualifiedName(Identifier(catalog), Identifier(schema), Identifier(parts.back())));
 		vector<pair<string, string>> columns;
 		for (auto &column : table.GetColumns().Logical()) {
 			columns.emplace_back(column.Name(), column.Type().ToString());
@@ -1577,7 +1611,7 @@ TableFunction CreateDeltaFromDataFunction() {
 		auto ddl = BuildDeltaSchemaDDL(columns, delta_table, data_table,
 		                               input.inputs[2].GetValue<bool>() ? OnCreateConflict::REPLACE_ON_CONFLICT
 		                                                                : OnCreateConflict::ERROR_ON_CONFLICT);
-		Parser parser;
+		auto parser = Parser::GetBuiltinParser();
 		parser.ParseQuery(ddl.sql);
 		auto binder = Binder::CreateBinder(context, input.binder);
 		auto bound = binder->Bind(*parser.statements[0]);
@@ -1588,13 +1622,13 @@ TableFunction CreateDeltaFromDataFunction() {
 }
 
 static void SerializeDropEntry(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
-                               const TableFunction &function) {
+                               const BoundTableFunction &function) {
 	// LogicalGet's fallback deserializer calls bind without a Binder. Retain the
 	// native binder's resolved target instead of resolving the search path again.
 	serializer.WriteProperty(100, "drop_info", &bind_data->Cast<DropViewBindData>().info);
 }
 
-static unique_ptr<FunctionData> DeserializeDropEntry(Deserializer &deserializer, TableFunction &function) {
+static unique_ptr<FunctionData> DeserializeDropEntry(Deserializer &deserializer, BoundTableFunction &function) {
 	auto info = deserializer.ReadProperty<unique_ptr<ParseInfo>>(100, "drop_info");
 	return make_uniq<DropViewBindData>(info->Cast<DropInfo>());
 }

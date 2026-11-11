@@ -1,2 +1,2 @@
--- {"operators": "INNER_JOIN,AGGREGATE,FILTER,SUBQUERY_FILTER", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "non_incr_reason": "op:SUBQUERY_FILTER", "ducklake": true}
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,SUBQUERY_FILTER", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "ducklake": true, "openivm_verified": true}
 SELECT c.C_W_ID, c.C_ID, c.C_BALANCE FROM dl.CUSTOMER c JOIN dl.DISTRICT d ON c.C_W_ID = d.D_W_ID AND c.C_D_ID = d.D_ID WHERE d.D_YTD > (SELECT AVG(D_YTD) FROM dl.DISTRICT);

@@ -7,7 +7,7 @@ require openivm
 require parquet
 
 statement ok
-INSTALL ducklake; LOAD ducklake;
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository'; LOAD ducklake;
 
 foreach backend,marker duckdb,data ducklake,metadata_contract_ducklake
 

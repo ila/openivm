@@ -9,7 +9,6 @@
 
 namespace duckdb {
 
-AggregateFunction BindAggregateByName(ClientContext &context, const string &name, const vector<LogicalType> &arg_types);
 unique_ptr<BoundAggregateExpression> MakeAggregate(ClientContext &context, const string &name,
                                                    unique_ptr<Expression> child, const string &alias);
 unique_ptr<BoundAggregateExpression> MakeCountStar(const string &alias);
