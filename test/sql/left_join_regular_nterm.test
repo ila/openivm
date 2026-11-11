@@ -159,3 +159,170 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# DuckDB 2.0 can retain a RIGHT join in a plan for a query whose preserved
+# relation is on the right. It has the same one-sided NULL transition as LEFT.
+statement ok
+CREATE TABLE rf(id INTEGER, ka INTEGER, kb INTEGER);
+
+statement ok
+CREATE TABLE ra(k INTEGER, v VARCHAR);
+
+statement ok
+CREATE TABLE rb(k INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO rf VALUES (1, 10, 20), (2, 11, 21), (3, 12, 20);
+
+statement ok
+INSERT INTO ra VALUES (10, 'a10'), (10, 'a10b'), (11, 'a11');
+
+statement ok
+INSERT INTO rb VALUES (20, 'b20'), (21, 'b21');
+
+statement ok
+CREATE MATERIALIZED VIEW right_mv AS
+    SELECT rf.id, ra.v AS av, rb.v AS bv
+    FROM ra RIGHT JOIN rf ON ra.k = rf.ka
+    LEFT JOIN rb ON rf.kb = rb.k;
+
+statement ok
+SET openivm_regular_nterm_left=false;
+
+statement ok
+CREATE TEMP TABLE right_full_compile AS
+    SELECT max(length(sql)) AS bytes
+    FROM openivm_compile_with_facts(
+        'right_mv',
+        '{"target_dialect":"duckdb","compile_only":true,
+          "delta_shape":{"rf":"MIXED","ra":"MIXED","rb":"MIXED"}}'
+    ) WHERE stmt_kind='data' AND refresh_type_name='SIMPLE_PROJECTION';
+
+statement ok
+SET openivm_regular_nterm_left=true;
+
+query I
+SELECT max(length(sql)) < (SELECT bytes FROM right_full_compile)
+FROM openivm_compile_with_facts(
+    'right_mv',
+    '{"target_dialect":"duckdb","compile_only":true,
+      "delta_shape":{"rf":"MIXED","ra":"MIXED","rb":"MIXED"}}'
+) WHERE stmt_kind='data' AND refresh_type_name='SIMPLE_PROJECTION';
+----
+true
+
+statement ok
+INSERT INTO ra VALUES (12, 'a12');
+
+statement ok
+DELETE FROM rb WHERE k = 21;
+
+statement ok
+UPDATE ra SET v = v || 'x' WHERE k = 10;
+
+statement ok
+UPDATE rf SET kb = 21 WHERE id = 1;
+
+statement ok
+INSERT INTO rf VALUES (4, 12, 21);
+
+statement ok
+DELETE FROM ra WHERE k = 11;
+
+statement ok
+PRAGMA refresh('right_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT rf.id, ra.v AS av, rb.v AS bv
+    FROM ra RIGHT JOIN rf ON ra.k = rf.ka LEFT JOIN rb ON rf.kb = rb.k
+    EXCEPT ALL SELECT id, av, bv FROM right_mv
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, av, bv FROM right_mv
+    EXCEPT ALL
+    SELECT rf.id, ra.v AS av, rb.v AS bv
+    FROM ra RIGHT JOIN rf ON ra.k = rf.ka LEFT JOIN rb ON rf.kb = rb.k
+);
+----
+0
+
+# TPC-DI-shaped LEFT query: DuckDB 2.0 optimizes its outer join as RIGHT.
+# The compiler must still choose the reduced-term program.
+statement ok
+CREATE SCHEMA silver;
+
+statement ok
+CREATE SCHEMA gold;
+
+statement ok
+CREATE TABLE silver.financials(company_id INT, eps DOUBLE, revenue DOUBLE,
+                               effective_timestamp TIMESTAMP, end_timestamp TIMESTAMP, is_current BOOLEAN);
+
+statement ok
+CREATE TABLE gold.dim_company(sk_company_id INT, company_id INT,
+                              effective_timestamp TIMESTAMP, end_timestamp TIMESTAMP);
+
+statement ok
+CREATE TABLE silver.daily_market(dm_date DATE, dm_close DOUBLE, dm_high DOUBLE, dm_low DOUBLE,
+                                 dm_vol BIGINT, dm_s_symb VARCHAR, fifty_two_week_high DOUBLE,
+                                 fifty_two_week_high_date DATE, fifty_two_week_low DOUBLE,
+                                 fifty_two_week_low_date DATE);
+
+statement ok
+CREATE TABLE gold.dim_security(sk_security_id INT, sk_company_id INT, symbol VARCHAR,
+                               effective_timestamp TIMESTAMP, end_timestamp TIMESTAMP, dividend DOUBLE);
+
+statement ok
+CREATE MATERIALIZED VIEW market_history AS
+WITH __dbt__cte__wrk_company_financials AS (
+    SELECT f.company_id, sk_company_id, f.eps, f.revenue, f.effective_timestamp,
+           f.end_timestamp, f.is_current
+    FROM silver.financials f JOIN gold.dim_company c
+      ON f.company_id = c.company_id
+     AND f.effective_timestamp BETWEEN c.effective_timestamp AND c.end_timestamp
+)
+SELECT s.sk_security_id, s.sk_company_id, dmh.dm_date AS sk_date_id,
+       (s.dividend / dmh.dm_close) / 100 AS yield,
+       fifty_two_week_high, fifty_two_week_high_date AS sk_fifty_two_week_high_date,
+       fifty_two_week_low, fifty_two_week_low_date AS sk_fifty_two_week_low_date,
+       dm_close AS closeprice, dm_high AS dayhigh, dm_low AS daylow, dm_vol AS volume
+FROM silver.daily_market dmh JOIN gold.dim_security s
+  ON s.symbol = dmh.dm_s_symb
+ AND dmh.dm_date BETWEEN s.effective_timestamp AND s.end_timestamp
+LEFT JOIN __dbt__cte__wrk_company_financials f USING (sk_company_id);
+
+statement ok
+SET openivm_regular_nterm_left=false;
+
+statement ok
+CREATE TEMP TABLE market_full_compile AS
+SELECT max(length(sql)) AS bytes,
+       max((length(sql)-length(replace(sql, 'UNION ALL', '')))/9) AS unions
+FROM openivm_compile_with_facts(
+    'market_history',
+    '{"target_dialect":"spark","compile_only":true,
+      "delta_shape":{"silver.financials":"MIXED","gold.dim_company":"MIXED",
+                     "silver.daily_market":"MIXED","gold.dim_security":"MIXED"}}'
+) WHERE stmt_kind='data' AND refresh_type_name='SIMPLE_PROJECTION';
+
+statement ok
+SET openivm_regular_nterm_left=true;
+
+query III
+SELECT max(length(sql)) < (SELECT bytes FROM market_full_compile),
+       max((length(sql)-length(replace(sql, 'UNION ALL', '')))/9) <
+           (SELECT unions FROM market_full_compile),
+       bool_or(sql LIKE '%RIGHT JOIN%')
+FROM openivm_compile_with_facts(
+    'market_history',
+    '{"target_dialect":"spark","compile_only":true,
+      "delta_shape":{"silver.financials":"MIXED","gold.dim_company":"MIXED",
+                     "silver.daily_market":"MIXED","gold.dim_security":"MIXED"}}'
+) WHERE stmt_kind='data' AND refresh_type_name='SIMPLE_PROJECTION';
+----
+true	true	true
