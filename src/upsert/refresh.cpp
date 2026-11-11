@@ -315,8 +315,14 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		// committing a partly refreshed backing table that downstream DuckLake views would read.
 		// Downstream views that read delta_<mv> need it as well: rows committed for a change
 		// that never reached the backing table would be emitted again by the cascading recovery.
+		// Grouped DuckLake views may stage rowids, then UPDATE and INSERT; those writes
+		// must commit together even when the view has no downstream dependents.
+		bool has_downstream = cross_system && !split_native && !split_protocol && probe_meta.HasDownstreamViews(vn);
+		bool standalone_ducklake_group = cross_system && !split_native && !split_protocol && !has_downstream &&
+		                                 probe_meta.IsDuckLakeCatalog(view_catalog_name) &&
+		                                 probe_meta.GetViewType(vn) == RefreshType::AGGREGATE_GROUP;
 		bool atomic_ducklake_data =
-		    cross_system && !split_native && (split_protocol || probe_meta.HasDownstreamViews(vn));
+		    cross_system && !split_native && (split_protocol || has_downstream || standalone_ducklake_group);
 		// Source-delta cleanup outside the database the data transaction writes (or, for native
 		// data, outside the metadata catalog) is collected instead of inlined: one transaction
 		// cannot write two databases. Every data step that runs in a transaction collects it.
@@ -618,6 +624,13 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			MetadataLocator::FailPoint(context, "after_data_commit");
 		}
 		InjectConcurrentCommit(context, "concurrent_commit_after_data", attempt);
+		if (standalone_ducklake_group && !source_pins.sources.empty()) {
+			// The transaction may have committed an MV snapshot after the pre-commit source
+			// check. Verify sources again before advancing their watermarks past that snapshot.
+			auto verify_start = std::chrono::steady_clock::now();
+			advance_watermarks(RequireUnchangedSources(context, source_pins, display_name));
+			profiler.AddStep("verify_post_commit_sources", verify_start);
+		}
 		if (!sources_verified && !source_pins.sources.empty()) {
 			// DuckLake data statements committed one by one. Any source change since the pin
 			// may have been read by some of them, so the watermarks stay unwritten and the
