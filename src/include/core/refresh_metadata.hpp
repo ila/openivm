@@ -468,6 +468,7 @@ public:
 		string output_col;
 		string comparison_op;
 		string threshold_sql;
+		string filter;
 	};
 
 	bool GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out);

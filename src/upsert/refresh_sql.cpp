@@ -1071,15 +1071,15 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                 return BuildFilteredGroupCountAuxStateCreateSQL(
 				                     aux_table_sql(aux_meta.aux_table), aux_source_table(aux_meta.source),
 				                     aux_meta.group_col, aux_meta.sum_col, aux_meta.source_group_expr,
-				                     aux_meta.source_sum_expr, /*replace=*/true);
+				                     aux_meta.source_sum_expr, aux_meta.filter, /*replace=*/true);
 			                 });
 			auto source_input = ResolveTrackedSourceInput(metadata, con, view_name, aux_meta.source, delta_table_names,
 			                                              view_catalog_name, view_schema_name, attached_db_catalog_name,
 			                                              attached_db_schema_name);
 			upsert_query = CompileFilteredGroupCount(
 			    view_name, aux_meta.aux_table, source_input.delta_sql, source_input.last_update, aux_meta.group_col,
-			    aux_meta.sum_col, aux_meta.source_group_expr, aux_meta.source_sum_expr, aux_meta.output_col,
-			    aux_meta.comparison_op, aux_meta.threshold_sql, internal_catalog_prefix);
+			    aux_meta.sum_col, aux_meta.source_group_expr, aux_meta.source_sum_expr, aux_meta.filter,
+			    aux_meta.output_col, aux_meta.comparison_op, aux_meta.threshold_sql, internal_catalog_prefix);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling SIMPLE_AGGREGATE "
 			                    "filtered-group-count aux (%s, sum=%s %s %s)\n",
 			                    aux_meta.group_col.c_str(), aux_meta.sum_col.c_str(), aux_meta.comparison_op.c_str(),
