@@ -143,6 +143,10 @@ string SparkPortableRefreshSQL(string sql) {
 			}
 			if (start < tokens[i].start &&
 			    (std::isalpha(static_cast<unsigned char>(sql[start])) || sql[start] == '_')) {
+				// A chained cast can start inside the previous edit's type name.
+				if (!edits.empty() && start < edits.back().end) {
+					continue;
+				}
 				auto target = token_text(i + 1);
 				edits.push_back({start, tokens[i + 1].start + target.size(),
 				                 "CAST(" + sql.substr(start, tokens[i].start - start) + " AS BIGINT)"});
