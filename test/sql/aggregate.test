@@ -4853,3 +4853,216 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# Issue #148: FILTER removes rows; replacing excluded arguments with NULL changes
+# FIRST/LAST and ARG_MIN_NULL/ARG_MAX_NULL because they retain NULL arguments.
+statement ok
+CREATE TABLE null_filter_scalar_source(id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO null_filter_scalar_source VALUES (1, -10), (2, 5), (3, 9), (4, -20);
+
+statement ok
+CREATE MATERIALIZED VIEW null_filter_scalar_mv AS
+SELECT FIRST(v ORDER BY id) FILTER (WHERE v > 0) AS first_value,
+       LAST(v ORDER BY id) FILTER (WHERE v > 0) AS last_value,
+       ARG_MIN_NULL(v, id) FILTER (WHERE v > 0) AS min_value,
+       ARG_MAX_NULL(v, id) FILTER (WHERE v > 0) AS max_value
+FROM null_filter_scalar_source;
+
+statement ok
+CREATE VIEW null_filter_scalar_expected AS
+SELECT FIRST(v ORDER BY id) FILTER (WHERE v > 0) AS first_value,
+       LAST(v ORDER BY id) FILTER (WHERE v > 0) AS last_value,
+       ARG_MIN_NULL(v, id) FILTER (WHERE v > 0) AS min_value,
+       ARG_MAX_NULL(v, id) FILTER (WHERE v > 0) AS max_value
+FROM null_filter_scalar_source;
+
+query IIII
+SELECT * FROM null_filter_scalar_mv;
+----
+5	9	5	9
+
+query IIII
+SELECT * FROM null_filter_scalar_mv EXCEPT ALL SELECT * FROM null_filter_scalar_expected;
+----
+
+query IIII
+SELECT * FROM null_filter_scalar_expected EXCEPT ALL SELECT * FROM null_filter_scalar_mv;
+----
+
+# Without ORDER BY, FIRST/LAST reach the rewrite directly rather than through
+# DuckDB's ordered-aggregate normalization. ARBITRARY is an alias of FIRST.
+statement ok
+CREATE MATERIALIZED VIEW null_filter_unordered_mv AS
+SELECT FIRST(v) FILTER (WHERE v = 5) AS first_value,
+       LAST(v) FILTER (WHERE v = 5) AS last_value,
+       ARBITRARY(v) FILTER (WHERE v = 5) AS arbitrary_value
+FROM null_filter_scalar_source;
+
+statement ok
+CREATE VIEW null_filter_unordered_expected AS
+SELECT FIRST(v) FILTER (WHERE v = 5) AS first_value,
+       LAST(v) FILTER (WHERE v = 5) AS last_value,
+       ARBITRARY(v) FILTER (WHERE v = 5) AS arbitrary_value
+FROM null_filter_scalar_source;
+
+query III
+SELECT * FROM null_filter_unordered_mv;
+----
+5	5	5
+
+query III
+SELECT * FROM null_filter_unordered_mv EXCEPT ALL SELECT * FROM null_filter_unordered_expected;
+----
+
+query III
+SELECT * FROM null_filter_unordered_expected EXCEPT ALL SELECT * FROM null_filter_unordered_mv;
+----
+
+statement ok
+INSERT INTO null_filter_scalar_source VALUES (0, 15), (5, -30), (6, 25);
+
+statement ok
+UPDATE null_filter_scalar_source SET v = -15 WHERE id = 0;
+
+statement ok
+UPDATE null_filter_scalar_source SET v = 30 WHERE id = 4;
+
+statement ok
+DELETE FROM null_filter_scalar_source WHERE id IN (2, 6);
+
+statement ok
+PRAGMA refresh('null_filter_scalar_mv');
+
+query IIII
+SELECT * FROM null_filter_scalar_mv EXCEPT ALL SELECT * FROM null_filter_scalar_expected;
+----
+
+query IIII
+SELECT * FROM null_filter_scalar_expected EXCEPT ALL SELECT * FROM null_filter_scalar_mv;
+----
+
+statement ok
+DELETE FROM null_filter_scalar_source;
+
+statement ok
+PRAGMA refresh('null_filter_scalar_mv');
+
+query IIII
+SELECT * FROM null_filter_scalar_mv EXCEPT ALL SELECT * FROM null_filter_scalar_expected;
+----
+
+query IIII
+SELECT * FROM null_filter_scalar_expected EXCEPT ALL SELECT * FROM null_filter_scalar_mv;
+----
+
+# Qualifying NULL arguments must survive. Cover empty filtered groups, NULL
+# predicates, and ordinary SUM/COUNT filters in the same aggregate node.
+statement ok
+CREATE TABLE null_filter_group_source(grp INTEGER, id INTEGER, v INTEGER, active BOOLEAN);
+
+statement ok
+INSERT INTO null_filter_group_source VALUES
+    (1, 1, -10, false), (1, 2, 5, true), (1, 3, 9, true), (1, 4, -20, false),
+    (2, 1, 10, false), (2, 2, 20, NULL),
+    (3, 1, NULL, true), (3, 2, 7, true), (3, 3, NULL, true),
+    (4, 1, 11, true), (4, 2, NULL, true),
+    (5, 1, NULL, true), (5, 2, 12, true);
+
+statement ok
+CREATE MATERIALIZED VIEW null_filter_group_mv AS
+SELECT grp,
+       FIRST(v ORDER BY id) FILTER (WHERE active) AS first_value,
+       LAST(v ORDER BY id) FILTER (WHERE active) AS last_value,
+       ARG_MIN_NULL(v, id) FILTER (WHERE active) AS min_value,
+       ARG_MAX_NULL(v, id) FILTER (WHERE active) AS max_value,
+       SUM(v) FILTER (WHERE active) AS total,
+       COUNT(*) FILTER (WHERE active) AS n
+FROM null_filter_group_source GROUP BY grp;
+
+statement ok
+CREATE VIEW null_filter_group_expected AS
+SELECT grp,
+       FIRST(v ORDER BY id) FILTER (WHERE active) AS first_value,
+       LAST(v ORDER BY id) FILTER (WHERE active) AS last_value,
+       ARG_MIN_NULL(v, id) FILTER (WHERE active) AS min_value,
+       ARG_MAX_NULL(v, id) FILTER (WHERE active) AS max_value,
+       SUM(v) FILTER (WHERE active) AS total,
+       COUNT(*) FILTER (WHERE active) AS n
+FROM null_filter_group_source GROUP BY grp;
+
+query IIIIIII
+SELECT * FROM null_filter_group_mv ORDER BY grp;
+----
+1	5	9	5	9	14	2
+2	NULL	NULL	NULL	NULL	NULL	0
+3	NULL	NULL	NULL	NULL	7	3
+4	11	NULL	11	NULL	11	2
+5	NULL	12	NULL	12	12	2
+
+query IIIIIII
+SELECT * FROM null_filter_group_mv EXCEPT ALL SELECT * FROM null_filter_group_expected;
+----
+
+query IIIIIII
+SELECT * FROM null_filter_group_expected EXCEPT ALL SELECT * FROM null_filter_group_mv;
+----
+
+statement ok
+INSERT INTO null_filter_group_source VALUES
+    (1, 5, 13, true), (2, 3, 21, true), (3, 4, 15, true), (6, 1, 17, true);
+
+statement ok
+UPDATE null_filter_group_source SET v = NULL WHERE grp = 1 AND id = 2;
+
+statement ok
+UPDATE null_filter_group_source SET active = true WHERE grp = 1 AND id = 4;
+
+statement ok
+UPDATE null_filter_group_source SET active = false WHERE grp = 4 AND id = 1;
+
+statement ok
+UPDATE null_filter_group_source SET v = 40 WHERE grp = 6;
+
+statement ok
+DELETE FROM null_filter_group_source WHERE (grp = 1 AND id = 3) OR grp IN (5, 6);
+
+statement ok
+PRAGMA refresh('null_filter_group_mv');
+
+query IIIIIII
+SELECT * FROM null_filter_group_mv EXCEPT ALL SELECT * FROM null_filter_group_expected;
+----
+
+query IIIIIII
+SELECT * FROM null_filter_group_expected EXCEPT ALL SELECT * FROM null_filter_group_mv;
+----
+
+statement ok
+DELETE FROM null_filter_group_source WHERE active;
+
+statement ok
+PRAGMA refresh('null_filter_group_mv');
+
+query IIIIIII
+SELECT * FROM null_filter_group_mv EXCEPT ALL SELECT * FROM null_filter_group_expected;
+----
+
+query IIIIIII
+SELECT * FROM null_filter_group_expected EXCEPT ALL SELECT * FROM null_filter_group_mv;
+----
+
+statement ok
+DELETE FROM null_filter_group_source;
+
+statement ok
+PRAGMA refresh('null_filter_group_mv');
+
+query IIIIIII
+SELECT * FROM null_filter_group_mv EXCEPT ALL SELECT * FROM null_filter_group_expected;
+----
+
+query IIIIIII
+SELECT * FROM null_filter_group_expected EXCEPT ALL SELECT * FROM null_filter_group_mv;
+----

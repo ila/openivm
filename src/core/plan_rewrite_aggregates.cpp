@@ -140,7 +140,10 @@ void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator>
 		if (!bound.GetFilter()) {
 			continue;
 		}
-		if (bound.Function().GetName().GetIdentifierName() == "list") {
+		// NULL masking only removes rows for aggregates that ignore NULL arguments.
+		const auto &name = bound.Function().GetName().GetIdentifierName();
+		if (name == "list" || name == "first" || name == "last" || name == "arg_min_null" || name == "arg_max_null") {
+			OPENIVM_DEBUG_PRINT("[PlanRewrite] Preserved FILTER for NULL-retaining aggregate %s\n", name.c_str());
 			continue;
 		}
 		auto filter_expr = std::move(bound.GetFilterMutable()); // nulls bound.filter
