@@ -8,12 +8,6 @@ OVERRIDE_GIT_DESCRIBE?=v2.0.0
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
-# Keep MinGW test failures attributable to a single SQL file while diagnosing
-# the process failure tracked in #157. The runner still executes every test.
-ifeq ($(DUCKDB_PLATFORM),windows_amd64_mingw)
-TEST_RUNNER += --batch-size 1
-endif
-
 .PHONY: test_regular_nterm_compiled
 
 test_release_internal: test_regular_nterm_compiled

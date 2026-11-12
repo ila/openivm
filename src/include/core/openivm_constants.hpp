@@ -106,7 +106,13 @@ constexpr const char *DISABLED_OPTIMIZERS = TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;
 // row indexes exceed the compact hash-vector capacity during generated
 // maintenance joins (notably Top-K publication diffs). Keep it out of refresh
 // execution until the native selection/capacity mismatch is fixed upstream.
+#ifdef __MINGW32__
+// MinGW overflows DuckDB's correlated-expression walk on large generated CTE
+// programs. Preserve CTE boundaries instead of inlining the entire chain.
+constexpr const char *REFRESH_DISABLED_OPTIMIZERS = "deliminator,join_filter_pushdown,cte_inlining";
+#else
 constexpr const char *REFRESH_DISABLED_OPTIMIZERS = "deliminator,join_filter_pushdown";
+#endif
 
 // Timestamp::GetCurrentTimestamp() (used by transactional delta capture) is UTC. Casting now()
 // from TIMESTAMPTZ to TIMESTAMP applies the session time zone, so use an epoch round-trip for all
