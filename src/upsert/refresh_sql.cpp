@@ -27,16 +27,11 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/planner.hpp"
 
-#include <regex>
+#include <cctype>
 
 namespace duckdb {
 
 string SparkPortableRefreshSQL(string sql) {
-	static const std::regex quoted_cast_regex(R"(('[^']*(?:''[^']*)*')::(TIMESTAMP|DATE))",
-	                                          std::regex_constants::icase);
-	static const std::regex bigint_cast_regex(R"(([A-Za-z_][A-Za-z0-9_\.]*)::BIGINT)", std::regex_constants::icase);
-	static const std::regex now_regex(R"(\bnow\(\))", std::regex_constants::icase);
-	static const std::regex null_safe_regex(R"(\s+IS\s+NOT\s+DISTINCT\s+FROM\s+)", std::regex_constants::icase);
 	// Use lexer tokens so helper syntax is translated without changing
 	// identifiers, literals or comments.
 	auto tokens = Parser::Tokenize(sql);
@@ -102,13 +97,82 @@ string SparkPortableRefreshSQL(string sql) {
 			sql.replace(token.start, 7, "EXCEPT");
 		}
 	}
-	sql = std::regex_replace(sql, quoted_cast_regex, "CAST($1 AS $2)");
-	sql = std::regex_replace(sql, bigint_cast_regex, "CAST($1 AS BIGINT)");
-	// UTC_NOW_SQL is DuckDB-only (epoch_us); Spark's current_timestamp() is already an absolute instant.
-	sql = SqlUtils::ReplaceAllOccurrences(sql, openivm::UTC_NOW_SQL, "current_timestamp()");
-	sql = std::regex_replace(sql, now_regex, "current_timestamp()");
-	sql = std::regex_replace(sql, null_safe_regex, " <=> ");
-	return sql;
+	// std::regex_replace over an entire refresh program can exhaust the MinGW stack.
+	// The lexer already identifies literals and operators; apply the remaining edits in one pass.
+	tokens = Parser::Tokenize(sql);
+	struct Edit {
+		idx_t start;
+		idx_t end;
+		string replacement;
+	};
+	vector<Edit> edits;
+	const string utc_now_sql = openivm::UTC_NOW_SQL;
+	auto token_text = [&](idx_t index) {
+		auto end = index + 1 < tokens.size() ? tokens[index + 1].start : sql.size();
+		return SqlUtils::TrimSQLFragment(sql.substr(tokens[index].start, end - tokens[index].start));
+	};
+	for (idx_t i = 0; i < tokens.size(); i++) {
+		auto word = token_text(i);
+		if (word == "make_timestamp" && sql.compare(tokens[i].start, utc_now_sql.size(), utc_now_sql) == 0) {
+			auto end = tokens[i].start + utc_now_sql.size();
+			edits.push_back({tokens[i].start, end, "current_timestamp()"});
+			while (i + 1 < tokens.size() && tokens[i + 1].start < end) {
+				i++;
+			}
+			continue;
+		}
+		if (tokens[i].type == SimplifiedTokenType::SIMPLIFIED_TOKEN_STRING_CONSTANT && i + 2 < tokens.size() &&
+		    token_text(i + 1) == "::") {
+			auto target = token_text(i + 2);
+			if (!word.empty() && word.front() == '\'' && word.back() == '\'' &&
+			    (StringUtil::CIEquals(target, "DATE") || StringUtil::CIEquals(target, "TIMESTAMP"))) {
+				edits.push_back(
+				    {tokens[i].start, tokens[i + 2].start + target.size(), "CAST(" + word + " AS " + target + ")"});
+				i += 2;
+				continue;
+			}
+		}
+		if (word == "::" && i > 0 && i + 1 < tokens.size() && StringUtil::CIEquals(token_text(i + 1), "BIGINT")) {
+			auto start = tokens[i].start;
+			while (start > 0) {
+				unsigned char c = sql[start - 1];
+				if (!std::isalnum(c) && c != '_' && c != '.') {
+					break;
+				}
+				start--;
+			}
+			if (start < tokens[i].start &&
+			    (std::isalpha(static_cast<unsigned char>(sql[start])) || sql[start] == '_')) {
+				auto target = token_text(i + 1);
+				edits.push_back({start, tokens[i + 1].start + target.size(),
+				                 "CAST(" + sql.substr(start, tokens[i].start - start) + " AS BIGINT)"});
+				i++;
+				continue;
+			}
+		}
+		if (StringUtil::CIEquals(word, "now") && i + 2 < tokens.size() && token_text(i + 1) == "(" &&
+		    token_text(i + 2) == ")") {
+			edits.push_back({tokens[i].start, tokens[i + 2].start + 1, "current_timestamp()"});
+			i += 2;
+			continue;
+		}
+		if (StringUtil::CIEquals(word, "IS") && i + 3 < tokens.size() &&
+		    StringUtil::CIEquals(token_text(i + 1), "NOT") && StringUtil::CIEquals(token_text(i + 2), "DISTINCT") &&
+		    StringUtil::CIEquals(token_text(i + 3), "FROM")) {
+			edits.push_back({tokens[i].start, tokens[i + 3].start + 4, " <=> "});
+			i += 3;
+		}
+	}
+	string result;
+	result.reserve(sql.size());
+	idx_t cursor = 0;
+	for (auto &edit : edits) {
+		result.append(sql, cursor, edit.start - cursor);
+		result += edit.replacement;
+		cursor = edit.end;
+	}
+	result.append(sql, cursor, sql.size() - cursor);
+	return result;
 }
 
 void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext &to) {
