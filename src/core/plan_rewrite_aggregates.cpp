@@ -112,6 +112,20 @@ static const char *SumSqPrefix(const string &func_name) {
 	}
 	return openivm::SUM_SQ_COL_PREFIX; // stddev, stddev_samp
 }
+
+static bool CanMaskAggregateFilter(const BoundAggregateExpression &aggregate) {
+	const auto &name = aggregate.Function().GetName().GetIdentifierName();
+	if (aggregate.GetChildren().empty()) {
+		return name == "count_star";
+	}
+	if (aggregate.GetChildren().size() != 1) {
+		return false;
+	}
+	return name == "count" || name == "sum" || name == "min" || name == "max" || name == "avg" ||
+	       IsStddevOrVariance(name) || name == "bool_and" || name == "bool_or" || name == "bit_and" ||
+	       name == "bit_or" || name == "bit_xor" || name == "product" || name == "any_value";
+}
+
 void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
 	for (auto &child : plan->children) {
 		RewriteAggregateFilters(context, child);
@@ -140,7 +154,9 @@ void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator>
 		if (!bound.GetFilter()) {
 			continue;
 		}
-		if (bound.Function().GetName().GetIdentifierName() == "list") {
+		if (!CanMaskAggregateFilter(bound)) {
+			OPENIVM_DEBUG_PRINT("[PlanRewrite] Preserved native FILTER for aggregate %s\n",
+			                    bound.Function().GetName().GetIdentifierName().c_str());
 			continue;
 		}
 		auto filter_expr = std::move(bound.GetFilterMutable()); // nulls bound.filter

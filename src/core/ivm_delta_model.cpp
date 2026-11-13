@@ -68,7 +68,7 @@ static void CountProfileNode(DeltaModelProfileCounts &counts, DeltaModelNodeKind
 		break;
 	case DeltaModelNodeKind::AGGREGATE: {
 		bool non_linear = analysis.found_minmax || analysis.found_count_distinct || analysis.found_list ||
-		                  analysis.found_filtered_list;
+		                  analysis.found_retained_aggregate_filter;
 		if (analysis.found_aggregation && (!non_linear || analysis.found_count_distinct)) {
 			counts.node_semantics += 2; // linear: APPEND_ONLY/DELETE_SKIP safe; COUNT DISTINCT: DELETE/UPDATE sensitive
 		}

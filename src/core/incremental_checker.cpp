@@ -281,12 +281,15 @@ static bool PlanAnalysis::*const NON_LOCAL_FACTS[] = {
 
 // Query-shape facts a pass-through CTE consumer inherits from the body.
 static bool PlanAnalysis::*const SHAPE_FACTS[] = {
-    &PlanAnalysis::found_aggregation,    &PlanAnalysis::found_projection,     &PlanAnalysis::found_having,
-    &PlanAnalysis::found_distinct,       &PlanAnalysis::found_union_distinct, &PlanAnalysis::found_minmax,
-    &PlanAnalysis::found_list,           &PlanAnalysis::found_filtered_list,  &PlanAnalysis::found_left_join,
-    &PlanAnalysis::found_full_outer,     &PlanAnalysis::found_semi_anti_join, &PlanAnalysis::found_join,
-    &PlanAnalysis::found_delim_join,     &PlanAnalysis::found_single_join,    &PlanAnalysis::found_window,
-    &PlanAnalysis::found_count_distinct, &PlanAnalysis::found_grouping_sets,  &PlanAnalysis::found_nested_aggregate};
+    &PlanAnalysis::found_aggregation,    &PlanAnalysis::found_projection,
+    &PlanAnalysis::found_having,         &PlanAnalysis::found_distinct,
+    &PlanAnalysis::found_union_distinct, &PlanAnalysis::found_minmax,
+    &PlanAnalysis::found_list,           &PlanAnalysis::found_retained_aggregate_filter,
+    &PlanAnalysis::found_left_join,      &PlanAnalysis::found_full_outer,
+    &PlanAnalysis::found_semi_anti_join, &PlanAnalysis::found_join,
+    &PlanAnalysis::found_delim_join,     &PlanAnalysis::found_single_join,
+    &PlanAnalysis::found_window,         &PlanAnalysis::found_count_distinct,
+    &PlanAnalysis::found_grouping_sets,  &PlanAnalysis::found_nested_aggregate};
 
 void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 	auto *node = &op;
@@ -427,8 +430,10 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 				const auto &supported = GetSupportedAggregates();
 				const bool scalar_subquery_first =
 				    bound_agg.Function().GetName().GetIdentifierName() == "first" && result.group_index.IsValid();
-				if (supported.find(bound_agg.Function().GetName().GetIdentifierName()) == supported.end() &&
-				    !scalar_subquery_first) {
+				const bool supported_aggregate =
+				    supported.find(bound_agg.Function().GetName().GetIdentifierName()) != supported.end() ||
+				    scalar_subquery_first;
+				if (!supported_aggregate) {
 					result.incremental_compatible = false;
 					result.found_unsupported_aggregate = true;
 				}
@@ -438,14 +443,11 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 					result.found_count_distinct = true;
 				}
 				if (bound_agg.GetFilter()) {
-					// LIST keeps NULL elements, so LIST(CASE WHEN p THEN x ELSE NULL END)
-					// is not equivalent to LIST(x) FILTER (WHERE p). Keep the raw FILTER
-					// and route the view to affected-group recompute using the original SQL.
-					if (bound_agg.Function().GetName().GetIdentifierName() == "list") {
-						result.found_filtered_list = true;
+					// Recompute affected groups with the native FILTER when NULL masking
+					// cannot preserve the aggregate's semantics.
+					if (supported_aggregate) {
+						result.found_retained_aggregate_filter = true;
 					} else {
-						// Other FILTER aggregates should have been normalized before the
-						// checker runs. If one reaches here, use full refresh.
 						result.incremental_compatible = false;
 						result.found_unsupported_filtered_aggregate = true;
 					}
