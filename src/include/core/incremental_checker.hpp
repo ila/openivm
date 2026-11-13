@@ -6,6 +6,9 @@
 
 namespace duckdb {
 
+class Binder;
+class QueryNode;
+
 /// Result of a single-pass plan analysis: IVM compatibility check + metadata extraction.
 struct PlanAnalysis {
 	bool incremental_compatible = true;
@@ -16,7 +19,7 @@ struct PlanAnalysis {
 	bool found_union_distinct = false;
 	bool found_minmax = false;
 	bool found_list = false;
-	bool found_filtered_list = false; // LIST(...) FILTER needs group-recompute with original SQL
+	bool found_retained_aggregate_filter = false; // Native aggregate FILTER needs affected-group recompute
 	bool found_left_join = false;
 	bool found_full_outer = false;
 	bool found_semi_anti_join = false;
@@ -44,7 +47,7 @@ struct PlanAnalysis {
 	vector<string> window_order_columns;     // Common simple ORDER BY columns for all window expressions
 	bool window_row_key_compatible = true;   // False when window expressions use different/non-column keys
 	size_t group_count = 0;                  // number of GROUP BY expressions
-	idx_t group_index = DConstants::INVALID_INDEX; // aggregate's group_index for binding lookup
+	TableIndex group_index;                  // aggregate's group_index for binding lookup
 };
 
 /// Add one operator's compatibility and classification metadata to the plan analysis.
@@ -54,6 +57,11 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &analysis);
 /// Merge an already-analyzed materialized CTE body after its outer consumer has been analyzed.
 /// The body supplies the query shape only for a pass-through consumer; otherwise only safety facts propagate.
 void MergeMaterializedCteBodyAnalysis(PlanAnalysis &analysis, PlanAnalysis body_analysis);
+
+/// Return whether DuckDB's rebind requirement comes from a query-dependent value rather than a source scan.
+/// The parsed query is needed because DuckDB can fold SQL value functions such as CURRENT_TIMESTAMP before
+/// logical-plan analysis. The bound plan distinguishes those values from same-named source columns.
+bool HasQueryDependentBinding(QueryNode &query, LogicalOperator &plan, Binder &binder, bool always_require_rebind);
 
 } // namespace duckdb
 

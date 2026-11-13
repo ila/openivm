@@ -2,27 +2,22 @@
 #define OPENIVM_PARSER_SQL_EXTRACTORS_HPP
 
 #include "duckdb.hpp"
+#include "core/refresh_metadata.hpp"
 
 namespace duckdb {
 
 struct SemiAntiExtract {
-	string join_type;
-	string left_table;
-	string left_alias;
-	string right_table;
-	string right_alias;
-	string predicate;
-	string post_filter;
-	string right_filter;
+	// The caller adds the aux table and its columns.
+	RefreshMetadata::SemiAntiAuxMeta meta;
+	// The left side is a derived table of the membership query rather than a relation.
+	bool left_is_subquery = false;
 	string left_key_col;
 	string left_key_expr;
 	string right_key_expr;
-	bool null_aware = false;
-	string null_aware_left_col;
 	string null_aware_left_expr;
-	string null_aware_right_expr;
-	vector<string> output_cols;
+	// Parallel to meta.output_cols; a column reference's name parts, otherwise empty.
 	vector<string> output_exprs;
+	vector<vector<string>> output_refs;
 };
 
 struct FilteredGroupCountExtract {
@@ -33,6 +28,7 @@ struct FilteredGroupCountExtract {
 	string output_col;
 	string comparison_op;
 	string threshold_sql;
+	string filter;
 };
 
 struct CountDistinctExtract {

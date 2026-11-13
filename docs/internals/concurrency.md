@@ -68,8 +68,13 @@ rows with `Timestamp::GetCurrentTimestamp()`, and generated SQL uses
 
 The gate (`MutationGate` in `src/core/refresh_locks.cpp`) is stored in the database
 instance's object cache, so its lifetime is tied to that database and it is never
-evicted. Delta capture acquires it when a DML statement writes its first delta row.
-`TransactionalMVLockState` retains the guard through commit or rollback.
+evicted. A DML statement on a tracked table acquires it before execution: when
+`RefreshInsertRule` plans the delta capture, or, for a cached prepared plan, in
+`TransactionalMVLockState::OnExecutePrepared` or on `EXECUTE`. DuckDB's `DELETE` and
+`UPDATE` take a table lock against checkpoints when their pipeline starts. Had the
+statement waited for the gate while holding that lock, a gate holder whose commit
+triggers an automatic checkpoint would wait for the table forever. `TransactionalMVLockState`
+retains the guard through commit or rollback.
 
 First-time creation of the shared metadata tables and native source delta tables runs
 in its own short transaction under the gate; view planning and initial materialization
@@ -81,3 +86,16 @@ database, their cleanup is deferred until the caller transaction commits
 (`TransactionalMVLockState::DeferDeltaCleanup`). Rollback discards it. If the deferred
 cleanup fails, the refresh still reports success and prints that cleanup was deferred;
 the committed watermark prevents the retained rows from being applied twice.
+
+## Metadata in another database
+
+With `openivm_metadata_catalog` naming another database than the view, the MV data and
+its watermarks cannot commit in one DuckDB transaction. Autocommit refresh then commits
+an interruption marker, the data and the watermarks in three transactions, and deletes
+consumed source deltas only after the watermarks commit. Any interruption leaves the
+marker set, so the next refresh recomputes. Explicit transactions that would need both
+databases are rejected. Clients sharing a PostgreSQL metadata schema also take a renewed
+per-view lease (`openivm_refresh_leases`) whose times come from the PostgreSQL server
+clock, stop writing data once a local deadline a third of the lease before its expiry
+passes, and fence the watermark commit with a write to their lease row. See
+[metadata placement](metadata-placement.md) for the full protocol and its failure table.

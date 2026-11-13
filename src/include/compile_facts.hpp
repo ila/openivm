@@ -97,7 +97,7 @@ private:
 unique_ptr<duckdb::FunctionData> OpenIvmCompileWithFactsBind(duckdb::ClientContext &context,
                                                              duckdb::TableFunctionBindInput &input,
                                                              duckdb::vector<duckdb::LogicalType> &return_types,
-                                                             duckdb::vector<duckdb::string> &names);
+                                                             duckdb::vector<duckdb::Identifier> &names);
 unique_ptr<duckdb::GlobalTableFunctionState> OpenIvmCompileWithFactsInit(duckdb::ClientContext &context,
                                                                          duckdb::TableFunctionInitInput &input);
 void OpenIvmCompileWithFactsExecute(duckdb::ClientContext &context, duckdb::TableFunctionInput &data_p,

@@ -1,4 +1,5 @@
 #include "core/parser_plan_helpers.hpp"
+#include "core/metadata_json.hpp"
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
@@ -7,30 +8,228 @@
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parser/query_error_context.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/bound_ref_wrapper.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/planner/bind_context.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/planner/planner.hpp"
+#include "duckdb/optimizer/unnest_rewriter.hpp"
+#include "duckdb/optimizer/column_binding_replacer.hpp"
+#include "duckdb/planner/logical_operator_visitor.hpp"
+#include "duckdb/planner/logical_operator_repeatability.hpp"
+#include "duckdb/planner/column_binding_map.hpp"
+#include "duckdb/function/function_binder.hpp"
 #include "duckdb/optimizer/cte_inlining.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_unnest_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
+#include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
+#include "duckdb/planner/operator/logical_unnest.hpp"
 #include "storage/ducklake_scan.hpp"
 #include "storage/ducklake_table_entry.hpp"
 
 #include <set>
 
 namespace duckdb {
+
+namespace {
+
+struct SourceColumnsBindData : public TableFunctionData {
+	explicit SourceColumnsBindData(TableCatalogEntry &table) : table(table) {
+	}
+	TableCatalogEntry &table;
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<SourceColumnsBindData>(table);
+	}
+	bool Equals(const FunctionData &other) const override {
+		return &table == &other.Cast<SourceColumnsBindData>().table;
+	}
+};
+
+static void RewriteSourceColumns(Binder &binder, SQLStatement &statement);
+
+} // namespace
+
+TableFunction SourceColumnsFunction() {
+	TableFunction function("openivm_source_columns", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                       [](ClientContext &, TableFunctionInput &, DataChunk &) {
+		                       throw InvalidInputException("OpenIVM source-column IR cannot execute directly");
+	                       });
+	function.bind_replace = [](ClientContext &context, TableFunctionBindInput &input) -> unique_ptr<TableRef> {
+		auto entry = Catalog::GetEntry(
+		    context,
+		    SqlUtils::QualifyLookup(
+		        EntryLookupInfo(CatalogType::TABLE_ENTRY, QualifiedName(Identifier(input.inputs[2].ToString()))),
+		        Identifier(input.inputs[0].ToString()), Identifier(input.inputs[1].ToString())),
+		    OnEntryNotFound::THROW_EXCEPTION);
+		if (entry->type == CatalogType::VIEW_ENTRY) {
+			auto &view = entry->Cast<ViewCatalogEntry>();
+			auto view_binder = Binder::CreateBinder(context, input.binder, BinderType::VIEW_BINDER);
+			view_binder->SetCanContainNulls(true);
+			view_binder->SetSearchPath(view.ParentCatalog(), view.ParentSchema().name);
+			view_binder->AddBoundView(view);
+			auto query = view.GetQuery().Copy();
+			RewriteSourceColumns(*view_binder, *query);
+			SubqueryRef subquery(unique_ptr_cast<SQLStatement, SelectStatement>(std::move(query)));
+			subquery.alias = input.ref.alias;
+			subquery.column_name_alias = view.aliases;
+			for (idx_t i = 0; i < input.ref.column_name_alias.size(); i++) {
+				if (i < subquery.column_name_alias.size()) {
+					subquery.column_name_alias[i] = input.ref.column_name_alias[i];
+				} else {
+					subquery.column_name_alias.push_back(input.ref.column_name_alias[i]);
+				}
+			}
+			auto bound = view_binder->Bind(static_cast<TableRef &>(subquery));
+			if (!view_binder->correlated_columns.empty()) {
+				throw BinderException("Contents of view were altered - view bound correlated columns");
+			}
+			view.UpdateBinding(bound.types, bound.names);
+			auto binder = Binder::CreateBinder(context, input.binder);
+			binder->bind_context.AddView(bound.plan->GetRootIndex(), input.ref.alias, subquery, bound, view);
+			OPENIVM_DEBUG_PRINT("[SOURCE COLUMNS] Bound view %s in its own search path\n", view.name.c_str());
+			return make_uniq<BoundRefWrapper>(std::move(bound), std::move(binder));
+		}
+		auto &table = entry->Cast<TableCatalogEntry>();
+		auto binder = Binder::CreateBinder(context, input.binder);
+		auto index = binder->GenerateTableIndex();
+		BoundStatement bound;
+		vector<ColumnIndex> columns;
+		for (auto &column : table.GetColumns().Logical()) {
+			bound.names.push_back(column.Name());
+			bound.types.push_back(column.Type());
+			columns.emplace_back(column.Oid());
+		}
+		auto function = SourceColumnsFunction();
+		auto get = make_uniq<LogicalGet>(index, BoundTableFunction(function), make_uniq<SourceColumnsBindData>(table),
+		                                 bound.types, bound.names);
+		get->SetColumnIds(std::move(columns));
+		bound.plan = std::move(get);
+		auto binding_names = BindContext::AliasColumnNames(table.name, bound.names, input.ref.column_name_alias);
+
+		binder->bind_context.AddEntryBinding(index, input.ref.alias, binding_names, bound.types, table);
+		OPENIVM_DEBUG_PRINT("[SOURCE COLUMNS] Preserving generated identities in %s.%s.%s\n",
+		                    table.catalog.GetName().c_str(), table.schema.name.GetIdentifierName().c_str(),
+		                    table.name.GetIdentifierName().c_str());
+		return make_uniq<BoundRefWrapper>(std::move(bound), std::move(binder));
+	};
+	function.projection_pushdown = true;
+	function.get_table_entry = [](const optional_ptr<const FunctionData> data) -> optional_ptr<TableCatalogEntry> {
+		return data->Cast<SourceColumnsBindData>().table;
+	};
+	function.serialize = [](Serializer &serializer, const optional_ptr<FunctionData> data, const BoundTableFunction &) {
+		auto &table = data->Cast<SourceColumnsBindData>().table;
+		serializer.WriteProperty(100, "catalog", table.catalog.GetName());
+		serializer.WriteProperty(101, "schema", table.schema.name.GetIdentifierName());
+		serializer.WriteProperty(102, "table", table.name.GetIdentifierName());
+	};
+	function.deserialize = [](Deserializer &deserializer, BoundTableFunction &) -> unique_ptr<FunctionData> {
+		auto catalog = deserializer.ReadProperty<string>(100, "catalog");
+		auto schema = deserializer.ReadProperty<string>(101, "schema");
+		auto name = deserializer.ReadProperty<string>(102, "table");
+		auto table = Catalog::GetEntry<TableCatalogEntry>(
+		    deserializer.Get<ClientContext &>(),
+		    QualifiedName(Identifier(catalog), Identifier(schema), Identifier(name)), OnEntryNotFound::THROW_EXCEPTION);
+		return make_uniq<SourceColumnsBindData>(*table);
+	};
+	return function;
+}
+
+namespace {
+
+static void RewriteSourceColumns(Binder &binder, SQLStatement &statement) {
+	// Bind generated columns as source values, not their current definitions. This
+	// plan is compiler IR only: LPTS emits ordinary source SQL, while delta scans
+	// read the materialized generated values captured with each signed change.
+	SqlUtils::RewriteSourceReferences(statement, [&](unique_ptr<TableRef> &ref) {
+		auto &base = ref->Cast<BaseTableRef>();
+		if (base.at_clause) {
+			return;
+		}
+		auto catalog = base.GetQualifiedName().Catalog().GetIdentifierName();
+		auto schema = base.GetQualifiedName().Schema().GetIdentifierName();
+		// The context-only resolver uses the caller's path. A view must check
+		// schema/catalog ambiguity against its own entry retriever instead.
+		if (catalog.empty() && !schema.empty() &&
+		    DatabaseManager::Get(binder.context).GetDatabase(binder.context, Identifier(schema))) {
+			auto local = binder.EntryRetriever().GetSchema(
+			    EntryLookupInfo(CatalogType::SCHEMA_ENTRY, QualifiedName(Identifier(schema))),
+			    OnEntryNotFound::RETURN_NULL);
+			if (local) {
+				throw BinderException(
+				    "Ambiguous reference to catalog or schema \"%s\" - use a fully qualified path like \"%s.%s\"",
+				    schema, local->ParentCatalog().GetName(), schema);
+			}
+			catalog = schema;
+			schema.clear();
+		}
+		auto entry = binder.EntryRetriever().GetEntry(
+		    SqlUtils::QualifyLookup(
+		        EntryLookupInfo(CatalogType::TABLE_ENTRY, QualifiedName(Identifier(base.Table().GetIdentifierName()))),
+		        Identifier(catalog), Identifier(schema)),
+		    OnEntryNotFound::RETURN_NULL);
+		if (!entry) {
+			return;
+		}
+		if (entry->type != CatalogType::VIEW_ENTRY) {
+			if (entry->type != CatalogType::TABLE_ENTRY || !entry->ParentCatalog().IsDuckCatalog()) {
+				return;
+			}
+			auto &table = entry->Cast<TableCatalogEntry>();
+			if (table.GetColumns().LogicalColumnCount() == table.GetColumns().PhysicalColumnCount()) {
+				return;
+			}
+		}
+		auto function = make_uniq<TableFunctionRef>();
+		vector<unique_ptr<ParsedExpression>> arguments;
+		for (auto &name : {entry->ParentCatalog().GetName(), entry->ParentSchema().name, entry->name}) {
+			arguments.push_back(ConstantExpression::FromValue(Value(name)));
+		}
+		function->function = make_uniq<FunctionExpression>("openivm_source_columns", std::move(arguments));
+		// CopyProperties requires equal ref types and omits column-name aliases.
+		function->alias = std::move(ref->alias);
+		function->column_name_alias = std::move(ref->column_name_alias);
+		function->query_location = ref->query_location;
+		function->sample = std::move(ref->sample);
+		function->external_dependency = std::move(ref->external_dependency);
+		ref = std::move(function);
+	});
+}
+
+} // namespace
+
+void PlanWithSourceColumns(Planner &planner, unique_ptr<SQLStatement> statement) {
+	RewriteSourceColumns(*planner.binder, *statement);
+	planner.CreatePlan(std::move(statement));
+}
 
 void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string> &output_names, string &suffix,
                                string &ordering) {
@@ -45,6 +244,7 @@ void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string>
 	}
 	vector<BoundOrderByNode> *orders = nullptr;
 	idx_t limit = DConstants::INVALID_INDEX, offset = 0;
+	double limit_percentage = -1;
 	unique_ptr<LogicalOperator> *order_slot = nullptr;
 	if ((*slot)->type == LogicalOperatorType::LOGICAL_TOP_N) {
 		auto &top = (*slot)->Cast<LogicalTopN>();
@@ -53,12 +253,15 @@ void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string>
 		offset = top.offset;
 	} else if ((*slot)->type == LogicalOperatorType::LOGICAL_LIMIT) {
 		auto &top = (*slot)->Cast<LogicalLimit>();
-		if ((top.limit_val.Type() != LimitNodeType::UNSET && top.limit_val.Type() != LimitNodeType::CONSTANT_VALUE) ||
+		if ((top.limit_val.Type() != LimitNodeType::UNSET && top.limit_val.Type() != LimitNodeType::CONSTANT_VALUE &&
+		     top.limit_val.Type() != LimitNodeType::CONSTANT_PERCENTAGE) ||
 		    (top.offset_val.Type() != LimitNodeType::UNSET && top.offset_val.Type() != LimitNodeType::CONSTANT_VALUE)) {
 			return;
 		}
 		if (top.limit_val.Type() == LimitNodeType::CONSTANT_VALUE) {
 			limit = top.limit_val.GetConstantValue();
+		} else if (top.limit_val.Type() == LimitNodeType::CONSTANT_PERCENTAGE) {
+			limit_percentage = top.limit_val.GetConstantPercentage();
 		}
 		if (top.offset_val.Type() == LimitNodeType::CONSTANT_VALUE) {
 			offset = top.offset_val.GetConstantValue();
@@ -99,9 +302,9 @@ void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string>
 				auto alias = string(openivm::SORT_VALUE_PREFIX) + to_string(i);
 				auto &projection = *projections.back();
 				auto value = order.expression->Copy();
-				value->alias = alias;
-				auto type = value->return_type;
-				ColumnBinding binding(projection.table_index, projection.expressions.size());
+				value->SetAlias(Identifier(alias));
+				auto type = value->GetReturnType();
+				ColumnBinding binding {projection.table_index, ProjectionIndex(projection.expressions.size())};
 				projection.expressions.push_back(std::move(value));
 				projection.ResolveOperatorTypes();
 				vector<LogicalProjection *> ancestors(projections.begin(), projections.end() - 1);
@@ -116,6 +319,8 @@ void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string>
 	suffix = ordering;
 	if (limit != DConstants::INVALID_INDEX) {
 		suffix += " LIMIT " + to_string(limit);
+	} else if (limit_percentage >= 0) {
+		suffix += " LIMIT " + Value::DOUBLE(limit_percentage).ToSQLString() + " PERCENT";
 	}
 	if (offset > 0) {
 		suffix += " OFFSET " + to_string(offset);
@@ -129,7 +334,7 @@ void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string>
 }
 
 static bool IsDerivedAggregate(const BoundAggregateExpression &aggregate) {
-	const auto &name = aggregate.function.name;
+	const auto &name = aggregate.Function().GetName().GetIdentifierName();
 	return name == "avg" || name == "stddev" || name == "stddev_samp" || name == "stddev_pop" || name == "variance" ||
 	       name == "var_samp" || name == "var_pop";
 }
@@ -143,11 +348,11 @@ static bool PrepareCtesForInlining(LogicalOperator *op, PlanRewriteNeeds &needs)
 		needs.has_aggregate = true;
 		auto &aggregate = op->Cast<LogicalAggregate>();
 		for (auto &expression : aggregate.expressions) {
-			if (expression->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+			if (expression->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
 				continue;
 			}
 			auto &bound_aggregate = expression->Cast<BoundAggregateExpression>();
-			needs.aggregate_filters = needs.aggregate_filters || bound_aggregate.filter;
+			needs.aggregate_filters = needs.aggregate_filters || bound_aggregate.GetFilter();
 			needs.derived_aggregates = needs.derived_aggregates || IsDerivedAggregate(bound_aggregate);
 		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_WINDOW) {
@@ -157,6 +362,11 @@ static bool PrepareCtesForInlining(LogicalOperator *op, PlanRewriteNeeds &needs)
 		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_DISTINCT) {
 		needs.distinct = true;
+	} else if (op->type == LogicalOperatorType::LOGICAL_INTERSECT || op->type == LogicalOperatorType::LOGICAL_EXCEPT) {
+		// INTERSECT/EXCEPT are full-refresh boundaries. Their positional output
+		// cannot carry branch-local hidden outer-join state, and full refresh does
+		// not need that state in the first place.
+		needs.blocking_set_operation = true;
 	} else if (op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
 		needs.fold_constant_scalar_subqueries = true;
 	} else if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
@@ -184,23 +394,404 @@ static bool PrepareCtesForInlining(LogicalOperator *op, PlanRewriteNeeds &needs)
 	return found_cte;
 }
 
+// DuckDB 2.0 represents correlated UNNEST as a table-in/out GET whose input
+// projection computes the list expression. Its native CTE UNNEST rewriter only
+// converts that GET when the projection slot is a column reference. Convert the
+// deterministic computed slot to the equivalent LogicalUnnest first, then let
+// the native rewriter remove the domain/deduplication CTEs.
+static void NormalizeComputedUnnestGet(ClientContext &context, LogicalOperator &root,
+                                       unique_ptr<LogicalOperator> &node) {
+	for (auto &child : node->children) {
+		NormalizeComputedUnnestGet(context, root, child);
+	}
+	if (node->type != LogicalOperatorType::LOGICAL_GET) {
+		return;
+	}
+	auto &get = node->Cast<LogicalGet>();
+	if (!ExpressionBinder::IsUnnestFunction(get.function.GetName()) || get.ordinality_idx.IsValid() ||
+	    node->children.size() != 1 || node->children[0]->type != LogicalOperatorType::LOGICAL_PROJECTION) {
+		return;
+	}
+	auto &projection = node->children[0]->Cast<LogicalProjection>();
+	if (projection.children.size() != 1) {
+		return;
+	}
+	auto bindings = node->GetColumnBindings();
+	auto indexes = node->GetTableIndex();
+	if (indexes.empty()) {
+		return;
+	}
+	auto unnest_index = indexes[0];
+	node->ResolveOperatorTypes();
+	bool has_computed_input = false;
+	for (idx_t i = 0; i < bindings.size(); i++) {
+		if (bindings[i].table_index != unnest_index) {
+			continue;
+		}
+		auto column = bindings[i].column_index.GetIndex();
+		if (column >= projection.expressions.size() || projection.expressions[column]->IsVolatile()) {
+			return;
+		}
+		has_computed_input = has_computed_input ||
+		                     projection.expressions[column]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF;
+	}
+	if (!has_computed_input) {
+		return;
+	}
+
+	auto get_node = std::move(node);
+	auto &input_projection = get_node->children[0]->Cast<LogicalProjection>();
+	auto input = std::move(input_projection.children[0]);
+	auto unnest = make_uniq<LogicalUnnest>(unnest_index);
+	unnest->children.push_back(std::move(input));
+	ColumnBindingReplacer replacer;
+	for (idx_t i = 0; i < bindings.size(); i++) {
+		auto &binding = bindings[i];
+		if (binding.table_index != unnest_index) {
+			continue;
+		}
+		auto column = binding.column_index.GetIndex();
+		auto &input_expression = input_projection.expressions[column];
+		auto alias = input_expression->GetAlias();
+		auto unnest_expression = make_uniq<BoundUnnestExpression>(get_node->types[i]);
+		unnest_expression->ChildMutable() = BoundCastExpression::AddArrayCastToList(context, input_expression->Copy());
+		auto output = ColumnBinding::PushExpression(unnest->expressions, std::move(unnest_expression));
+		input_expression =
+		    make_uniq<BoundColumnRefExpression>(alias, get_node->types[i], ColumnBinding(unnest_index, output));
+		input_projection.types[column] = get_node->types[i];
+		replacer.replacement_bindings.emplace_back(
+		    binding, ColumnBinding(input_projection.table_index, ProjectionIndex(column)), get_node->types[i]);
+	}
+	input_projection.children[0] = std::move(unnest);
+	node = std::move(get_node->children[0]);
+	replacer.stop_operator = *node;
+	replacer.VisitOperator(root);
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Normalized computed table-in/out UNNEST input\n");
+}
+
+// Native UNNEST normalization accepts one correlation condition. Pack the
+// generated null-safe key tuple into one equivalent comparison, retaining every
+// key (including NULLs) so the native rewriter can remove the deduplication join.
+static bool ContainsUnnestGet(const LogicalOperator &op) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET &&
+	    ExpressionBinder::IsUnnestFunction(op.Cast<LogicalGet>().function.GetName())) {
+		return true;
+	}
+	for (auto &child : op.children) {
+		if (ContainsUnnestGet(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void PackUnnestCorrelationKeys(ClientContext &context, LogicalOperator &op, TableIndex domain = TableIndex()) {
+	if (op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+		auto &cte = op.Cast<LogicalMaterializedCTE>();
+		if (StringUtil::StartsWith(cte.ctename.GetIdentifierName(), "__duckdb_delim_") &&
+		    !StringUtil::StartsWith(cte.ctename.GetIdentifierName(), "__duckdb_delim_dedup_")) {
+			domain = cte.table_index;
+		}
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = op.Cast<LogicalComparisonJoin>();
+		bool domain_join = false;
+		for (auto &child : join.children) {
+			domain_join |=
+			    child->type == LogicalOperatorType::LOGICAL_CTE_REF && child->Cast<LogicalCTERef>().cte_index == domain;
+		}
+		if (domain_join && ContainsUnnestGet(join) && join.join_type == JoinType::INNER && join.conditions.size() > 1 &&
+		    std::all_of(join.conditions.begin(), join.conditions.end(), [](const JoinCondition &condition) {
+			    return condition.IsComparison() &&
+			           condition.GetComparisonType() == ExpressionType::COMPARE_NOT_DISTINCT_FROM;
+		    })) {
+			vector<unique_ptr<Expression>> left, right;
+			for (idx_t i = 0; i < join.conditions.size(); i++) {
+				auto &condition = join.conditions[i];
+				left.push_back(condition.LeftReference()->Copy());
+				right.push_back(condition.RightReference()->Copy());
+				left.back()->SetAlias(Identifier("key_" + to_string(i)));
+				right.back()->SetAlias(Identifier("key_" + to_string(i)));
+			}
+			FunctionBinder binder(context);
+			auto lhs =
+			    binder.BindScalarFunction(Identifier(DEFAULT_SCHEMA), Identifier("struct_pack"), std::move(left));
+			auto rhs =
+			    binder.BindScalarFunction(Identifier(DEFAULT_SCHEMA), Identifier("struct_pack"), std::move(right));
+			join.conditions.clear();
+			join.conditions.emplace_back(std::move(lhs), std::move(rhs), ExpressionType::COMPARE_NOT_DISTINCT_FROM);
+			OPENIVM_DEBUG_PRINT("[PlanRewrite] Packed native UNNEST correlation keys\n");
+		}
+	}
+	for (auto &child : op.children) {
+		PackUnnestCorrelationKeys(context, *child, domain);
+	}
+}
+
+// A deterministic correlated table function is row-local even though DuckDB
+// 2.0 decorrelates it into domain CTE -> DISTINCT keys -> function -> join.
+// Restore the row-local form so the source delta flows through the function
+// directly, while carrying every source column needed above the removed join.
+static bool NormalizeCorrelatedTableFunctionCTE(unique_ptr<LogicalOperator> &candidate) {
+	for (auto &child : candidate->children) {
+		if (NormalizeCorrelatedTableFunctionCTE(child)) {
+			return true;
+		}
+	}
+	if (candidate->type != LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+		return false;
+	}
+	auto &domain = candidate->Cast<LogicalMaterializedCTE>();
+	if (domain.children.size() != 2) {
+		return false;
+	}
+
+	auto join_owner = &domain.children[1];
+	while ((*join_owner)->type == LogicalOperatorType::LOGICAL_PROJECTION && (*join_owner)->children.size() == 1) {
+		join_owner = &(*join_owner)->children[0];
+	}
+	if ((*join_owner)->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		return false;
+	}
+	auto &join = (*join_owner)->Cast<LogicalComparisonJoin>();
+	if (join.join_type != JoinType::INNER || join.children.size() != 2) {
+		return false;
+	}
+	idx_t domain_side;
+	if (join.children[0]->type == LogicalOperatorType::LOGICAL_CTE_REF &&
+	    join.children[0]->Cast<LogicalCTERef>().cte_index == domain.table_index) {
+		domain_side = 0;
+	} else if (join.children[1]->type == LogicalOperatorType::LOGICAL_CTE_REF &&
+	           join.children[1]->Cast<LogicalCTERef>().cte_index == domain.table_index) {
+		domain_side = 1;
+	} else {
+		return false;
+	}
+	auto function_side = 1 - domain_side;
+	vector<reference<LogicalProjection>> output_projections;
+	auto function_owner = &join.children[function_side];
+	while ((*function_owner)->type == LogicalOperatorType::LOGICAL_PROJECTION &&
+	       (*function_owner)->children.size() == 1) {
+		output_projections.push_back((*function_owner)->Cast<LogicalProjection>());
+		function_owner = &(*function_owner)->children[0];
+	}
+	if ((*function_owner)->type != LogicalOperatorType::LOGICAL_GET) {
+		return false;
+	}
+	auto &get = (*function_owner)->Cast<LogicalGet>();
+	auto function_name = get.function.GetName().GetIdentifierName();
+	auto repeatable = ClassifyLogicalOperatorRepeatability(get) == LogicalOperatorRepeatability::REPEATABLE ||
+	                  StringUtil::CIEquals(function_name, "generate_series") ||
+	                  StringUtil::CIEquals(function_name, "range");
+	if (ExpressionBinder::IsUnnestFunction(get.function.GetName()) || get.GetTable() || !repeatable ||
+	    get.children.size() != 1) {
+		return false;
+	}
+
+	vector<reference<LogicalProjection>> projections;
+	auto dedup_owner = &get.children[0];
+	while ((*dedup_owner)->type == LogicalOperatorType::LOGICAL_PROJECTION && (*dedup_owner)->children.size() == 1) {
+		projections.push_back((*dedup_owner)->Cast<LogicalProjection>());
+		dedup_owner = &(*dedup_owner)->children[0];
+	}
+	if ((*dedup_owner)->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY || projections.empty()) {
+		return false;
+	}
+	auto &dedup = (*dedup_owner)->Cast<LogicalAggregate>();
+	if (dedup.children.size() != 1 || dedup.children[0]->type != LogicalOperatorType::LOGICAL_CTE_REF ||
+	    dedup.children[0]->Cast<LogicalCTERef>().cte_index != domain.table_index || dedup.groups.empty()) {
+		return false;
+	}
+
+	domain.children[0]->ResolveOperatorTypes();
+	auto source_bindings = domain.children[0]->GetColumnBindings();
+	auto source_types = domain.children[0]->types;
+	auto domain_ref_bindings = join.children[domain_side]->GetColumnBindings();
+	auto dedup_ref_bindings = dedup.children[0]->GetColumnBindings();
+	auto dedup_bindings = dedup.GetColumnBindings();
+	if (source_bindings.size() != domain_ref_bindings.size()) {
+		return false;
+	}
+
+	ColumnBindingReplacer dedup_replacer;
+	for (idx_t i = 0; i < dedup.groups.size(); i++) {
+		if (dedup.groups[i]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			return false;
+		}
+		auto input_binding = dedup.groups[i]->Cast<BoundColumnRefExpression>().Binding();
+		auto entry = std::find(dedup_ref_bindings.begin(), dedup_ref_bindings.end(), input_binding);
+		if (entry == dedup_ref_bindings.end()) {
+			return false;
+		}
+		auto source_index = NumericCast<idx_t>(entry - dedup_ref_bindings.begin());
+		dedup_replacer.replacement_bindings.emplace_back(dedup_bindings[i], source_bindings[source_index],
+		                                                 source_types[source_index]);
+	}
+	*dedup_owner = std::move(domain.children[0]);
+	dedup_replacer.VisitOperator(*get.children[0]);
+
+	// Carry every domain column through the argument projections. The table-in/out
+	// GET exposes selected child bindings through projected_input.
+	auto carried_bindings = source_bindings;
+	for (idx_t depth = projections.size(); depth > 0; depth--) {
+		auto &projection = projections[depth - 1].get();
+		vector<ColumnBinding> next;
+		next.reserve(carried_bindings.size());
+		for (idx_t i = 0; i < carried_bindings.size(); i++) {
+			optional_idx output;
+			for (idx_t expr = 0; expr < projection.expressions.size(); expr++) {
+				if (projection.expressions[expr]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+				    projection.expressions[expr]->Cast<BoundColumnRefExpression>().Binding() == carried_bindings[i]) {
+					output = expr;
+					break;
+				}
+			}
+			if (!output.IsValid()) {
+				output = projection.expressions.size();
+				projection.expressions.push_back(
+				    make_uniq<BoundColumnRefExpression>(source_types[i], carried_bindings[i]));
+			}
+			next.emplace_back(projection.table_index, ProjectionIndex(output.GetIndex()));
+		}
+		projection.ResolveOperatorTypes();
+		carried_bindings = std::move(next);
+	}
+	auto function_input_bindings = get.children[0]->GetColumnBindings();
+	for (auto &binding : carried_bindings) {
+		auto entry = std::find(function_input_bindings.begin(), function_input_bindings.end(), binding);
+		if (entry == function_input_bindings.end()) {
+			return false;
+		}
+		auto input = NumericCast<idx_t>(entry - function_input_bindings.begin());
+		if (std::find(get.projected_input.begin(), get.projected_input.end(), input) == get.projected_input.end()) {
+			get.projected_input.push_back(input);
+		}
+	}
+	get.ResolveOperatorTypes();
+	for (idx_t depth = output_projections.size(); depth > 0; depth--) {
+		auto &projection = output_projections[depth - 1].get();
+		vector<ColumnBinding> next;
+		next.reserve(carried_bindings.size());
+		for (idx_t i = 0; i < carried_bindings.size(); i++) {
+			optional_idx output;
+			for (idx_t expr = 0; expr < projection.expressions.size(); expr++) {
+				if (projection.expressions[expr]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+				    projection.expressions[expr]->Cast<BoundColumnRefExpression>().Binding() == carried_bindings[i]) {
+					output = expr;
+					break;
+				}
+			}
+			if (!output.IsValid()) {
+				output = projection.expressions.size();
+				projection.expressions.push_back(
+				    make_uniq<BoundColumnRefExpression>(source_types[i], carried_bindings[i]));
+			}
+			next.emplace_back(projection.table_index, ProjectionIndex(output.GetIndex()));
+		}
+		projection.ResolveOperatorTypes();
+		carried_bindings = std::move(next);
+	}
+
+	ColumnBindingReplacer domain_replacer;
+	for (idx_t i = 0; i < domain_ref_bindings.size(); i++) {
+		domain_replacer.replacement_bindings.emplace_back(domain_ref_bindings[i], carried_bindings[i], source_types[i]);
+	}
+	*join_owner = std::move(join.children[function_side]);
+	candidate = std::move(domain.children[1]);
+	domain_replacer.VisitOperator(*candidate);
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Restored row-local correlated table function\n");
+	return true;
+}
+
 PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
 	PlanRewriteNeeds needs;
 	if (PrepareCtesForInlining(plan.get(), needs)) {
+		PackUnnestCorrelationKeys(context, *plan);
+		NormalizeComputedUnnestGet(context, *plan, plan);
 		Optimizer cte_opt(binder, context);
 		CTEInlining cte_inlining(cte_opt);
+		plan = cte_inlining.Optimize(std::move(plan));
+		while (NormalizeCorrelatedTableFunctionCTE(plan)) {
+		}
+		// Inline the single-use dedup CTE before native UNNEST normalization.
+		// DuckDB 2.0's explicit nested-CTE branch temporarily leaves a null
+		// domain child while updating bindings; the equivalent inline-dedup
+		// branch replaces the domain node before walking the plan.
+		UnnestRewriter unnest_rewriter(context);
+		plan = unnest_rewriter.Optimize(std::move(plan));
 		plan = cte_inlining.Optimize(std::move(plan));
 	}
 	return needs;
 }
 
-string QualifyCreateSourceTable(const string &table_name, const string &current_catalog, const string &current_schema,
-                                const string &default_db) {
-	if (current_catalog.empty() || current_catalog == default_db || table_name.find('.') != string::npos ||
-	    table_name.find('(') != string::npos) {
+string QualifyCreateSourceTable(ClientContext &context, const string &table_name, const CreateMVPlanFacts &facts,
+                                const string &current_catalog, const string &current_schema, const string &default_db,
+                                const string &default_schema) {
+	// The staged executor builds auxiliary state with the metadata schema selected. Name the
+	// relation the view actually bound, which can come from any schema on the search path.
+	vector<string> parts;
+	try {
+		parts = SqlUtils::ParseQualifiedIdentifier(table_name);
+	} catch (const ParserException &) {
+		// Table functions are SQL expressions rather than relation identifiers.
 		return table_name;
 	}
-	return current_catalog + "." + current_schema + "." + table_name;
+	if (parts.size() > 3) {
+		return table_name;
+	}
+	const auto &source_name = parts.back();
+	const string source_schema = parts.size() >= 2 ? parts[parts.size() - 2] : INVALID_SCHEMA;
+	const string source_catalog = parts.size() == 3 ? parts[0] : INVALID_CATALOG;
+	// Resolve public views before consulting physical scan facts: an MV binds to its
+	// publication table, whose name differs from the caller's quoted SQL identifier.
+	QueryErrorContext error_context;
+	for (auto type : {CatalogType::TABLE_ENTRY, CatalogType::VIEW_ENTRY}) {
+		auto entry = Catalog::GetEntry(
+		    context,
+		    SqlUtils::QualifyLookup(EntryLookupInfo(type, QualifiedName(Identifier(source_name)), error_context),
+		                            Identifier(source_catalog), Identifier(source_schema)),
+		    OnEntryNotFound::RETURN_NULL);
+		if (entry) {
+			auto qualified =
+			    SqlUtils::FullName(entry->ParentCatalog().GetName(), entry->ParentSchema().name, entry->name);
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Auxiliary source '%s' resolves to %s\n", table_name.c_str(),
+			                    qualified.c_str());
+			return qualified;
+		}
+	}
+	const SourceTableInfo *bound = nullptr;
+	bool bound_in_current_schema = false;
+	for (auto &entry : facts.source_table_info) {
+		auto &source = entry.second;
+		if (!StringUtil::CIEquals(source.table_name, source_name) ||
+		    (parts.size() >= 2 && !StringUtil::CIEquals(source.schema_name, source_schema)) ||
+		    (parts.size() == 3 && !StringUtil::CIEquals(source.catalog_name, source_catalog))) {
+			continue;
+		}
+		bool in_current_schema = StringUtil::CIEquals(source.catalog_name, current_catalog) &&
+		                         StringUtil::CIEquals(source.schema_name, current_schema);
+		// Same-named sources prefer the caller's schema, then a deterministic order.
+		if (!bound || (in_current_schema && !bound_in_current_schema) ||
+		    (in_current_schema == bound_in_current_schema &&
+		     SqlUtils::FullName(source.catalog_name, source.schema_name, source.table_name) <
+		         SqlUtils::FullName(bound->catalog_name, bound->schema_name, bound->table_name))) {
+			bound = &source;
+			bound_in_current_schema = in_current_schema;
+		}
+	}
+	if (bound) {
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Auxiliary source '%s' bound to %s\n", table_name.c_str(),
+		                    SqlUtils::FullName(bound->catalog_name, bound->schema_name, bound->table_name).c_str());
+		return SqlUtils::FullName(bound->catalog_name, bound->schema_name, bound->table_name);
+	}
+	if (parts.size() > 1) {
+		return table_name;
+	}
+	if (current_catalog.empty() || (current_catalog == default_db && current_schema == default_schema)) {
+		return table_name;
+	}
+	return SqlUtils::QuoteIdentifier(current_catalog) + "." + SqlUtils::QuoteIdentifier(current_schema) + "." +
+	       table_name;
 }
 
 static string StripTrailingSemicolon(string sql) {
@@ -221,8 +812,9 @@ string ExplainInitialLoadQuery(Connection &con, const string &label, const strin
 	con.Query("SET explain_output='all'");
 	auto explain = con.Query("EXPLAIN " + sql);
 	if (old_explain && !old_explain->HasError() && old_explain->RowCount() > 0 &&
-	    !old_explain->GetValue(0, 0).IsNull()) {
-		con.Query("SET explain_output='" + SqlUtils::EscapeSingleQuotes(old_explain->GetValue(0, 0).ToString()) + "'");
+	    !old_explain->Collection().GetValue(0, 0).IsNull()) {
+		con.Query("SET explain_output='" +
+		          SqlUtils::EscapeSingleQuotes(old_explain->Collection().GetValue(0, 0).ToString()) + "'");
 	}
 	string result = label + "\n";
 	if (!explain || explain->HasError()) {
@@ -233,16 +825,17 @@ string ExplainInitialLoadQuery(Connection &con, const string &label, const strin
 	return result;
 }
 
-void AddJoinKeyColumn(const unique_ptr<Expression> &expr, unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols) {
-	if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+void AddJoinKeyColumn(const unique_ptr<Expression> &expr,
+                      unordered_map<TableIndex, unordered_set<ProjectionIndex>> &join_key_cols) {
+	if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		return;
 	}
 	auto &bcr = expr->Cast<BoundColumnRefExpression>();
-	join_key_cols[bcr.binding.table_index].insert(bcr.binding.column_index);
+	join_key_cols[bcr.Binding().table_index].insert(bcr.Binding().column_index);
 }
 
 static string BindingKey(const BoundColumnRefExpression &bcr) {
-	return to_string(bcr.binding.table_index) + ":" + to_string(bcr.binding.column_index);
+	return to_string(bcr.Binding().table_index.index) + ":" + to_string(bcr.Binding().column_index);
 }
 
 static string FindBindingParent(unordered_map<string, string> &parents, const string &key) {
@@ -267,20 +860,20 @@ static void UnionBindings(unordered_map<string, string> &parents, const string &
 }
 
 static bool IsPurePassThroughExpression(const Expression *expr) {
-	if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
+	if (expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 		return true;
 	}
-	if (expr->expression_class == ExpressionClass::BOUND_CAST) {
-		auto &cast = expr->Cast<BoundCastExpression>();
-		return IsPurePassThroughExpression(cast.child.get());
+	if (BoundCastExpression::IsCast(*expr)) {
+		auto &cast = expr->Cast<BoundFunctionExpression>();
+		return IsPurePassThroughExpression(&BoundCastExpression::Child(cast));
 	}
 	return false;
 }
 
-static bool ExpressionReferencesNonGroupBinding(Expression *expr, idx_t group_index) {
-	if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
+static bool ExpressionReferencesNonGroupBinding(Expression *expr, TableIndex group_index) {
+	if (expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
-		return bcr.binding.table_index != group_index;
+		return bcr.Binding().table_index != group_index;
 	}
 	bool refs_non_group = false;
 	ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
@@ -291,15 +884,15 @@ static bool ExpressionReferencesNonGroupBinding(Expression *expr, idx_t group_in
 	return refs_non_group;
 }
 
-bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, idx_t group_index) {
+bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, TableIndex group_index) {
 	for (auto *agg_ptr : facts.aggregates) {
 		auto &agg = *agg_ptr;
 		for (auto &expr : agg.expressions) {
-			if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+			if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
 				continue;
 			}
 			auto &bound = expr->Cast<BoundAggregateExpression>();
-			for (auto &child : bound.children) {
+			for (auto &child : bound.GetChildren()) {
 				if (!IsPurePassThroughExpression(child.get())) {
 					return true;
 				}
@@ -354,11 +947,13 @@ static void AddGetFacts(LogicalGet &get, const string &current_catalog, CreateMV
 	auto table_ref = get.GetTable();
 	if (table_ref.get()) {
 		auto &table = *table_ref.get();
-		string table_name = table.name;
+		string table_name = table.name.GetIdentifierName();
 		if (!table_name.empty() && !SqlUtils::IsDelta(table_name)) {
-			auto key = SqlUtils::FullName(table.ParentCatalog().GetName(), table.schema.name, table_name);
+			auto key = SqlUtils::FullName(table.ParentCatalog().GetName().GetIdentifierName(),
+			                              table.schema.name.GetIdentifierName(), table_name);
 			if (facts.source_table_info
-			        .emplace(key, SourceTableInfo {table_name, table.ParentCatalog().GetName(), table.schema.name})
+			        .emplace(key, SourceTableInfo {table_name, table.ParentCatalog().GetName().GetIdentifierName(),
+			                                       table.schema.name.GetIdentifierName()})
 			        .second) {
 				facts.source_name_counts[table_name]++;
 			}
@@ -371,11 +966,11 @@ static void AddGetFacts(LogicalGet &get, const string &current_catalog, CreateMV
 		facts.occurrence_by_index[get.table_index] = source;
 		facts.source_occurrences.push_back(std::move(source));
 	}
-	if (get.function.name != "ducklake_scan" || !get.function.function_info) {
+	if (get.function.GetName().GetIdentifierName() != "ducklake_scan" || !get.function.function_info) {
 		return;
 	}
 	auto &info = get.function.function_info->Cast<DuckLakeFunctionInfo>();
-	string cat = info.table.ParentCatalog().GetName();
+	string cat = info.table.ParentCatalog().GetName().GetIdentifierName();
 	if (cat.empty()) {
 		if (current_catalog.empty()) {
 			throw CatalogException("Could not resolve DuckLake catalog for table '" + info.table_name + "'");
@@ -383,11 +978,12 @@ static void AddGetFacts(LogicalGet &get, const string &current_catalog, CreateMV
 		cat = current_catalog;
 	}
 	DuckLakeSourceTableInfo source_info;
-	source_info.table_name = info.table_name;
+	source_info.table_name = info.table_name.GetIdentifierName();
 	source_info.catalog_name = cat;
-	source_info.schema_name = info.table.schema.name;
+	source_info.schema_name = info.table.schema.name.GetIdentifierName();
 	source_info.table_id = static_cast<int64_t>(info.table_id.index);
-	facts.ducklake_table_info[SqlUtils::FullName(cat, info.table.schema.name, info.table_name)] = source_info;
+	facts.ducklake_table_info[SqlUtils::FullName(cat, info.table.schema.name.GetIdentifierName(), info.table_name)] =
+	    source_info;
 }
 
 static string NullableGetTableName(LogicalGet &get);
@@ -405,25 +1001,36 @@ static void AppendUniqueValues(vector<T> &target, const vector<T> &source) {
 static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &current_catalog, CreateMVPlanFacts &facts,
                                        unordered_map<string, idx_t> &next_occurrence, bool seen_agg_above,
                                        bool under_join, const LogicalOperator *redundant_distinct,
-                                       PlanAnalysis &analysis) {
+                                       PlanAnalysis &analysis, TableIndex internal_delim_cte = TableIndex()) {
 	if (!op) {
 		return "";
 	}
 	for (auto &binding : op->GetColumnBindings()) {
-		facts.max_table_index = std::max(facts.max_table_index, binding.table_index);
+		facts.max_table_index = std::max(facts.max_table_index, binding.table_index.index);
 	}
-	AnalyzePlanOperator(*op, analysis);
+	bool internal_delim_dedup = false;
+	if (internal_delim_cte.IsValid() && op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		auto &aggregate = op->Cast<LogicalAggregate>();
+		auto *input = op;
+		while (input->children.size() == 1 && input->type != LogicalOperatorType::LOGICAL_CTE_REF) {
+			input = input->children[0].get();
+		}
+		internal_delim_dedup = aggregate.expressions.empty() && input->type == LogicalOperatorType::LOGICAL_CTE_REF &&
+		                       input->Cast<LogicalCTERef>().cte_index == internal_delim_cte;
+	}
+	if (!internal_delim_dedup) {
+		AnalyzePlanOperator(*op, analysis);
+	}
 	auto *logical_join = dynamic_cast<LogicalJoin *>(op);
 	if (logical_join && (logical_join->join_type == JoinType::LEFT || logical_join->join_type == JoinType::RIGHT ||
 	                     logical_join->join_type == JoinType::OUTER)) {
-		facts.outer_join_count++;
 		facts.outer_joins.push_back(logical_join);
 	}
 	if (redundant_distinct && op != redundant_distinct && op->type == LogicalOperatorType::LOGICAL_DISTINCT) {
 		facts.has_descendant_distinct = true;
 	}
 	string first_table;
-	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && !internal_delim_dedup) {
 		seen_agg_above = true;
 		auto &agg = op->Cast<LogicalAggregate>();
 		facts.aggregates.push_back(&agg);
@@ -471,9 +1078,13 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 			facts.comparison_joins.push_back(&join);
 			for (auto &cond : join.conditions) {
-				auto *left = cond.left.get();
-				auto *right = cond.right.get();
-				if (left->type != ExpressionType::BOUND_COLUMN_REF || right->type != ExpressionType::BOUND_COLUMN_REF) {
+				if (!cond.IsComparison()) {
+					continue;
+				}
+				auto *left = cond.LeftReference().get();
+				auto *right = cond.RightReference().get();
+				if (left->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF ||
+				    right->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 					continue;
 				}
 				auto &left_ref = left->Cast<BoundColumnRefExpression>();
@@ -485,27 +1096,34 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		}
 		if (op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN && join.join_type == JoinType::SINGLE) {
 			for (auto &expr : join.duplicate_eliminated_columns) {
-				if (expr && expr->type == ExpressionType::BOUND_COLUMN_REF) {
+				if (expr && expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 					facts.single_delim_key_bindings.insert(BindingKey(expr->Cast<BoundColumnRefExpression>()));
 				}
 			}
 			for (auto &cond : join.conditions) {
-				if (cond.left && cond.left->type == ExpressionType::BOUND_COLUMN_REF) {
-					facts.single_delim_key_bindings.insert(BindingKey(cond.left->Cast<BoundColumnRefExpression>()));
+				if (!cond.IsComparison()) {
+					continue;
 				}
-				if (cond.right && cond.right->type == ExpressionType::BOUND_COLUMN_REF) {
-					facts.single_delim_key_bindings.insert(BindingKey(cond.right->Cast<BoundColumnRefExpression>()));
+				if (cond.LeftReference() &&
+				    cond.LeftReference()->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+					facts.single_delim_key_bindings.insert(
+					    BindingKey(cond.LeftReference()->Cast<BoundColumnRefExpression>()));
+				}
+				if (cond.RightReference() &&
+				    cond.RightReference()->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+					facts.single_delim_key_bindings.insert(
+					    BindingKey(cond.RightReference()->Cast<BoundColumnRefExpression>()));
 				}
 			}
 		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op->Cast<LogicalGet>();
 		facts.has_cardinality_changing_filter =
-		    facts.has_cardinality_changing_filter || !get.table_filters.filters.empty();
+		    facts.has_cardinality_changing_filter || !!get.table_filters.HasFilters();
 		AddGetFacts(get, current_catalog, facts, next_occurrence);
 		auto table_ref = get.GetTable();
 		if (table_ref.get()) {
-			first_table = table_ref.get()->name;
+			first_table = table_ref.get()->name.GetIdentifierName();
 		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &cte_ref = op->Cast<LogicalCTERef>();
@@ -523,9 +1141,9 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	}
 	vector<idx_t> child_ids;
 	child_ids.reserve(op->children.size());
-	auto collect_child = [&](LogicalOperator *child, PlanAnalysis &child_analysis) {
+	auto collect_child = [&](LogicalOperator *child, PlanAnalysis &child_analysis, TableIndex child_delim_cte) {
 		string child_first = CollectCreateMVPlanFacts(child, current_catalog, facts, next_occurrence, seen_agg_above,
-		                                              under_join, redundant_distinct, child_analysis);
+		                                              under_join, redundant_distinct, child_analysis, child_delim_cte);
 		D_ASSERT(!facts.plan_nodes_post_order.empty());
 		child_ids.push_back(facts.plan_nodes_post_order.size() - 1);
 		if (first_table.empty()) {
@@ -533,21 +1151,25 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		}
 	};
 	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+		auto &cte = op->Cast<LogicalMaterializedCTE>();
 		PlanAnalysis body_analysis;
 		if (!op->children.empty()) {
-			collect_child(op->children[0].get(), body_analysis);
+			collect_child(op->children[0].get(), body_analysis, internal_delim_cte);
 		}
 		if (op->children.size() >= 2) {
-			collect_child(op->children[1].get(), analysis);
+			auto consumer_delim = StringUtil::StartsWith(cte.ctename.GetIdentifierName(), "__duckdb_delim_")
+			                          ? cte.table_index
+			                          : internal_delim_cte;
+			collect_child(op->children[1].get(), analysis, consumer_delim);
 			MergeMaterializedCteBodyAnalysis(analysis, std::move(body_analysis));
 		}
 		for (idx_t i = 2; i < op->children.size(); i++) {
 			PlanAnalysis ignored_analysis;
-			collect_child(op->children[i].get(), ignored_analysis);
+			collect_child(op->children[i].get(), ignored_analysis, internal_delim_cte);
 		}
 	} else {
 		for (auto &child : op->children) {
-			collect_child(child.get(), analysis);
+			collect_child(child.get(), analysis, internal_delim_cte);
 		}
 	}
 	if (!first_table.empty()) {
@@ -600,27 +1222,31 @@ static bool IsHiddenHavingColumn(const string &name) {
 	return StringUtil::StartsWith(name, "openivm_having_");
 }
 
+// The aggregate function a column reference reads from one of `aggregates`, if any.
+static optional_ptr<BoundAggregateExpression>
+ReferencedAggregate(const BoundColumnRefExpression &column_ref,
+                    const unordered_map<TableIndex, LogicalAggregate *> &aggregates) {
+	auto aggregate_it = aggregates.find(column_ref.Binding().table_index);
+	if (aggregate_it == aggregates.end() ||
+	    column_ref.Binding().column_index >= aggregate_it->second->expressions.size()) {
+		return nullptr;
+	}
+	auto &aggregate_expr = *aggregate_it->second->expressions[column_ref.Binding().column_index];
+	return aggregate_expr.GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE
+	           ? &aggregate_expr.Cast<BoundAggregateExpression>()
+	           : nullptr;
+}
+
 static bool IsMinMaxAggregateColumn(const BoundColumnRefExpression &column_ref,
-                                    const unordered_map<idx_t, LogicalAggregate *> &aggregates) {
-	auto aggregate_it = aggregates.find(column_ref.binding.table_index);
-	if (aggregate_it == aggregates.end()) {
-		return false;
-	}
-	auto &aggregate = *aggregate_it->second;
-	if (column_ref.binding.column_index >= aggregate.expressions.size()) {
-		return false;
-	}
-	auto &aggregate_expr = aggregate.expressions[column_ref.binding.column_index];
-	if (aggregate_expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
-		return false;
-	}
-	auto &bound_aggregate = aggregate_expr->Cast<BoundAggregateExpression>();
-	return bound_aggregate.function.name == "min" || bound_aggregate.function.name == "max";
+                                    const unordered_map<TableIndex, LogicalAggregate *> &aggregates) {
+	auto aggregate = ReferencedAggregate(column_ref, aggregates);
+	return aggregate && (aggregate->Function().GetName().GetIdentifierName() == "min" ||
+	                     aggregate->Function().GetName().GetIdentifierName() == "max");
 }
 
 static bool ExpressionReferencesMinMaxAggregate(Expression &expr,
-                                                const unordered_map<idx_t, LogicalAggregate *> &aggregates) {
-	if (expr.expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+                                                const unordered_map<TableIndex, LogicalAggregate *> &aggregates) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		auto &column_ref = expr.Cast<BoundColumnRefExpression>();
 		return IsMinMaxAggregateColumn(column_ref, aggregates);
 	}
@@ -635,36 +1261,27 @@ static bool ExpressionReferencesMinMaxAggregate(Expression &expr,
 }
 
 static bool ExpressionReferencesUserSumAggregate(Expression &expr, const CreateMVPlanFacts &facts,
-                                                 const unordered_map<idx_t, LogicalAggregate *> &aggregates,
+                                                 const unordered_map<TableIndex, LogicalAggregate *> &aggregates,
                                                  idx_t depth = 0) {
 	if (depth > 16) {
 		return false;
 	}
-	if (expr.expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		auto &column_ref = expr.Cast<BoundColumnRefExpression>();
-		auto aggregate_it = aggregates.find(column_ref.binding.table_index);
-		if (aggregate_it != aggregates.end()) {
-			auto &aggregate = *aggregate_it->second;
-			if (column_ref.binding.column_index >= aggregate.expressions.size()) {
-				return false;
-			}
-			auto &aggregate_expr = aggregate.expressions[column_ref.binding.column_index];
-			if (aggregate_expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
-				return false;
-			}
-			auto &bound_aggregate = aggregate_expr->Cast<BoundAggregateExpression>();
-			return bound_aggregate.function.name == "sum" &&
-			       !IncrementalTableNames::IsInternalColumn(bound_aggregate.alias);
+		if (aggregates.count(column_ref.Binding().table_index)) {
+			auto aggregate = ReferencedAggregate(column_ref, aggregates);
+			return aggregate && aggregate->Function().GetName().GetIdentifierName() == "sum" &&
+			       !IncrementalTableNames::IsInternalColumn(aggregate->GetAlias().GetIdentifierName());
 		}
-		auto projection_it = facts.projections_by_index.find(column_ref.binding.table_index);
+		auto projection_it = facts.projections_by_index.find(column_ref.Binding().table_index);
 		if (projection_it == facts.projections_by_index.end()) {
 			return false;
 		}
 		auto &projection = *projection_it->second;
-		if (column_ref.binding.column_index >= projection.expressions.size()) {
+		if (column_ref.Binding().column_index >= projection.expressions.size()) {
 			return false;
 		}
-		return ExpressionReferencesUserSumAggregate(*projection.expressions[column_ref.binding.column_index], facts,
+		return ExpressionReferencesUserSumAggregate(*projection.expressions[column_ref.Binding().column_index], facts,
 		                                            aggregates, depth + 1);
 	}
 
@@ -678,7 +1295,7 @@ static bool ExpressionReferencesUserSumAggregate(Expression &expr, const CreateM
 }
 
 static void FinalizeCreateMVPlanFacts(CreateMVPlanFacts &facts) {
-	unordered_map<idx_t, LogicalAggregate *> aggregates;
+	unordered_map<TableIndex, LogicalAggregate *> aggregates;
 	for (auto *aggregate : facts.aggregates) {
 		aggregates[aggregate->aggregate_index] = aggregate;
 	}
@@ -688,19 +1305,20 @@ static void FinalizeCreateMVPlanFacts(CreateMVPlanFacts &facts) {
 	for (auto *projection : facts.projections) {
 		for (auto &expr : projection->expressions) {
 			Expression *unwrapped = expr.get();
-			while (unwrapped->expression_class == ExpressionClass::BOUND_CAST) {
-				unwrapped = unwrapped->Cast<BoundCastExpression>().child.get();
+			while (BoundCastExpression::IsCast(*unwrapped)) {
+				unwrapped = BoundCastExpression::ChildMutable(unwrapped->Cast<BoundFunctionExpression>()).get();
 			}
-			if (unwrapped->expression_class != ExpressionClass::BOUND_COLUMN_REF &&
+			if (unwrapped->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF &&
 			    ExpressionReferencesUserSumAggregate(*unwrapped, facts, aggregates)) {
 				facts.has_computed_sum_aggregate_projection = true;
 			}
-			if (expr->expression_class == ExpressionClass::BOUND_COLUMN_REF && IsHiddenHavingColumn(expr->alias)) {
+			if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+			    IsHiddenHavingColumn(expr->GetAlias().GetIdentifierName())) {
 				auto &column_ref = expr->Cast<BoundColumnRefExpression>();
 				if (IsMinMaxAggregateColumn(column_ref, aggregates)) {
 					facts.has_hidden_minmax_having_column = true;
 				}
-			} else if (expr->expression_class != ExpressionClass::BOUND_COLUMN_REF &&
+			} else if (expr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF &&
 			           ExpressionReferencesMinMaxAggregate(*expr, aggregates)) {
 				facts.has_computed_minmax_aggregate_projection = true;
 			}
@@ -708,8 +1326,8 @@ static void FinalizeCreateMVPlanFacts(CreateMVPlanFacts &facts) {
 	}
 }
 
-bool ResolvesToOutputBinding(idx_t table_index, idx_t column_index, idx_t group_index, size_t group_count,
-                             const CreateMVPlanFacts &facts, bool through_casts, int depth) {
+bool ResolvesToOutputBinding(TableIndex table_index, ProjectionIndex column_index, TableIndex group_index,
+                             size_t group_count, const CreateMVPlanFacts &facts, bool through_casts, int depth) {
 	if (depth > 16) {
 		return false;
 	}
@@ -723,14 +1341,14 @@ bool ResolvesToOutputBinding(idx_t table_index, idx_t column_index, idx_t group_
 			return false;
 		}
 		auto *expr = proj.expressions[column_index].get();
-		while (through_casts && expr->expression_class == ExpressionClass::BOUND_CAST) {
-			expr = expr->Cast<BoundCastExpression>().child.get();
+		while (through_casts && BoundCastExpression::IsCast(*expr)) {
+			expr = BoundCastExpression::ChildMutable(expr->Cast<BoundFunctionExpression>()).get();
 		}
-		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 			return false;
 		}
 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
-		return ResolvesToOutputBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
+		return ResolvesToOutputBinding(bcr.Binding().table_index, bcr.Binding().column_index, group_index, group_count,
 		                               facts, through_casts, depth + 1);
 	}
 	auto setop_it = facts.setops_by_index.find(table_index);
@@ -770,36 +1388,37 @@ bool ResolvesToOutputBinding(idx_t table_index, idx_t column_index, idx_t group_
 	return false;
 }
 
-static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t group_index, size_t group_count,
-                                   const CreateMVPlanFacts &facts) {
+static bool ResolvesToGroupBinding(TableIndex table_index, ProjectionIndex column_index, TableIndex group_index,
+                                   size_t group_count, const CreateMVPlanFacts &facts) {
 	return ResolvesToOutputBinding(table_index, column_index, group_index, group_count, facts, false);
 }
 
 static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t expr_index,
                                    const vector<string> &output_names, const BoundColumnRefExpression &bcr) {
-	if (!expr->alias.empty()) {
-		return expr->alias;
+	if (!expr->GetAlias().GetIdentifierName().empty()) {
+		return expr->GetAlias().GetIdentifierName();
 	}
 	if (expr_index < output_names.size() && !output_names[expr_index].empty() &&
 	    !IncrementalTableNames::IsInternalColumn(output_names[expr_index])) {
 		return output_names[expr_index];
 	}
-	return bcr.GetName();
+	return bcr.GetName().GetIdentifierName();
 }
 
-static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr, string *cast_type = nullptr) {
+BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr, string *cast_type) {
 	if (cast_type) {
 		cast_type->clear();
 	}
 	vector<string> cast_specs;
-	while (expr && expr->expression_class == ExpressionClass::BOUND_CAST) {
-		auto &cast = expr->Cast<BoundCastExpression>();
+	while (expr && BoundCastExpression::IsCast(*expr)) {
+		auto &cast = expr->Cast<BoundFunctionExpression>();
 		if (cast_type) {
-			cast_specs.push_back(SqlUtils::BuildCastSpec(expr->return_type.ToString(), cast.try_cast));
+			cast_specs.push_back(
+			    SqlUtils::BuildCastSpec(expr->GetReturnType().ToString(), BoundCastExpression::IsTryCast(cast)));
 		}
-		expr = cast.child.get();
+		expr = BoundCastExpression::ChildMutable(cast).get();
 	}
-	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
+	if (!expr || expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		return nullptr;
 	}
 	if (cast_type) {
@@ -810,17 +1429,17 @@ static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr, stri
 	return &expr->Cast<BoundColumnRefExpression>();
 }
 
-static bool AddGroupColumnsFromProjection(LogicalProjection &proj, const CreateMVPlanFacts &facts, idx_t group_index,
-                                          size_t group_count, const vector<string> &output_names,
-                                          vector<string> &group_names) {
+static bool AddGroupColumnsFromProjection(LogicalProjection &proj, const CreateMVPlanFacts &facts,
+                                          TableIndex group_index, size_t group_count,
+                                          const vector<string> &output_names, vector<string> &group_names) {
 	bool matched = false;
 	for (idx_t expr_i = 0; expr_i < proj.expressions.size(); expr_i++) {
 		auto &expr = proj.expressions[expr_i];
-		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 			continue;
 		}
 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
-		if (!ResolvesToGroupBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
+		if (!ResolvesToGroupBinding(bcr.Binding().table_index, bcr.Binding().column_index, group_index, group_count,
 		                            facts)) {
 			continue;
 		}
@@ -834,7 +1453,7 @@ static bool AddGroupColumnsFromProjection(LogicalProjection &proj, const CreateM
 	return matched;
 }
 
-static bool AddGroupColumnsFromBindings(LogicalOperator &op, const CreateMVPlanFacts &facts, idx_t group_index,
+static bool AddGroupColumnsFromBindings(LogicalOperator &op, const CreateMVPlanFacts &facts, TableIndex group_index,
                                         size_t group_count, const vector<string> &output_names,
                                         vector<string> &group_names) {
 	bool matched = false;
@@ -853,7 +1472,7 @@ static bool AddGroupColumnsFromBindings(LogicalOperator &op, const CreateMVPlanF
 	return matched;
 }
 
-static bool FindGroupColumns(const CreateMVPlanFacts &facts, idx_t group_index, size_t group_count,
+static bool FindGroupColumns(const CreateMVPlanFacts &facts, TableIndex group_index, size_t group_count,
                              const vector<string> &output_names, vector<string> &group_names) {
 	auto *root_facts = GetPlanNodeFacts(facts, facts.root);
 	if (!root_facts) {
@@ -877,12 +1496,12 @@ static bool FindGroupColumns(const CreateMVPlanFacts &facts, idx_t group_index, 
 	return false;
 }
 
-static bool IsGroupExpression(const Expression &expression, const CreateMVPlanFacts &facts, idx_t group_index,
+static bool IsGroupExpression(const Expression &expression, const CreateMVPlanFacts &facts, TableIndex group_index,
                               size_t group_count) {
 	if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		auto &column = expression.Cast<BoundColumnRefExpression>();
-		return ResolvesToGroupBinding(column.binding.table_index, column.binding.column_index, group_index, group_count,
-		                              facts);
+		return ResolvesToGroupBinding(column.Binding().table_index, column.Binding().column_index, group_index,
+		                              group_count, facts);
 	}
 	bool valid = expression.GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE;
 	ExpressionIterator::EnumerateChildren(expression, [&](const Expression &child) {
@@ -891,7 +1510,7 @@ static bool IsGroupExpression(const Expression &expression, const CreateMVPlanFa
 	return valid;
 }
 
-vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, idx_t group_index, size_t group_count,
+vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, TableIndex group_index, size_t group_count,
                                       const vector<string> &output_names) {
 	vector<string> group_names;
 	if (!AddGroupColumnsFromBindings(*facts.root, facts, group_index, group_count, output_names, group_names)) {
@@ -938,7 +1557,7 @@ vector<string> DeriveScalarDelimKeyColumnNames(const CreateMVPlanFacts &facts, c
 		for (idx_t expr_idx = 0; expr_idx < top_projection->expressions.size() && expr_idx < output_names.size();
 		     expr_idx++) {
 			auto &expr = top_projection->expressions[expr_idx];
-			if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
+			if (!expr || expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 				continue;
 			}
 			if (!facts.single_delim_key_bindings.count(BindingKey(expr->Cast<BoundColumnRefExpression>()))) {
@@ -976,11 +1595,11 @@ vector<string> DeriveAggregateGroupColumnNames(const CreateMVPlanFacts &facts, c
 	return group_names;
 }
 
-static bool GetLogicalGetColumnName(LogicalGet &get, idx_t column_index, string &column);
+static bool GetLogicalGetColumnName(LogicalGet &get, ProjectionIndex column_index, string &column);
 
 static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr, const CreateMVPlanFacts &facts) {
-	idx_t table_index = bcr->binding.table_index;
-	idx_t column_index = bcr->binding.column_index;
+	TableIndex table_index = bcr->Binding().table_index;
+	ProjectionIndex column_index = bcr->Binding().column_index;
 	for (int depth = 0; depth < 16; depth++) {
 		auto get_it = facts.gets_by_index.find(table_index);
 		if (get_it != facts.gets_by_index.end()) {
@@ -997,12 +1616,13 @@ static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr, const Cr
 			return "";
 		}
 		auto &expr = proj->expressions[column_index];
-		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
-			return expr->alias.empty() ? expr->GetName() : expr->alias;
+		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			return expr->GetAlias().empty() ? expr->GetName().GetIdentifierName()
+			                                : expr->GetAlias().GetIdentifierName();
 		}
 		auto &next = expr->Cast<BoundColumnRefExpression>();
-		table_index = next.binding.table_index;
-		column_index = next.binding.column_index;
+		table_index = next.Binding().table_index;
+		column_index = next.Binding().column_index;
 	}
 	return "";
 }
@@ -1018,26 +1638,26 @@ static string OccurrenceKey(const OccurrenceColumnRef &ref) {
 	return OccurrenceKey(ref.table, ref.occurrence);
 }
 
-static bool GetLogicalGetColumnName(LogicalGet &get, idx_t column_index, string &column) {
+static bool GetLogicalGetColumnName(LogicalGet &get, ProjectionIndex column_index, string &column) {
 	if (get.GetTable().get()) {
 		auto &ids = get.GetColumnIds();
 		if (column_index < ids.size()) {
 			auto base_idx = ids[column_index].GetPrimaryIndex();
 			auto &cols = get.GetTable().get()->GetColumns();
 			if (base_idx < cols.LogicalColumnCount()) {
-				column = cols.GetColumn(LogicalIndex(base_idx)).Name();
+				column = cols.GetColumn(LogicalIndex(base_idx)).Name().GetIdentifierName();
 				return true;
 			}
 		}
 	}
 	if (column_index < get.names.size()) {
-		column = get.names[column_index];
+		column = get.names[column_index].GetIdentifierName();
 		return true;
 	}
 	return false;
 }
 
-static bool GetLogicalGetColumnType(LogicalGet &get, idx_t column_index, LogicalType &type) {
+static bool GetLogicalGetColumnType(LogicalGet &get, ProjectionIndex column_index, LogicalType &type) {
 	if (column_index < get.returned_types.size()) {
 		type = get.returned_types[column_index];
 		return true;
@@ -1062,8 +1682,8 @@ static bool HasKeyBinding(const vector<ColumnBinding> &keys, const ColumnBinding
 
 static bool IsKeyReference(const Expression &expr, const vector<ColumnBinding> &keys) {
 	// Casts and computed expressions need a separate equivalence proof.
-	return expr.type == ExpressionType::BOUND_COLUMN_REF &&
-	       HasKeyBinding(keys, expr.Cast<BoundColumnRefExpression>().binding);
+	return expr.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF &&
+	       HasKeyBinding(keys, expr.Cast<BoundColumnRefExpression>().Binding());
 }
 
 static vector<ColumnBinding> DirectSourceKeyBindings(LogicalOperator &op, const CreateMVPlanFacts &facts,
@@ -1121,9 +1741,13 @@ static vector<ColumnBinding> DirectSourceKeyBindings(LogicalOperator &op, const 
 		auto right = DirectSourceKeyBindings(*op.children[1], facts, key, source, depth + 1);
 		bool same_key = false;
 		for (auto &condition : join.conditions) {
-			if ((condition.comparison == ExpressionType::COMPARE_EQUAL ||
-			     condition.comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) &&
-			    IsKeyReference(*condition.left, left) && IsKeyReference(*condition.right, right)) {
+			if (!condition.IsComparison()) {
+				continue;
+			}
+			if ((condition.GetComparisonType() == ExpressionType::COMPARE_EQUAL ||
+			     condition.GetComparisonType() == ExpressionType::COMPARE_NOT_DISTINCT_FROM) &&
+			    IsKeyReference(*condition.LeftReference(), left) &&
+			    IsKeyReference(*condition.RightReference(), right)) {
 				same_key = true;
 			}
 		}
@@ -1147,7 +1771,7 @@ static vector<ColumnBinding> DirectSourceKeyBindings(LogicalOperator &op, const 
 		auto &projection = op.Cast<LogicalProjection>();
 		for (idx_t i = 0; i < projection.expressions.size(); i++) {
 			if (IsKeyReference(*projection.expressions[i], left)) {
-				result.emplace_back(projection.table_index, i);
+				result.emplace_back(projection.table_index, ProjectionIndex(i));
 			}
 		}
 	} else if (op.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
@@ -1157,8 +1781,8 @@ static vector<ColumnBinding> DirectSourceKeyBindings(LogicalOperator &op, const 
 		}
 		for (idx_t i = 0; i < aggregate.groups.size(); i++) {
 			if (IsKeyReference(*aggregate.groups[i], left) &&
-			    (aggregate.grouping_sets.empty() || aggregate.grouping_sets[0].count(i))) {
-				result.emplace_back(aggregate.group_index, i);
+			    (aggregate.grouping_sets.empty() || aggregate.grouping_sets[0].count(ProjectionIndex(i)))) {
+				result.emplace_back(aggregate.group_index, ProjectionIndex(i));
 			}
 		}
 	}
@@ -1194,8 +1818,8 @@ string DeriveDirectSourceGroupKey(const CreateMVPlanFacts &facts, const vector<s
 
 static bool ResolveBindingToGetColumn(ColumnBinding binding, const CreateMVPlanFacts &facts, LogicalGet *&get,
                                       string &column) {
-	idx_t table_index = binding.table_index;
-	idx_t column_index = binding.column_index;
+	TableIndex table_index = binding.table_index;
+	ProjectionIndex column_index = binding.column_index;
 	for (int depth = 0; depth < 16; depth++) {
 		auto get_it = facts.gets_by_index.find(table_index);
 		if (get_it != facts.gets_by_index.end()) {
@@ -1214,19 +1838,10 @@ static bool ResolveBindingToGetColumn(ColumnBinding binding, const CreateMVPlanF
 		if (!next) {
 			return false;
 		}
-		table_index = next->binding.table_index;
-		column_index = next->binding.column_index;
+		table_index = next->Binding().table_index;
+		column_index = next->Binding().column_index;
 	}
 	return false;
-}
-
-static bool ResolveBindingToBaseRef(ColumnBinding binding, const CreateMVPlanFacts &facts, BaseColumnRef &out) {
-	LogicalGet *get = nullptr;
-	if (!ResolveBindingToGetColumn(binding, facts, get, out.column) || !get->GetTable().get()) {
-		return false;
-	}
-	out.table = facts.occurrence_by_index.at(get->table_index).table;
-	return true;
 }
 
 static bool ResolveBindingToOccurrenceRef(ColumnBinding binding, const CreateMVPlanFacts &facts,
@@ -1247,8 +1862,8 @@ static bool ResolveBindingToOccurrenceRef(ColumnBinding binding, const CreateMVP
 static bool ResolveBindingToOccurrenceRefWithCast(ColumnBinding binding, const CreateMVPlanFacts &facts,
                                                   OccurrenceColumnRef &out, string &cast_type,
                                                   const LogicalType &expression_type) {
-	idx_t table_index = binding.table_index;
-	idx_t column_index = binding.column_index;
+	TableIndex table_index = binding.table_index;
+	ProjectionIndex column_index = binding.column_index;
 	for (int depth = 0; depth < 16; depth++) {
 		auto get_it = facts.gets_by_index.find(table_index);
 		if (get_it != facts.gets_by_index.end()) {
@@ -1285,8 +1900,8 @@ static bool ResolveBindingToOccurrenceRefWithCast(ColumnBinding binding, const C
 		if (!projection_cast.empty()) {
 			cast_type = SqlUtils::ComposeCastSpecs(cast_type, projection_cast);
 		}
-		table_index = next->binding.table_index;
-		column_index = next->binding.column_index;
+		table_index = next->Binding().table_index;
+		column_index = next->Binding().column_index;
 	}
 	return false;
 }
@@ -1297,22 +1912,20 @@ static void AddJoinEdgesFromFacts(CreateMVPlanFacts &facts) {
 			continue;
 		}
 		for (auto &cond : join->conditions) {
-			auto *left = GetColumnRefThroughCasts(cond.left.get());
-			auto *right = GetColumnRefThroughCasts(cond.right.get());
+			if (!cond.IsComparison()) {
+				continue;
+			}
+			auto *left = GetColumnRefThroughCasts(cond.LeftReference().get());
+			auto *right = GetColumnRefThroughCasts(cond.RightReference().get());
 			if (!left || !right) {
 				continue;
 			}
-			BaseColumnRef lbase, rbase;
-			if (ResolveBindingToBaseRef(left->binding, facts, lbase) &&
-			    ResolveBindingToBaseRef(right->binding, facts, rbase)) {
-				facts.inner_join_edges.emplace_back(std::move(lbase), std::move(rbase));
-			}
-			if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
+			if (cond.GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
 				continue;
 			}
 			OccurrenceColumnRef lref, rref;
-			if (ResolveBindingToOccurrenceRef(left->binding, facts, lref) &&
-			    ResolveBindingToOccurrenceRef(right->binding, facts, rref)) {
+			if (ResolveBindingToOccurrenceRef(left->Binding(), facts, lref) &&
+			    ResolveBindingToOccurrenceRef(right->Binding(), facts, rref)) {
 				facts.projection_lineage_edges.push_back({lref, rref});
 				facts.projection_lineage_edges.push_back({rref, lref});
 			}
@@ -1335,7 +1948,7 @@ bool ProducesAtMostOneRow(LogicalOperator &node) {
 }
 
 static bool ResolveBindingToGroupKey(const ColumnBinding &binding,
-                                     const unordered_map<idx_t, LogicalProjection *> &projections,
+                                     const unordered_map<TableIndex, LogicalProjection *> &projections,
                                      const LogicalAggregate &aggregate, idx_t &group_index, idx_t depth = 0) {
 	if (depth > 16) {
 		return false;
@@ -1352,11 +1965,11 @@ static bool ResolveBindingToGroupKey(const ColumnBinding &binding,
 		return false;
 	}
 	auto &expression = projection->second->expressions[binding.column_index];
-	if (expression->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+	if (expression->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 		return false;
 	}
 	auto &column = expression->Cast<BoundColumnRefExpression>();
-	return ResolveBindingToGroupKey(column.binding, projections, aggregate, group_index, depth + 1);
+	return ResolveBindingToGroupKey(column.Binding(), projections, aggregate, group_index, depth + 1);
 }
 
 bool IsRedundantDistinctOverGroupKeys(LogicalOperator &node) {
@@ -1370,7 +1983,7 @@ bool IsRedundantDistinctOverGroupKeys(LogicalOperator &node) {
 
 	auto *output = node.children[0].get();
 	auto *current = output;
-	unordered_map<idx_t, LogicalProjection *> projections;
+	unordered_map<TableIndex, LogicalProjection *> projections;
 	while (current && current->children.size() == 1 &&
 	       (current->type == LogicalOperatorType::LOGICAL_PROJECTION ||
 	        current->type == LogicalOperatorType::LOGICAL_FILTER)) {
@@ -1541,7 +2154,7 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 			continue;
 		}
 		OccurrenceColumnRef key_ref;
-		if (!ResolveBindingToOccurrenceRef(bcr->binding, facts, key_ref)) {
+		if (!ResolveBindingToOccurrenceRef(bcr->Binding(), facts, key_ref)) {
 			continue;
 		}
 		string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
@@ -1581,23 +2194,23 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 }
 
 bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinKeySource &out) {
-	for (auto *join : facts.comparison_joins) {
-		if (!join || join->join_type != JoinType::LEFT || join->conditions.empty()) {
-			continue;
-		}
-		auto *preserved_key = GetColumnRefThroughCasts(join->conditions[0].left.get());
+	auto *join = FindProjectionKeyJoin(*facts.root);
+	if (join && join->join_type == JoinType::LEFT) {
+		auto *preserved_key = GetColumnRefThroughCasts(join->conditions[0].LeftReference().get(), &out.cast_type);
 		if (!preserved_key) {
 			return false;
 		}
 		OccurrenceColumnRef source;
-		if (!ResolveBindingToOccurrenceRef(preserved_key->binding, facts, source)) {
+		if (!ResolveBindingToOccurrenceRefWithCast(preserved_key->Binding(), facts, source, out.cast_type,
+		                                           preserved_key->GetReturnType())) {
 			return false;
 		}
 		out.table = source.table;
 		out.occurrence = source.occurrence;
 		out.column = source.column;
-		out.cardinality_transition_check_safe = facts.outer_join_count == 1 && join->conditions.size() == 1 &&
-		                                        join->conditions[0].comparison == ExpressionType::COMPARE_EQUAL;
+		out.cardinality_transition_check_safe =
+		    facts.outer_joins.size() == 1 && join->conditions.size() == 1 &&
+		    join->conditions[0].GetComparisonType() == ExpressionType::COMPARE_EQUAL;
 		return true;
 	}
 	return false;
@@ -1606,10 +2219,10 @@ bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::Lef
 static string NullableGetTableName(LogicalGet &get) {
 	auto table = get.GetTable();
 	if (table.get() && !table.get()->name.empty()) {
-		return table.get()->name;
+		return table.get()->name.GetIdentifierName();
 	}
-	if (get.function.name == "ducklake_scan" && get.function.function_info) {
-		return get.function.function_info->Cast<DuckLakeFunctionInfo>().table_name;
+	if (get.function.GetName().GetIdentifierName() == "ducklake_scan" && get.function.function_info) {
+		return get.function.function_info->Cast<DuckLakeFunctionInfo>().table_name.GetIdentifierName();
 	}
 	return "";
 }
@@ -1661,7 +2274,7 @@ bool BuildLeftJoinNullableSources(const CreateMVPlanFacts &facts, RefreshMetadat
 }
 
 struct WindowLineageOp {
-	string kind;
+	WindowLineageKind kind = WindowLineageKind::DIRECT;
 	string output_col;
 	string source_table;
 	idx_t source_occurrence = 0;
@@ -1698,7 +2311,7 @@ static void CollectLeafColumnBindings(Expression *expr, vector<ColumnBinding> &b
 		return;
 	}
 	if (auto *bcr = GetColumnRefThroughCasts(expr)) {
-		bindings.push_back(bcr->binding);
+		bindings.push_back(bcr->Binding());
 		return;
 	}
 	ExpressionIterator::EnumerateChildren(*expr,
@@ -1764,19 +2377,24 @@ static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPl
 		    {std::move(lookup_ref), std::move(lookup_cast), std::move(changed_ref), std::move(changed_cast)});
 	};
 	for (auto &condition : join.conditions) {
-		if (condition.comparison != ExpressionType::COMPARE_EQUAL) {
+		if (!condition.IsComparison()) {
+			continue;
+		}
+		if (condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
 			continue;
 		}
 		string left_cast;
 		string right_cast;
-		auto *left = GetColumnRefThroughCasts(condition.left.get(), &left_cast);
-		auto *right = GetColumnRefThroughCasts(condition.right.get(), &right_cast);
+		auto *left = GetColumnRefThroughCasts(condition.LeftReference().get(), &left_cast);
+		auto *right = GetColumnRefThroughCasts(condition.RightReference().get(), &right_cast);
 		if (!left || !right) {
 			continue;
 		}
 		OccurrenceColumnRef left_ref, right_ref;
-		if (!ResolveBindingToOccurrenceRefWithCast(left->binding, facts, left_ref, left_cast, left->return_type) ||
-		    !ResolveBindingToOccurrenceRefWithCast(right->binding, facts, right_ref, right_cast, right->return_type)) {
+		if (!ResolveBindingToOccurrenceRefWithCast(left->Binding(), facts, left_ref, left_cast,
+		                                           left->GetReturnType()) ||
+		    !ResolveBindingToOccurrenceRefWithCast(right->Binding(), facts, right_ref, right_cast,
+		                                           right->GetReturnType())) {
 			continue;
 		}
 		switch (join.join_type) {
@@ -1802,18 +2420,18 @@ static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPl
 static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlanFacts &facts,
                                        const vector<string> &partition_columns, vector<WindowLineageOp> &direct_ops) {
 	for (auto &expression : window.expressions) {
-		if (expression->expression_class != ExpressionClass::BOUND_WINDOW) {
+		if (expression->GetExpressionClass() != ExpressionClass::BOUND_WINDOW) {
 			continue;
 		}
 		auto &window_expression = expression->Cast<BoundWindowExpression>();
-		for (auto &partition : window_expression.partitions) {
+		for (auto &partition : window_expression.Partitions()) {
 			string partition_cast;
 			auto *column_ref = GetColumnRefThroughCasts(partition.get(), &partition_cast);
 			if (!column_ref) {
 				continue;
 			}
 			vector<OccurrenceColumnRef> refs;
-			if (!ResolveBindingToOccurrenceRefs(column_ref->binding, facts, refs)) {
+			if (!ResolveBindingToOccurrenceRefs(column_ref->Binding(), facts, refs)) {
 				continue;
 			}
 			for (auto &ref : refs) {
@@ -1825,7 +2443,7 @@ static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlan
 						continue;
 					}
 					WindowLineageOp op;
-					op.kind = "direct";
+					op.kind = WindowLineageKind::DIRECT;
 					op.output_col = output_col;
 					op.source_table = ref.table;
 					op.source_occurrence = ref.occurrence;
@@ -1865,7 +2483,7 @@ static void AddUniqueLineageOp(vector<WindowLineageOp> &ops, WindowLineageOp op)
 static bool HasEquivalentPartitionRef(const vector<WindowLineageOp> &ops, const OccurrenceColumnRef &ref,
                                       const string &output_col) {
 	for (auto &op : ops) {
-		if (op.kind == "direct" && StringUtil::CIEquals(op.output_col, output_col) &&
+		if (op.kind == WindowLineageKind::DIRECT && StringUtil::CIEquals(op.output_col, output_col) &&
 		    StringUtil::CIEquals(op.source_table, ref.table) && op.source_occurrence == ref.occurrence &&
 		    StringUtil::CIEquals(op.source_col, ref.column)) {
 			return true;
@@ -1953,7 +2571,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 					continue;
 				}
 				WindowLineageOp equivalent;
-				equivalent.kind = "direct";
+				equivalent.kind = WindowLineageKind::DIRECT;
 				equivalent.output_col = direct.output_col;
 				equivalent.source_table = other.table;
 				equivalent.source_occurrence = other.occurrence;
@@ -1983,7 +2601,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 				continue;
 			}
 			WindowLineageOp lookup;
-			lookup.kind = "lookup";
+			lookup.kind = WindowLineageKind::LOOKUP;
 			lookup.output_col = direct.output_col;
 			lookup.source_table = edge.changed_join.table;
 			lookup.source_occurrence = edge.changed_join.occurrence;
@@ -2027,7 +2645,7 @@ void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<st
 			}
 			string base_col = ResolveBindingToBaseColumn(bcr, facts);
 			if (!StringUtil::CIEquals(base_col, partition_column) &&
-			    !StringUtil::CIEquals(bcr->GetName(), partition_column)) {
+			    !StringUtil::CIEquals(bcr->GetName().GetIdentifierName(), partition_column)) {
 				continue;
 			}
 			string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
@@ -2084,9 +2702,10 @@ void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts,
 		for (auto *ref : facts.join_refs) {
 			string ref_col = ResolveBindingToBaseColumn(ref, facts);
 			if (ref_col.empty()) {
-				ref_col = ref->GetName();
+				ref_col = ref->GetName().GetIdentifierName();
 			}
-			if (!StringUtil::CIEquals(ref_col, group_col) && !StringUtil::CIEquals(ref->GetName(), group_col)) {
+			if (!StringUtil::CIEquals(ref_col, group_col) &&
+			    !StringUtil::CIEquals(ref->GetName().GetIdentifierName(), group_col)) {
 				continue;
 			}
 			string parent = FindBindingParent(parents, BindingKey(*ref));
@@ -2131,50 +2750,192 @@ void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts,
 	}
 }
 
-static string FullOuterJoinColumnName(const unique_ptr<Expression> &expr, const CreateMVPlanFacts &facts) {
-	if (expr->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
-		return "";
-	}
-	auto *ref = dynamic_cast<BoundColumnRefExpression *>(expr.get());
-	if (!ref) {
-		return "";
-	}
-	string col_name = ResolveBindingToBaseColumn(ref, facts);
-	return col_name.empty() ? ref->GetName() : col_name;
-}
-
 string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts) {
+	struct FullOuterEdge {
+		OccurrenceColumnRef left;
+		OccurrenceColumnRef right;
+	};
+	vector<FullOuterEdge> edges;
+	auto add_edge = [&](const OccurrenceColumnRef &left, const OccurrenceColumnRef &right) {
+		for (const auto &edge : edges) {
+			if (StringUtil::CIEquals(edge.left.table, left.table) &&
+			    StringUtil::CIEquals(edge.left.column, left.column) &&
+			    StringUtil::CIEquals(edge.right.table, right.table) &&
+			    StringUtil::CIEquals(edge.right.column, right.column)) {
+				return;
+			}
+		}
+		edges.push_back({left, right});
+	};
+	auto *projection_join = facts.analysis.found_aggregation ? nullptr : FindProjectionKeyJoin(*facts.root);
 	for (auto *join : facts.comparison_joins) {
-		if (join->join_type != JoinType::OUTER || join->conditions.empty()) {
+		if (join->join_type != JoinType::OUTER) {
 			continue;
 		}
-		auto &condition = join->conditions[0];
-		string left_col_name = FullOuterJoinColumnName(condition.left, facts);
-		string right_col_name = FullOuterJoinColumnName(condition.right, facts);
-		string left_table;
-		string right_table;
-		if (!join->children.empty()) {
-			auto it = facts.first_table_name.find(join->children[0].get());
-			left_table = it == facts.first_table_name.end() ? string() : it->second;
+		if (projection_join && join != projection_join) {
+			continue;
 		}
-		if (join->children.size() > 1) {
-			auto it = facts.first_table_name.find(join->children[1].get());
-			right_table = it == facts.first_table_name.end() ? string() : it->second;
-		}
-		BaseColumnRef left_source, right_source;
-		auto left_ref = GetColumnRefThroughCasts(condition.left.get());
-		auto right_ref = GetColumnRefThroughCasts(condition.right.get());
-		if (left_ref && ResolveBindingToBaseRef(left_ref->binding, facts, left_source)) {
-			left_table = left_source.table;
-		}
-		if (right_ref && ResolveBindingToBaseRef(right_ref->binding, facts, right_source)) {
-			right_table = right_source.table;
-		}
-		if (!left_col_name.empty() && !right_col_name.empty() && !left_table.empty() && !right_table.empty()) {
-			return left_table + ":" + left_col_name + "," + right_table + ":" + right_col_name;
+		for (auto &condition : join->conditions) {
+			if (!condition.IsComparison() || condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
+				continue;
+			}
+			auto left_ref = GetColumnRefThroughCasts(condition.LeftReference().get());
+			auto right_ref = GetColumnRefThroughCasts(condition.RightReference().get());
+			if (!left_ref || !right_ref) {
+				continue;
+			}
+			vector<OccurrenceColumnRef> left_sources;
+			vector<OccurrenceColumnRef> right_sources;
+			if (!ResolveBindingToOccurrenceRefs(left_ref->Binding(), facts, left_sources) ||
+			    !ResolveBindingToOccurrenceRefs(right_ref->Binding(), facts, right_sources)) {
+				continue;
+			}
+			for (const auto &left : left_sources) {
+				for (const auto &right : right_sources) {
+					add_edge(left, right);
+				}
+			}
 		}
 	}
-	return "";
+	if (edges.empty()) {
+		return "";
+	}
+
+	vector<string> serialized_edges;
+	serialized_edges.reserve(edges.size());
+	for (const auto &edge : edges) {
+		MetadataJson::Writer writer;
+		writer.Str("left_table", edge.left.table);
+		writer.Str("left_column", edge.left.column);
+		writer.Str("right_table", edge.right.table);
+		writer.Str("right_column", edge.right.column);
+		serialized_edges.push_back(writer.Finish());
+	}
+	MetadataJson::Writer writer;
+	writer.Objects("edges", serialized_edges);
+	OPENIVM_DEBUG_PRINT("[CREATE MV] Recorded %zu physical FULL OUTER key edges\n", edges.size());
+	return writer.Finish();
+}
+
+static bool ScopePresenceMatches(ColumnBinding binding, const string &name, const CreateMVPlanFacts &facts) {
+	auto projection = facts.projections_by_index.find(binding.table_index);
+	if (projection != facts.projections_by_index.end()) {
+		auto &expression = *projection->second->expressions[binding.column_index];
+		if (expression.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+			auto &value = expression.Cast<BoundConstantExpression>().GetValue();
+			return expression.GetAlias().GetIdentifierName() == name && !value.IsNull() && value.GetValue<bool>();
+		}
+		if (expression.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+			return ScopePresenceMatches(expression.Cast<BoundColumnRefExpression>().Binding(), name, facts);
+		}
+	}
+	for (auto *aggregate : facts.aggregates) {
+		if (binding.table_index != aggregate->aggregate_index) {
+			continue;
+		}
+		auto &expression = aggregate->expressions[binding.column_index]->Cast<BoundAggregateExpression>();
+		if (expression.Function().GetName().GetIdentifierName() == "bool_or" && expression.GetChildren().size() == 1 &&
+		    expression.GetChildren()[0]->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+			return ScopePresenceMatches(expression.GetChildren()[0]->Cast<BoundColumnRefExpression>().Binding(), name,
+			                            facts);
+		}
+	}
+	auto setop = facts.setops_by_index.find(binding.table_index);
+	if (setop != facts.setops_by_index.end()) {
+		for (auto &child : setop->second->children) {
+			if (ScopePresenceMatches(child->GetColumnBindings()[binding.column_index], name, facts)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static bool CollectFullOuterScopeSources(LogicalOperator &node, const LogicalProjection &input_projection,
+                                         const CreateMVPlanFacts &facts, const string &presence,
+                                         vector<RefreshMetadata::FullOuterScopeInput> &sources) {
+	string input_presence = presence;
+	if (node.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		for (auto &expression : node.Cast<LogicalProjection>().expressions) {
+			if (expression->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+			    StringUtil::StartsWith(expression->GetAlias().GetIdentifierName(), openivm::FULL_SCOPE_PREFIX)) {
+				input_presence = expression->GetAlias().GetIdentifierName();
+				break;
+			}
+		}
+	}
+	if (node.type == LogicalOperatorType::LOGICAL_GET) {
+		auto entry = facts.occurrence_by_index.find(node.Cast<LogicalGet>().table_index);
+		if (entry == facts.occurrence_by_index.end()) {
+			return false;
+		}
+		RefreshMetadata::FullOuterScopeInput input;
+		input.table = entry->second.table;
+		input.occurrence = entry->second.occurrence;
+		bool found = false;
+		for (idx_t i = 0; i < input_projection.expressions.size(); i++) {
+			if (ScopePresenceMatches(ColumnBinding(TableIndex(input_projection.table_index), ProjectionIndex(i)),
+			                         input_presence, facts)) {
+				input.presence_index = i;
+				found = true;
+				break;
+			}
+		}
+		D_ASSERT(found);
+		if (!found) {
+			throw InternalException("Missing source presence in FULL JOIN input");
+		}
+		sources.push_back(std::move(input));
+	}
+	for (auto &child : node.children) {
+		if (!CollectFullOuterScopeSources(*child, input_projection, facts, input_presence, sources)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+vector<RefreshMetadata::FullOuterScope> BuildFullOuterScopes(const CreateMVPlanFacts &facts) {
+	vector<RefreshMetadata::FullOuterScope> scopes;
+	for (auto *join : facts.comparison_joins) {
+		if ((join->join_type != JoinType::OUTER && join->join_type != JoinType::LEFT &&
+		     join->join_type != JoinType::RIGHT) ||
+		    join->conditions.empty()) {
+			continue;
+		}
+		RefreshMetadata::FullOuterScope scope;
+		bool complete = true;
+		for (idx_t side = 0; side < 2; side++) {
+			auto &child = *join->children[side];
+			if (child.type != LogicalOperatorType::LOGICAL_PROJECTION) {
+				complete = false;
+				break;
+			}
+			auto &projection = child.Cast<LogicalProjection>();
+			auto &source = side == 0 ? scope.left : scope.right;
+			for (auto &expression : projection.expressions) {
+				if (expression->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+				    StringUtil::StartsWith(expression->GetAlias().GetIdentifierName(), openivm::FULL_SCOPE_PREFIX)) {
+					source.presence_column = expression->GetAlias().GetIdentifierName();
+					break;
+				}
+			}
+			if (source.presence_column.empty()) {
+				complete = false;
+				break;
+			}
+			source.key_column = source.presence_column + "_key";
+			if (!CollectFullOuterScopeSources(child, projection, facts, source.presence_column, source.inputs) ||
+			    source.inputs.empty()) {
+				complete = false;
+				break;
+			}
+		}
+		if (complete) {
+			scopes.push_back(std::move(scope));
+		}
+	}
+	return scopes;
 }
 
 static string SanitizeOutputName(const string &name) {
@@ -2220,8 +2981,9 @@ static void AppendProjectionOutputNames(LogicalProjection &projection, idx_t out
                                         vector<string> &output_names) {
 	while (output_names.size() < output_count) {
 		idx_t idx = output_names.size();
-		if (idx < projection.expressions.size() && !projection.expressions[idx]->alias.empty()) {
-			output_names.push_back(projection.expressions[idx]->alias);
+		if (idx < projection.expressions.size() &&
+		    !projection.expressions[idx]->GetAlias().GetIdentifierName().empty()) {
+			output_names.push_back(projection.expressions[idx]->GetAlias().GetIdentifierName());
 		} else {
 			output_names.push_back("openivm_col_" + to_string(idx));
 		}
@@ -2234,8 +2996,9 @@ static void AppendAggregateOutputNames(LogicalAggregate &aggregate, idx_t output
 		idx_t idx = output_names.size();
 		if (idx >= group_count) {
 			idx_t expr_idx = idx - group_count;
-			if (expr_idx < aggregate.expressions.size() && !aggregate.expressions[expr_idx]->alias.empty()) {
-				output_names.push_back(aggregate.expressions[expr_idx]->alias);
+			if (expr_idx < aggregate.expressions.size() &&
+			    !aggregate.expressions[expr_idx]->GetAlias().GetIdentifierName().empty()) {
+				output_names.push_back(aggregate.expressions[expr_idx]->GetAlias().GetIdentifierName());
 				continue;
 			}
 		}
@@ -2286,13 +3049,12 @@ static bool IsAggregateFunctionUnsupportedByLpts(const string &fn_name) {
 	return fn_name == "quantile_cont" || fn_name == "quantile_disc" || fn_name == "percentile_cont" ||
 	       fn_name == "percentile_disc" || fn_name == "approx_quantile" || fn_name == "mad" || fn_name == "median" ||
 	       fn_name == "mode" ||
-	       // Two-argument aggregates whose children LPTS re-aliases to internal
+	       // Statistical aggregates whose children LPTS re-aliases to internal
 	       // `tN_col` names; the serialized SQL refers to those names against the
 	       // original FROM clause and fails binding at CREATE-table time.
 	       fn_name == "corr" || fn_name == "covar_pop" || fn_name == "covar_samp" || fn_name == "regr_avgx" ||
 	       fn_name == "regr_avgy" || fn_name == "regr_count" || fn_name == "regr_intercept" || fn_name == "regr_r2" ||
-	       fn_name == "regr_slope" || fn_name == "regr_sxx" || fn_name == "regr_sxy" || fn_name == "regr_syy" ||
-	       fn_name == "arg_min" || fn_name == "arg_max";
+	       fn_name == "regr_slope" || fn_name == "regr_sxx" || fn_name == "regr_sxy" || fn_name == "regr_syy";
 }
 
 bool PlanNeedsOriginalSqlForLpts(const CreateMVPlanFacts &facts) {
@@ -2301,11 +3063,11 @@ bool PlanNeedsOriginalSqlForLpts(const CreateMVPlanFacts &facts) {
 	}
 	for (auto *aggregate : facts.aggregates) {
 		for (auto &expr : aggregate->expressions) {
-			if (expr->type != ExpressionType::BOUND_AGGREGATE) {
+			if (expr->GetExpressionType() != ExpressionType::BOUND_AGGREGATE) {
 				continue;
 			}
 			auto &bound_agg = expr->Cast<BoundAggregateExpression>();
-			if (IsAggregateFunctionUnsupportedByLpts(bound_agg.function.name)) {
+			if (IsAggregateFunctionUnsupportedByLpts(bound_agg.Function().GetName().GetIdentifierName())) {
 				return true;
 			}
 		}
@@ -2315,7 +3077,7 @@ bool PlanNeedsOriginalSqlForLpts(const CreateMVPlanFacts &facts) {
 
 bool IsPacLoaded(ClientContext &context) {
 	Value pac_check_val;
-	return context.TryGetCurrentSetting("pac_check", pac_check_val);
+	return context.TryGetCurrentSetting(Identifier("pac_check"), pac_check_val);
 }
 
 void ForwardPacSettingsIfLoaded(ClientContext &context, Connection &con) {
@@ -2325,13 +3087,13 @@ void ForwardPacSettingsIfLoaded(ClientContext &context, Connection &con) {
 	for (auto &name : {"pac_mi", "pac_seed", "pac_m", "pac_noise", "pac_hash_repair", "pac_check", "pac_rewrite",
 	                   "pac_conservative_mode"}) {
 		Value val;
-		if (context.TryGetCurrentSetting(name, val) && !val.IsNull()) {
+		if (context.TryGetCurrentSetting(Identifier(name), val) && !val.IsNull()) {
 			con.Query("SET " + string(name) + " = " + val.ToString());
 		}
 	}
 }
 
-using LeftJoinInnerTableMap = unordered_map<const LogicalComparisonJoin *, std::set<idx_t>>;
+using LeftJoinInnerTableMap = unordered_map<const LogicalComparisonJoin *, std::set<TableIndex>>;
 
 // Which base tables read as NULL in a null-padded row of join `oj`.
 //
@@ -2340,9 +3102,9 @@ using LeftJoinInnerTableMap = unordered_map<const LogicalComparisonJoin *, std::
 // So start from oj's inner subtree and close transitively over any join whose condition touches an
 // already-NULL table, adding that join's inner side. Aggregates over these tables contribute 0 to the
 // null-padded row; aggregates over the preserved side still contribute.
-static std::set<idx_t> ComputeNullTablesForLevel(const CreateMVPlanFacts &facts, LogicalComparisonJoin *oj,
-                                                 const LeftJoinInnerTableMap &inner_tables) {
-	std::set<idx_t> null_tables;
+static std::set<TableIndex> ComputeNullTablesForLevel(const CreateMVPlanFacts &facts, LogicalComparisonJoin *oj,
+                                                      const LeftJoinInnerTableMap &inner_tables) {
+	std::set<TableIndex> null_tables;
 	if (!oj || oj->children.size() != 2) {
 		return null_tables;
 	}
@@ -2373,14 +3135,17 @@ static std::set<idx_t> ComputeNullTablesForLevel(const CreateMVPlanFacts &facts,
 			}
 			bool touches_null = false;
 			for (auto &cond : other->conditions) {
-				for (auto *side : {cond.left.get(), cond.right.get()}) {
+				if (!cond.IsComparison()) {
+					continue;
+				}
+				for (auto *side : {cond.LeftReference().get(), cond.RightReference().get()}) {
 					auto *cref = GetColumnRefThroughCasts(side);
 					if (!cref) {
 						continue;
 					}
 					LogicalGet *g = nullptr;
 					string c;
-					if (ResolveBindingToGetColumn(cref->binding, facts, g, c) && g &&
+					if (ResolveBindingToGetColumn(cref->Binding(), facts, g, c) && g &&
 					    null_tables.count(g->table_index)) {
 						touches_null = true;
 						break;
@@ -2408,15 +3173,15 @@ static bool IsUnfilteredGetSubtree(LogicalOperator *op) {
 	while (op && op->type == LogicalOperatorType::LOGICAL_PROJECTION && op->children.size() == 1) {
 		op = op->children[0].get();
 	}
-	return op && op->type == LogicalOperatorType::LOGICAL_GET && op->Cast<LogicalGet>().table_filters.filters.empty();
+	return op && op->type == LogicalOperatorType::LOGICAL_GET && !op->Cast<LogicalGet>().table_filters.HasFilters();
 }
 
 static bool ColumnIsNotNull(LogicalGet &get, const string &column_name) {
 	auto table = get.GetTable();
-	if (!table.get() || !table.get()->ColumnExists(column_name)) {
+	if (!table.get() || !table.get()->ColumnExists(Identifier(column_name))) {
 		return false;
 	}
-	auto column_index = table.get()->GetColumn(column_name).Logical();
+	auto column_index = table.get()->GetColumn(Identifier(column_name)).Logical();
 	for (auto &constraint : table.get()->GetConstraints()) {
 		if (constraint->type == ConstraintType::NOT_NULL &&
 		    constraint->Cast<NotNullConstraint>().index == column_index) {
@@ -2426,37 +3191,48 @@ static bool ColumnIsNotNull(LogicalGet &get, const string &column_name) {
 	return false;
 }
 
-static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateMVPlanFacts &facts,
-                                             const vector<string> &output_names, const string &view_name,
-                                             LogicalComparisonJoin *oj, size_t level,
-                                             const std::set<idx_t> &null_tables, vector<string> &preserved_cols,
-                                             const string &delta_view_catalog_prefix, string &out_inner_table,
-                                             string &out_inner_key, string &out_pres_table, string &out_pres_key) {
-	preserved_cols.clear();
-	if (facts.aggregates.size() != 1) {
+// The qualified identity of the view source `get` scans, which also names its base table; empty otherwise.
+static string ResolveSourceBase(const CreateMVPlanFacts &facts, LogicalGet &get) {
+	auto table = get.GetTable();
+	if (!table.get()) {
 		return "";
 	}
+	auto identity = SqlUtils::FullName(table->ParentCatalog().GetName(), table->schema.name, table->name);
+	return facts.source_table_info.count(identity) ? identity : string();
+}
+
+// Appends this level's SQL and source identities to `meta`; false when the level is unsupported.
+static bool BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateMVPlanFacts &facts,
+                                           const vector<string> &output_names, const string &view_name,
+                                           LogicalComparisonJoin *oj, size_t level,
+                                           const std::set<TableIndex> &null_tables,
+                                           const string &delta_view_catalog_prefix,
+                                           RefreshMetadata::LeftJoinSecondaryMeta &meta) {
+	vector<string> preserved_cols;
+	if (facts.aggregates.size() != 1) {
+		return false;
+	}
 	if (!oj || oj->join_type != JoinType::LEFT || oj->conditions.size() != 1 || oj->children.size() != 2) {
-		return "";
+		return false;
 	}
 	// Binder can flatten a filtered preserved-side subquery by lifting its
 	// LogicalFilter above the join. Inspect the complete view plan as well as
 	// the local children; secondary transition counts are valid only when no
 	// additional cardinality predicate exists anywhere in this aggregate view.
 	if (facts.has_cardinality_changing_filter) {
-		return "";
+		return false;
 	}
 	// __newc below counts rows directly in the inner base table. A filter or any other
 	// cardinality-changing inner subtree (including a right-only ON predicate pushed below
 	// the join) would make that count differ from the actual join matches.
 	if (!IsUnfilteredGetSubtree(oj->children[1].get())) {
-		return "";
+		return false;
 	}
 	auto &condition = oj->conditions[0];
-	if (condition.comparison != ExpressionType::COMPARE_EQUAL ||
-	    condition.left->expression_class != ExpressionClass::BOUND_COLUMN_REF ||
-	    condition.right->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
-		return "";
+	if (condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL ||
+	    condition.LeftReference()->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
+	    condition.RightReference()->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return false;
 	}
 	// Every LEFT JOIN level needs the secondary, including a SINGLE left join whose preserved side is a
 	// bare table. The old comment here claimed the primary delta already emits the null-padded
@@ -2468,36 +3244,22 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	auto &agg = *facts.aggregates[0];
 	size_t G = agg.groups.size();
 	if (G == 0 || output_names.size() < G + agg.expressions.size()) {
-		return "";
+		return false;
 	}
 	// Deepest-join keys: condition.left = preserved side, condition.right = inner (null) side.
-	auto &pres_ref = condition.left->Cast<BoundColumnRefExpression>();
-	auto &inner_ref = condition.right->Cast<BoundColumnRefExpression>();
-	ColumnBinding key_pres = pres_ref.binding;
+	auto &pres_ref = condition.LeftReference()->Cast<BoundColumnRefExpression>();
+	auto &inner_ref = condition.RightReference()->Cast<BoundColumnRefExpression>();
+	ColumnBinding key_pres = pres_ref.Binding();
 	LogicalGet *inner_get = nullptr;
 	string inner_col;
-	if (!ResolveBindingToGetColumn(inner_ref.binding, facts, inner_get, inner_col) || !inner_get ||
-	    !inner_get->GetTable().get()) {
-		return "";
+	if (!ResolveBindingToGetColumn(inner_ref.Binding(), facts, inner_get, inner_col) || !inner_get) {
+		return false;
 	}
-	idx_t inner_tidx = inner_get->table_index;
-	string inner_table = inner_get->GetTable().get()->name;
-	auto sti = facts.source_table_info.find(SqlUtils::FullName(inner_get->GetTable()->ParentCatalog().GetName(),
-	                                                           inner_get->GetTable()->schema.name, inner_table));
-	if (sti == facts.source_table_info.end()) {
-		return "";
+	auto inner_identity = ResolveSourceBase(facts, *inner_get);
+	if (inner_identity.empty()) {
+		return false;
 	}
-	string cat = sti->second.catalog_name;
-	string sch = sti->second.schema_name;
-	string qual;
-	if (!cat.empty()) {
-		qual += KeywordHelper::WriteOptionallyQuoted(cat) + ".";
-	}
-	if (!sch.empty()) {
-		qual += KeywordHelper::WriteOptionallyQuoted(sch) + ".";
-	}
-	string inner_base = qual + KeywordHelper::WriteOptionallyQuoted(inner_table);
-	string qcol = KeywordHelper::WriteOptionallyQuoted(inner_col);
+	string qcol = SqlUtils::QuoteIdentifier(inner_col);
 
 	// The correction below assumes a dangling (null-padded) row for this key is ALREADY materialized
 	// in the view -- true only if the preserved-side row (e.g. the order) existed before this refresh
@@ -2507,31 +3269,21 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	// own base table/column so we can gate on "did this key exist before this batch's delta."
 	LogicalGet *pres_get = nullptr;
 	string pres_col;
-	if (!ResolveBindingToGetColumn(key_pres, facts, pres_get, pres_col) || !pres_get || !pres_get->GetTable().get()) {
-		return "";
+	if (!ResolveBindingToGetColumn(key_pres, facts, pres_get, pres_col) || !pres_get) {
+		return false;
 	}
-	string pres_table = pres_get->GetTable().get()->name;
-	if (pres_get->table_index == inner_tidx || StringUtil::CIEquals(pres_table, inner_table)) {
+	auto pres_identity = ResolveSourceBase(facts, *pres_get);
+	if (pres_identity.empty()) {
+		return false;
+	}
+	if (pres_get->table_index == inner_get->table_index || StringUtil::CIEquals(pres_identity, inner_identity)) {
 		// Self-referencing deepest join (preserved and inner sides are the same base table): the
 		// old_pres_count/old_count arithmetic below assumes two distinct tables with independent
 		// delta tracking. Bail rather than risk generating ambiguous or incorrect SQL for this rare
 		// shape.
-		return "";
+		return false;
 	}
-	auto pres_sti = facts.source_table_info.find(SqlUtils::FullName(pres_get->GetTable()->ParentCatalog().GetName(),
-	                                                                pres_get->GetTable()->schema.name, pres_table));
-	if (pres_sti == facts.source_table_info.end()) {
-		return "";
-	}
-	string pres_qual;
-	if (!pres_sti->second.catalog_name.empty()) {
-		pres_qual += KeywordHelper::WriteOptionallyQuoted(pres_sti->second.catalog_name) + ".";
-	}
-	if (!pres_sti->second.schema_name.empty()) {
-		pres_qual += KeywordHelper::WriteOptionallyQuoted(pres_sti->second.schema_name) + ".";
-	}
-	string pres_base = pres_qual + KeywordHelper::WriteOptionallyQuoted(pres_table);
-	string pres_qcol = KeywordHelper::WriteOptionallyQuoted(pres_col);
+	string pres_qcol = SqlUtils::QuoteIdentifier(pres_col);
 
 	// Classify each aggregate output column's contribution to a null-padded row of the deepest join.
 	// output_names layout: [group cols (G)] [visible aggregates (agg.expressions, in order)] [hidden helpers].
@@ -2543,26 +3295,26 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	for (size_t j = 0; j < num_agg; j++) {
 		if (j < agg.expressions.size()) {
 			auto &e = agg.expressions[j];
-			if (e->expression_class != ExpressionClass::BOUND_AGGREGATE) {
-				return "";
+			if (e->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+				return false;
 			}
 			auto &ba = e->Cast<BoundAggregateExpression>();
-			string fn = StringUtil::Lower(ba.function.name);
-			if (ba.children.empty()) {
+			string fn = StringUtil::Lower(ba.Function().GetName().GetIdentifierName());
+			if (ba.GetChildren().empty()) {
 				contribs.push_back("1"); // count_star: null-padded row still counts
 				continue;
 			}
-			auto *cref = GetColumnRefThroughCasts(ba.children[0].get());
+			auto *cref = GetColumnRefThroughCasts(ba.GetChildren()[0].get());
 			if (!cref) {
-				return "";
+				return false;
 			}
 			LogicalGet *g = nullptr;
 			string c;
-			bool resolved = ResolveBindingToGetColumn(cref->binding, facts, g, c);
+			bool resolved = ResolveBindingToGetColumn(cref->Binding(), facts, g, c);
 			bool is_inner = resolved && g && null_tables.count(g->table_index) > 0;
 			if (fn == "count") {
 				if (!is_inner && (!resolved || !g || !ColumnIsNotNull(*g, c))) {
-					return "";
+					return false;
 				}
 				contribs.push_back(is_inner ? "0" : "1");
 				if (!is_inner) {
@@ -2573,10 +3325,10 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 				if (is_inner) {
 					contribs.push_back("0");
 				} else {
-					return ""; // preserved-side SUM needs the value; defer to a later generalization
+					return false; // preserved-side SUM needs the value; defer to a later generalization
 				}
 			} else {
-				return "";
+				return false;
 			}
 		} else {
 			// Hidden helper columns are internally generated with fixed openivm_* names (never
@@ -2588,7 +3340,7 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 			           StringUtil::StartsWith(col, "openivm_nonnull_sum_count")) {
 				contribs.push_back("0");
 			} else {
-				return "";
+				return false;
 			}
 		}
 	}
@@ -2601,9 +3353,9 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	for (auto &ge : agg.groups) {
 		auto *gr = GetColumnRefThroughCasts(ge.get());
 		if (!gr) {
-			return "";
+			return false;
 		}
-		group_bindings.push_back(gr->binding);
+		group_bindings.push_back(gr->Binding());
 	}
 	vector<string> x_names(x_bindings.size());
 	int key_pos = -1;
@@ -2630,48 +3382,43 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 		}
 	}
 	if (key_pos < 0) {
-		return "";
+		return false;
 	}
 	for (size_t gi = 0; gi < G; gi++) {
 		if (group_pos[gi] < 0) {
-			return "";
+			return false;
 		}
 	}
 	string x_sql;
 	SqlDialect dialect = SqlDialect::DUCKDB;
-	auto ast = LogicalPlanToAst(context, x_plan, dialect);
+	auto ast = LogicalPlanToAst(context, x_plan, dialect, {}, CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
 	auto cte_list = AstToCteList(*ast, dialect);
 	x_sql = cte_list->ToQuery(true, x_names);
 	if (!x_sql.empty() && x_sql.back() == ';') {
 		x_sql.pop_back();
 	}
 	if (x_sql.empty()) {
-		return "";
+		return false;
 	}
 
 	// delta_mv columns: group cols + aggregate cols + openivm_multiplicity (matches the primary INSERT).
 	string col_list;
 	string sel;
 	for (size_t gi = 0; gi < G; gi++) {
-		col_list += KeywordHelper::WriteOptionallyQuoted(output_names[gi]) + ", ";
+		col_list += SqlUtils::QuoteIdentifier(output_names[gi]) + ", ";
 		sel += "X.\"__g" + std::to_string(gi) + "\", ";
 	}
 	for (size_t j = 0; j < contribs.size(); j++) {
-		col_list += KeywordHelper::WriteOptionallyQuoted(output_names[G + j]) + ", ";
+		col_list += SqlUtils::QuoteIdentifier(output_names[G + j]) + ", ";
 		sel += contribs[j] + ", ";
 	}
 	col_list += "openivm_multiplicity";
 	sel += "CASE WHEN (__newc - __t.dsum) > 0 AND __newc = 0 THEN 1 ELSE -1 END";
 
-	out_inner_table = inner_table;
-	out_inner_key = inner_col;
-	out_pres_table = pres_table;
-	out_pres_key = pres_col;
-
 	// Must carry the same catalog prefix the delta table was created with. Unqualified works only when
 	// the MV's state lives in the default catalog; a DuckLake-backed view's delta table is
 	// dl.main.openivm_delta_<view>, and an unqualified INSERT there fails the whole refresh.
-	string dmv = delta_view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
+	string dmv = delta_view_catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
 	// The two delta row sources are placeholders resolved at refresh: a regular table reads its
 	// openivm_delta_<table>, a DuckLake table reads ducklake_table_insertions/deletions between
 	// snapshots (whose IDs only exist at refresh time). Both substitutions yield columns (__k, __m).
@@ -2683,13 +3430,23 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	// the delta keys measured ~40% SLOWER at TPC-H SF50 (DuckDB already decorrelates them well).
 	string sql = "INSERT INTO " + dmv + " (" + col_list + ")\nSELECT " + sel +
 	             "\nFROM (SELECT __k, SUM(__m) AS dsum FROM " + inner_delta_src + " GROUP BY __k) __t\nJOIN (" + x_sql +
-	             ") X ON X.\"" + key_alias + "\" = __t.__k,\nLATERAL (SELECT (SELECT COUNT(*) FROM " + inner_base +
+	             ") X ON X.\"" + key_alias + "\" = __t.__k,\nLATERAL (SELECT (SELECT COUNT(*) FROM " + inner_identity +
 	             " ib WHERE ib." + qcol + " = __t.__k) AS __newc) __n,\nLATERAL (SELECT (SELECT COUNT(*) FROM " +
-	             pres_base + " pb WHERE pb." + pres_qcol + " = __t.__k) - COALESCE((SELECT SUM(__m) FROM " +
+	             pres_identity + " pb WHERE pb." + pres_qcol + " = __t.__k) - COALESCE((SELECT SUM(__m) FROM " +
 	             pres_delta_src +
 	             " __pd WHERE __pd.__k = __t.__k), 0) AS __old_pres_count) __op"
 	             "\nWHERE (__newc > 0) <> ((__newc - __t.dsum) > 0) AND __old_pres_count > 0;";
-	return sql;
+	meta.sql += (meta.sql.empty() ? "" : "\n") + sql;
+	meta.inner_tables.push_back(inner_identity);
+	meta.inner_keys.push_back(inner_col);
+	meta.pres_tables.push_back(pres_identity);
+	meta.pres_keys.push_back(pres_col);
+	for (auto &col : preserved_cols) {
+		if (std::find(meta.preserved_cols.begin(), meta.preserved_cols.end(), col) == meta.preserved_cols.end()) {
+			meta.preserved_cols.push_back(col);
+		}
+	}
+	return true;
 }
 
 // Emit a secondary delta for EVERY LEFT JOIN level whose preserved side is itself a join.
@@ -2702,14 +3459,12 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 // The per-level SQL fragments are concatenated and the two source identities per level are stored as
 // index-aligned arrays, so refresh can resolve each level's placeholders independently (a regular
 // table reads its delta table, a DuckLake table reads snapshot insertions/deletions).
-string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlanFacts &facts,
-                                      const vector<string> &output_names, const string &view_name,
-                                      vector<string> &preserved_cols, const string &delta_view_catalog_prefix,
-                                      vector<string> &out_inner_tables, vector<string> &out_inner_keys,
-                                      vector<string> &out_pres_tables, vector<string> &out_pres_keys) {
-	preserved_cols.clear();
-	string combined_sql;
-	vector<string> inner_tables, inner_keys, pres_tables, pres_keys;
+RefreshMetadata::LeftJoinSecondaryMeta BuildLeftJoinSecondaryDeltaSQL(ClientContext &context,
+                                                                      const CreateMVPlanFacts &facts,
+                                                                      const vector<string> &output_names,
+                                                                      const string &view_name,
+                                                                      const string &delta_view_catalog_prefix) {
+	RefreshMetadata::LeftJoinSecondaryMeta meta;
 	LeftJoinInnerTableMap join_inner_tables;
 	for (auto *join : facts.comparison_joins) {
 		if (!join || join->join_type != JoinType::LEFT || join->children.size() != 2) {
@@ -2717,10 +3472,10 @@ string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlan
 		}
 		auto *subtree = GetPlanNodeFacts(facts, join->children[1].get());
 		if (!subtree) {
-			return "";
+			return {};
 		}
 		join_inner_tables.emplace(
-		    join, std::set<idx_t>(subtree->subtree_table_indices.begin(), subtree->subtree_table_indices.end()));
+		    join, std::set<TableIndex>(subtree->subtree_table_indices.begin(), subtree->subtree_table_indices.end()));
 	}
 	size_t level = 0;
 	for (auto *oj : facts.comparison_joins) {
@@ -2731,37 +3486,15 @@ string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlan
 		// bare table -- see the note in BuildLeftJoinSecondaryForLevel for why the primary delta does
 		// NOT cover that case.
 		auto null_tables = ComputeNullTablesForLevel(facts, oj, join_inner_tables);
-		vector<string> level_preserved;
-		string it, ik, pt, pk;
-		string level_sql =
-		    BuildLeftJoinSecondaryForLevel(context, facts, output_names, view_name, oj, level, null_tables,
-		                                   level_preserved, delta_view_catalog_prefix, it, ik, pt, pk);
-		if (level_sql.empty()) {
+		if (!BuildLeftJoinSecondaryForLevel(context, facts, output_names, view_name, oj, level, null_tables,
+		                                    delta_view_catalog_prefix, meta)) {
 			// An unsupported level makes the whole correction incomplete, and a partial correction is
 			// worse than none (it would double-count the levels it does cover). Bail entirely.
-			preserved_cols.clear();
-			return "";
-		}
-		combined_sql += (combined_sql.empty() ? "" : "\n") + level_sql;
-		inner_tables.push_back(it);
-		inner_keys.push_back(ik);
-		pres_tables.push_back(pt);
-		pres_keys.push_back(pk);
-		for (auto &c : level_preserved) {
-			if (std::find(preserved_cols.begin(), preserved_cols.end(), c) == preserved_cols.end()) {
-				preserved_cols.push_back(c);
-			}
+			return {};
 		}
 		level++;
 	}
-	if (combined_sql.empty()) {
-		return "";
-	}
-	out_inner_tables = std::move(inner_tables);
-	out_inner_keys = std::move(inner_keys);
-	out_pres_tables = std::move(pres_tables);
-	out_pres_keys = std::move(pres_keys);
-	return combined_sql;
+	return meta;
 }
 
 } // namespace duckdb

@@ -245,3 +245,64 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Test 10: refresh_status reports every refresh strategy, including
+# COUNT_DISTINCT_INCREMENTAL (enum ordinal 11, after the unused ordinal 10)
+# ==========================================
+
+query TTTTTTT
+PRAGMA refresh_status('mv_auto');
+----
+mv_auto	NULL	<REGEX>:.*	NULL	<REGEX>:.*	<REGEX>:.*	aggregate_group
+
+statement ok
+SET openivm_stateful_auxstate = true;
+
+statement ok
+CREATE TABLE status_cd (g INT, x INT);
+
+statement ok
+INSERT INTO status_cd VALUES (1, 10), (1, 20), (1, 10), (2, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_status_cd REFRESH EVERY '1 hour' AS
+    SELECT g, COUNT(DISTINCT x) AS dx FROM status_cd GROUP BY g;
+
+query TTTTTTT
+PRAGMA refresh_status('mv_status_cd');
+----
+mv_status_cd	3600	<REGEX>:.*	<REGEX>:.*	<REGEX>:.*	<REGEX>:.*	count_distinct_incremental
+
+statement ok
+INSERT INTO status_cd VALUES (1, 40), (2, 30), (3, 99);
+
+statement ok
+DELETE FROM status_cd WHERE g = 1 AND x = 20;
+
+statement ok
+UPDATE status_cd SET x = 31 WHERE g = 2;
+
+statement ok
+PRAGMA refresh('mv_status_cd');
+
+query I
+SELECT count(*) FROM (
+    SELECT g, dx FROM mv_status_cd
+    EXCEPT ALL
+    SELECT g, COUNT(DISTINCT x) FROM status_cd GROUP BY g
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT g, COUNT(DISTINCT x) FROM status_cd GROUP BY g
+    EXCEPT ALL
+    SELECT g, dx FROM mv_status_cd
+);
+----
+0
+
+statement ok
+SET openivm_stateful_auxstate = false;

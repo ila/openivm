@@ -15,7 +15,6 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 
 #include <map>
-#include <regex>
 
 namespace duckdb {
 
@@ -88,8 +87,9 @@ struct RunningWindowPlan {
 };
 
 static string RunningColumn(const ParsedExpression &expr) {
-	return expr.GetExpressionClass() == ExpressionClass::COLUMN_REF ? expr.Cast<ColumnRefExpression>().GetColumnName()
-	                                                                : "";
+	return expr.GetExpressionClass() == ExpressionClass::COLUMN_REF
+	           ? expr.Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName()
+	           : "";
 }
 
 static bool ParseRunningWindowExpression(const ParsedExpression &expression, RunningWindowExpr &out,
@@ -98,40 +98,42 @@ static bool ParseRunningWindowExpression(const ParsedExpression &expression, Run
 		return false;
 	}
 	auto &window = expression.Cast<WindowExpression>();
-	auto function = StringUtil::Lower(window.function_name);
+	auto function = StringUtil::Lower(window.FunctionName().GetIdentifierName());
 	if (function == "count_star") {
 		function = "count";
 	}
 	if ((function != "sum" && function != "min" && function != "max" && function != "count" && function != "avg" &&
 	     function != "row_number") ||
-	    window.partitions.size() != 1 || window.orders.size() != 1 || window.children.size() > 1 ||
-	    window.filter_expr || window.distinct || !window.arg_orders.empty() ||
-	    window.exclude_clause != WindowExcludeMode::NO_OTHER || window.start != WindowBoundary::UNBOUNDED_PRECEDING ||
-	    (window.end != WindowBoundary::CURRENT_ROW_RANGE && window.end != WindowBoundary::CURRENT_ROW_ROWS) ||
-	    window.orders[0].type == OrderType::DESCENDING) {
+	    window.Partitions().size() != 1 || window.OrderBy().size() != 1 || window.GetArguments().size() > 1 ||
+	    window.Filter() || window.Distinct() || !window.ArgOrders().empty() ||
+	    window.WindowExclude() != WindowExcludeMode::NO_OTHER ||
+	    window.WindowStart() != WindowBoundary::UNBOUNDED_PRECEDING ||
+	    (window.WindowEnd() != WindowBoundary::CURRENT_ROW_RANGE &&
+	     window.WindowEnd() != WindowBoundary::CURRENT_ROW_ROWS) ||
+	    window.OrderBy()[0].type == OrderType::DESCENDING) {
 		return false;
 	}
-	auto partition = RunningColumn(*window.partitions[0]);
-	auto order = RunningColumn(*window.orders[0].expression);
+	auto partition = RunningColumn(*window.Partitions()[0]);
+	auto order = RunningColumn(*window.OrderBy()[0].expression);
 	if (partition.empty() || order.empty() ||
 	    (!partition_col.empty() && !StringUtil::CIEquals(partition_col, partition)) ||
 	    (!order_col.empty() && !StringUtil::CIEquals(order_col, order))) {
 		return false;
 	}
 	out.function_name = function;
-	out.rows_frame = window.end == WindowBoundary::CURRENT_ROW_ROWS;
-	out.nulls_first = window.orders[0].null_order == OrderByNullType::NULLS_FIRST;
-	out.argument = window.children.empty() && (function == "count" || function == "row_number") ? "*"
-	               : window.children.empty()                                                    ? ""
-	                                         : RunningColumn(*window.children[0]);
-	out.output_column = expression.GetName();
+	out.rows_frame = window.WindowEnd() == WindowBoundary::CURRENT_ROW_ROWS;
+	out.nulls_first = window.OrderBy()[0].null_order == OrderByNullType::NULLS_FIRST;
+	out.argument = window.GetArguments().empty() && (function == "count" || function == "row_number") ? "*"
+	               : window.GetArguments().empty()                                                    ? ""
+	                                               : RunningColumn(window.GetArguments()[0].GetExpression());
+	out.output_column = expression.GetName().GetIdentifierName();
 	partition_col = partition;
 	order_col = order;
 	return !out.argument.empty();
 }
 
 static unique_ptr<SelectStatement> ParseRunningSelect(const string &sql) {
-	Parser parser;
+	auto parser = Parser::GetBuiltinParser();
 	try {
 		parser.ParseQuery(sql);
 	} catch (const ParserException &) {
@@ -158,8 +160,9 @@ static SelectNode *RunningSelect(QueryNode &node) {
 
 static string RefreshExpressionSQL(ParsedExpression &expression) {
 	// Resolve builtin cast names so portable SQL uses DATE rather than an unresolved quoted type name.
-	ParsedExpressionIterator::VisitExpressionMutable<CastExpression>(
-	    expression, [&](CastExpression &cast) { cast.cast_type = UnboundType::TryDefaultBind(cast.cast_type); });
+	ParsedExpressionIterator::VisitExpressionMutable<CastExpression>(expression, [&](CastExpression &cast) {
+		cast.SetTargetType(TypeExpression::FromLogicalType(UnboundType::TryDefaultBind(cast.TargetType())));
+	});
 	return expression.ToString();
 }
 
@@ -168,11 +171,11 @@ static string TranslateExpressionIdentifiers(const ParsedExpression &expression,
 	auto copy = expression.Copy();
 	bool resolved = true;
 	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(*copy, [&](ColumnRefExpression &column) {
-		auto found = alias_to_output.find(StringUtil::Lower(column.GetColumnName()));
+		auto found = alias_to_output.find(StringUtil::Lower(column.GetColumnName().GetIdentifierName()));
 		if (found == alias_to_output.end()) {
 			resolved = false;
 		} else {
-			column.column_names = {found->second};
+			column.ColumnNamesMutable() = {Identifier(found->second)};
 		}
 	});
 	return resolved ? RefreshExpressionSQL(*copy) : "";
@@ -201,13 +204,13 @@ static bool TryParseRunningWindowPlan(SelectNode &select, const vector<string> &
 			if (source.empty()) {
 				return false;
 			}
-			plan.passthrough_columns.emplace_back(source, item->GetName());
+			plan.passthrough_columns.emplace_back(source, item->GetName().GetIdentifierName());
 		}
 	}
 	for (auto &column : column_names) {
 		bool found = false;
 		for (auto &item : select.select_list) {
-			found = found || StringUtil::CIEquals(column, item->GetName());
+			found = found || StringUtil::CIEquals(column, item->GetName().GetIdentifierName());
 		}
 		if (!found) {
 			return false;
@@ -223,7 +226,7 @@ static bool TryParseLptsRunningWindowPlan(SelectNode &select, const vector<strin
 		return false;
 	}
 	auto &scan_cte = *select.cte_map.map.begin()->second;
-	auto *scan = RunningSelect(*scan_cte.query->node);
+	auto *scan = RunningSelect(*scan_cte.query_node);
 	if (!scan || scan_cte.aliases.size() != scan->select_list.size()) {
 		return false;
 	}
@@ -234,7 +237,7 @@ static bool TryParseLptsRunningWindowPlan(SelectNode &select, const vector<strin
 		if (source.empty()) {
 			return false;
 		}
-		auto alias = StringUtil::Lower(scan_cte.aliases[i]);
+		auto alias = StringUtil::Lower(scan_cte.aliases[i].GetIdentifierName());
 		plan.source_columns.push_back(source);
 		alias_to_source[alias] = source;
 		alias_to_output[alias] = source;
@@ -245,26 +248,26 @@ static bool TryParseLptsRunningWindowPlan(SelectNode &select, const vector<strin
 			output_names = column_names;
 			break;
 		}
-		output_names.push_back(item->GetName());
+		output_names.push_back(item->GetName().GetIdentifierName());
 	}
 	plan.output_columns = output_names;
 	// Resolve final output names through passthrough CTEs once. Window outputs need
 	// not appear in function order, and hidden positions are appended at the end.
 	std::map<string, string> final_names;
 	for (auto &item : select.select_list) {
-		final_names[StringUtil::Lower(RunningColumn(*item))] = item->GetName();
+		final_names[StringUtil::Lower(RunningColumn(*item))] = item->GetName().GetIdentifierName();
 	}
 	vector<CommonTableExpressionInfo *> ctes;
 	for (auto &entry : select.cte_map.map) {
 		ctes.push_back(entry.second.get());
 	}
 	for (auto it = ctes.rbegin(); it != ctes.rend(); ++it) {
-		auto *body = RunningSelect(*(*it)->query->node);
+		auto *body = RunningSelect(*(*it)->query_node);
 		if (!body || (*it)->aliases.size() != body->select_list.size()) {
 			return false;
 		}
 		for (idx_t i = 0; i < body->select_list.size(); i++) {
-			auto target = final_names.find(StringUtil::Lower((*it)->aliases[i]));
+			auto target = final_names.find(StringUtil::Lower((*it)->aliases[i].GetIdentifierName()));
 			auto source = RunningColumn(*body->select_list[i]);
 			if (target != final_names.end() && !source.empty()) {
 				final_names.emplace(StringUtil::Lower(source), target->second);
@@ -284,7 +287,7 @@ static bool TryParseLptsRunningWindowPlan(SelectNode &select, const vector<strin
 	string parsed_order;
 	for (auto &entry : select.cte_map.map) {
 		auto &cte = *entry.second;
-		auto *body = RunningSelect(*cte.query->node);
+		auto *body = RunningSelect(*cte.query_node);
 		if (!body || cte.aliases.size() != body->select_list.size()) {
 			return false;
 		}
@@ -295,7 +298,7 @@ static bool TryParseLptsRunningWindowPlan(SelectNode &select, const vector<strin
 		string position_column;
 		for (idx_t item_idx = 0; item_idx < cte_items.size(); item_idx++) {
 			auto &item = cte_items[item_idx];
-			string output_alias = cte_aliases[item_idx];
+			string output_alias = cte_aliases[item_idx].GetIdentifierName();
 			string output_key = StringUtil::Lower(output_alias);
 			if (item->GetExpressionClass() != ExpressionClass::WINDOW) {
 				string source_key = StringUtil::Lower(RunningColumn(*item));
@@ -473,11 +476,6 @@ static string RunningAdjustedExpr(const RunningWindowExpr &expr, const RunningWi
 	return RunningAdjustedExprWithSeed(expr, local, state_col);
 }
 
-static string SparkPortableTimestampCasts(const string &sql) {
-	static const std::regex timestamp_cast_regex(R"(('[^']*(?:''[^']*)*')::TIMESTAMP)", std::regex_constants::icase);
-	return std::regex_replace(sql, timestamp_cast_regex, "CAST($1 AS TIMESTAMP)");
-}
-
 static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const string &view_query_sql,
                                                  const string &delta_ts_filter, const string &catalog_prefix,
                                                  const vector<string> &partition_columns,
@@ -528,7 +526,7 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
 	string old_temp_table = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
 	string new_temp_table = SqlUtils::QuoteIdentifier(string("openivm_new_") + view_name);
-	string portable_delta_ts_filter = SparkPortableTimestampCasts(delta_ts_filter);
+	string portable_delta_ts_filter = SparkPortableRefreshSQL(delta_ts_filter);
 	string delta_filter = portable_delta_ts_filter.empty() ? "" : " AND " + portable_delta_ts_filter;
 	string delta_positive = QualifiedColumn("d", openivm::MULTIPLICITY_COL) + " > 0" + delta_filter;
 	string part_q = SqlUtils::QuoteIdentifier(plan.partition_column);
@@ -608,15 +606,14 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 	}
 	// Apply the partition restriction at the source, before blocking window operators.
 	// The suffix parser proved that every window uses this same partition key.
-	auto *scan =
-	    select->cte_map.map.empty() ? select : RunningSelect(*select->cte_map.map.begin()->second->query->node);
+	auto *scan = select->cte_map.map.empty() ? select : RunningSelect(*select->cte_map.map.begin()->second->query_node);
 	D_ASSERT(scan && !scan->where_clause);
 	auto &source = scan->from_table->Cast<BaseTableRef>();
-	auto source_alias = source.alias.empty() ? source.table_name : source.alias;
+	auto source_alias = source.alias.empty() ? source.Table().GetIdentifierName() : source.alias.GetIdentifierName();
 	auto predicate = "EXISTS (SELECT 1 FROM " + fallback_table + " openivm_aff WHERE " +
 	                 QualifiedColumn("openivm_aff", plan.partition_column) + " IS NOT DISTINCT FROM " +
 	                 QualifiedColumn(source_alias, spec.source_column) + ")";
-	auto filters = Parser::ParseExpressionList(predicate);
+	auto filters = Parser::GetBuiltinParser().ParseExpressionList(predicate);
 	scan->where_clause = std::move(filters[0]);
 	string fallback_query = statement->ToString();
 	OPENIVM_DEBUG_PRINT("[CompileWindowSuffixExtend] Pushed fallback partition filter into source scan\n");
@@ -753,8 +750,8 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 	sql += "CREATE OR REPLACE TEMP TABLE " + result_table + " AS " + suffix_query + ";\n";
 	sql += "INSERT INTO " + data_table + " (" + insert_cols + ") SELECT * FROM " + result_table + ";\n";
 	if (emit_cascade_delta) {
-		sql += "INSERT INTO " + delta_table + " SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM " + result_table +
-		       ";\n";
+		sql += "INSERT INTO " + delta_table + " SELECT *, CAST(1 AS INTEGER), " + string(openivm::UTC_NOW_SQL) +
+		       " FROM " + result_table + ";\n";
 	}
 	for (auto &table :
 	     {result_table, suffix_table, state_table, fallback_table, fast_table, bounds_table, affected_table}) {
@@ -802,10 +799,11 @@ static void BuildAliasedSourceLists(const vector<string> &cols, const vector<str
 static bool VisitQualifiedAlias(ParsedExpression &expression, const string &alias, const string *replacement) {
 	bool found = false;
 	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(expression, [&](ColumnRefExpression &column) {
-		if (column.column_names.size() >= 2 && StringUtil::CIEquals(column.column_names[0], alias)) {
+		if (column.ColumnNames().size() >= 2 &&
+		    StringUtil::CIEquals(column.ColumnNames()[0].GetIdentifierName(), alias)) {
 			found = true;
 			if (replacement) {
-				column.column_names[0] = *replacement;
+				column.ColumnNamesMutable()[0] = Identifier(*replacement);
 			}
 		}
 	});
@@ -813,7 +811,7 @@ static bool VisitQualifiedAlias(ParsedExpression &expression, const string &alia
 }
 
 static string RewriteQualifiedAliasPrefix(const string &expr, const string &source_alias, const string &target_alias) {
-	auto expressions = Parser::ParseExpressionList(expr);
+	auto expressions = Parser::GetBuiltinParser().ParseExpressionList(expr);
 	D_ASSERT(expressions.size() == 1);
 	VisitQualifiedAlias(*expressions[0], source_alias, &target_alias);
 	return RefreshExpressionSQL(*expressions[0]);
@@ -823,7 +821,7 @@ static bool ReferencesQualifiedAlias(const string &expr, const string &alias) {
 	if (expr.empty()) {
 		return false;
 	}
-	auto expressions = Parser::ParseExpressionList(expr);
+	auto expressions = Parser::GetBuiltinParser().ParseExpressionList(expr);
 	D_ASSERT(expressions.size() == 1);
 	return VisitQualifiedAlias(*expressions[0], alias, nullptr);
 }
@@ -1086,11 +1084,10 @@ string BuildSemiAntiAuxStateCreateSQL(const string &target_table, const string &
 	       " FROM left_counts lc LEFT JOIN match_counts mc ON " + lc_mc_match + right_stats_from;
 }
 
-static string SemiAntiVisibleExpr(const string &join_type, bool null_aware, const string &null_aware_left_col,
+static string SemiAntiVisibleExpr(SemiAntiJoinType join_type, bool null_aware, const string &null_aware_left_col,
                                   const string &alias) {
 	string prefix = alias.empty() ? "" : alias + ".";
-	bool is_anti = StringUtil::Lower(join_type) == "anti";
-	if (!is_anti) {
+	if (join_type != SemiAntiJoinType::ANTI) {
 		return prefix + "_match_count > 0";
 	}
 	if (null_aware && !null_aware_left_col.empty()) {
@@ -1101,7 +1098,7 @@ static string SemiAntiVisibleExpr(const string &join_type, bool null_aware, cons
 	return prefix + "_match_count = 0";
 }
 
-string BuildSemiAntiInitialDataSQL(const string &data_table, const string &aux_table, const string &join_type,
+string BuildSemiAntiInitialDataSQL(const string &data_table, const string &aux_table, SemiAntiJoinType join_type,
                                    const vector<string> &left_cols, const vector<string> &output_cols, bool null_aware,
                                    const string &null_aware_left_col) {
 	if (output_cols.empty()) {
@@ -1113,7 +1110,7 @@ string BuildSemiAntiInitialDataSQL(const string &data_table, const string &aux_t
 	       " _cur, generate_series(1, _cur._left_count::BIGINT) WHERE " + visible + " AND _cur._left_count > 0";
 }
 
-string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
+string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, SemiAntiJoinType join_type,
                                 const string &left_table, const string &left_alias, const string &right_table,
                                 const string &right_alias, const string &predicate, const string &post_filter,
                                 const string &right_filter, const vector<string> &left_cols,
@@ -1138,7 +1135,7 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	string right_stats_table = "openivm_saj_right_stats_" + view_name;
 	string old_table = "openivm_saj_old_" + view_name;
 	string aff_table = "openivm_saj_aff_" + view_name;
-	bool null_aware_anti = null_aware && StringUtil::Lower(join_type) == "anti" && !null_aware_left_col.empty() &&
+	bool null_aware_anti = null_aware && join_type == SemiAntiJoinType::ANTI && !null_aware_left_col.empty() &&
 	                       !null_aware_right_expr.empty();
 	string visible = SemiAntiVisibleExpr(join_type, null_aware_anti, null_aware_left_col, "");
 	string cur_visible = SemiAntiVisibleExpr(join_type, null_aware_anti, null_aware_left_col, "_cur");
@@ -1291,28 +1288,29 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	       SqlUtils::QuoteIdentifier(right_stats_table) + ";\nDROP TABLE IF EXISTS " +
 	       SqlUtils::QuoteIdentifier(aff_table) + ";\n";
 
-	OPENIVM_DEBUG_PRINT("[CompileSemiAntiRecompute] %s join, %zu left cols, aux=%s\n", join_type.c_str(),
-	                    left_cols.size(), aux_table.c_str());
+	OPENIVM_DEBUG_PRINT("[CompileSemiAntiRecompute] %s join, %zu left cols, aux=%s\n",
+	                    SEMI_ANTI_JOIN_TYPE_NAMES[static_cast<idx_t>(join_type)], left_cols.size(), aux_table.c_str());
 	return sql;
 }
 
 string BuildFilteredGroupCountAuxStateCreateSQL(const string &target_table, const string &source_table,
                                                 const string &group_col, const string &sum_col,
                                                 const string &source_group_expr, const string &source_sum_expr,
-                                                bool replace) {
+                                                const string &filter_sql, bool replace) {
 	string group_q = SqlUtils::QuoteIdentifier(group_col);
 	string sum_q = SqlUtils::QuoteIdentifier(sum_col);
 	string group_expr = source_group_expr.empty() ? group_q : source_group_expr;
 	string sum_expr = source_sum_expr.empty() ? sum_q : source_sum_expr;
+	string filter = filter_sql.empty() ? "" : " WHERE " + filter_sql;
 	return CreateAuxTablePrefix(target_table, replace) + " AS SELECT " + group_expr + " AS " + group_q + ", sum(" +
-	       sum_expr + ") AS openivm_sum FROM " + source_table + " GROUP BY " + group_expr;
+	       sum_expr + ") AS openivm_sum FROM " + source_table + filter + " GROUP BY " + group_expr;
 }
 
 string CompileFilteredGroupCount(const string &view_name, const string &aux_table, const string &delta_source,
                                  const string &last_update, const string &group_col, const string &sum_col,
                                  const string &source_group_expr, const string &source_sum_expr,
-                                 const string &output_col, const string &comparison_op, const string &threshold_sql,
-                                 const string &catalog_prefix) {
+                                 const string &filter_sql, const string &output_col, const string &comparison_op,
+                                 const string &threshold_sql, const string &catalog_prefix) {
 	if (aux_table.empty() || delta_source.empty() || last_update.empty() || group_col.empty() || sum_col.empty() ||
 	    output_col.empty() || comparison_op.empty() || threshold_sql.empty()) {
 		throw InternalException("CompileFilteredGroupCount called with incomplete metadata for view '%s'", view_name);
@@ -1333,12 +1331,13 @@ string CompileFilteredGroupCount(const string &view_name, const string &aux_tabl
 	string old_visible = "CASE WHEN " + old_sum + " " + comparison_op + " " + threshold_sql + " THEN 1 ELSE 0 END";
 	string new_visible = "CASE WHEN " + new_sum + " " + comparison_op + " " + threshold_sql + " THEN 1 ELSE 0 END";
 	string aux_match = SqlUtils::BuildNullSafeMatch(vector<string> {group_col}, "_aux", "d");
+	string filter = filter_sql.empty() ? "" : " AND (" + filter_sql + ")";
 
 	string sql;
 	sql += "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(dsum_table) + " AS\n  SELECT " + source_group +
 	       " AS " + group_q + ", " + dsum_expr + " AS openivm_delta_sum\n  FROM " + delta_q + "\n  WHERE " +
-	       string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP\n  GROUP BY " +
-	       source_group + "\n  HAVING " + dsum_expr + " <> 0;\n\n";
+	       string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP" + filter +
+	       "\n  GROUP BY " + source_group + "\n  HAVING " + dsum_expr + " <> 0;\n\n";
 
 	sql += "WITH openivm_transition AS (\n  SELECT SUM((" + new_visible + ") - (" + old_visible +
 	       ")) AS openivm_delta_count\n  FROM " + SqlUtils::QuoteIdentifier(dsum_table) + " d LEFT JOIN " + aux_q +
@@ -1353,8 +1352,8 @@ string CompileFilteredGroupCount(const string &view_name, const string &aux_tabl
 	sql += "DELETE FROM " + aux_q + " WHERE openivm_sum = 0;\n";
 	sql += "DROP TABLE IF EXISTS " + SqlUtils::QuoteIdentifier(dsum_table) + ";\n";
 
-	OPENIVM_DEBUG_PRINT("[CompileFilteredGroupCount] group=%s, sum=%s, op=%s, aux=%s\n", group_col.c_str(),
-	                    sum_col.c_str(), comparison_op.c_str(), aux_table.c_str());
+	OPENIVM_DEBUG_PRINT("[CompileFilteredGroupCount] group=%s, sum=%s, op=%s, aux=%s, filter=%s\n", group_col.c_str(),
+	                    sum_col.c_str(), comparison_op.c_str(), aux_table.c_str(), filter_sql.c_str());
 	return sql;
 }
 
@@ -1362,7 +1361,8 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const string &catalog_prefix, const vector<string> &partition_columns,
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs, bool emit_cascade_delta,
                               const string &affected_keys_sql, const vector<string> &column_names,
-                              bool running_window_incremental, bool *uses_running_suffix) {
+                              bool running_window_incremental, bool *uses_running_suffix,
+                              bool use_data_modifying_ctes) {
 	if (uses_running_suffix) {
 		*uses_running_suffix = false;
 	}
@@ -1417,8 +1417,8 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 	}
 	string filter = have_affected_keys ? BuildAffectedTableFilter(output_columns, "openivm_target", affected_temp_table)
 	                                   : BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_target");
-	sql +=
-	    BuildSnapshotDeltaRefreshSQL(data_table, view_query_sql, delta_table, old_temp_table, new_temp_table, filter);
+	sql += BuildSnapshotDeltaRefreshSQL(data_table, view_query_sql, delta_table, old_temp_table, new_temp_table, filter,
+	                                    use_data_modifying_ctes);
 	if (have_affected_keys) {
 		sql += "\nDROP TABLE IF EXISTS " + affected_temp_table + ";\n";
 	}

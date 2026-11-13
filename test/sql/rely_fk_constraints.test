@@ -46,12 +46,13 @@ true
 statement ok
 PRAGMA openivm_declare_rely_fk('rely_fact', 'product_id', 'rely_dim', 'product_id');
 
-query TTTTTI
-SELECT table_name, constraint_kind, columns_json, referenced_table, referenced_columns_json, is_trusted
+query ITTITI
+SELECT table_name = current_database() || '.main.rely_fact', constraint_kind, columns_json,
+       referenced_table = current_database() || '.main.rely_dim', referenced_columns_json, is_trusted
 FROM openivm_constraints_cache
-WHERE table_name = 'rely_fact';
+WHERE table_name = current_database() || '.main.rely_fact';
 ----
-rely_fact	RELY_FK	["product_id"]	rely_dim	["product_id"]	true
+true	RELY_FK	["product_id"]	true	["product_id"]	true
 
 # The RELY declaration is accepted by the compile-only path and preserves the
 # incremental aggregate refresh shape. The dedicated constraints_cache_fk_prune

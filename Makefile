@@ -3,6 +3,7 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # Configuration of extension
 EXT_NAME=openivm
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
+OVERRIDE_GIT_DESCRIBE?=v2.0.0
 
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
@@ -21,3 +22,36 @@ test_release_internal: test_scheduler_catalog
 test_scheduler_catalog:
 	cmake --build build/release --target scheduler_catalog_test
 	python3 test/integration/test_scheduler_catalog.py ./build/release/extension/openivm/scheduler_catalog_test
+
+.PHONY: test_benchmark_metadata
+
+test_release_internal: test_benchmark_metadata
+
+test_benchmark_metadata:
+	cmake --build build/release --target benchmark_metadata_test
+	dir=$$(mktemp -d) && ./build/release/extension/openivm/benchmark_metadata_test $$dir | grep -qx PASS; status=$$?; rm -rf $$dir; exit $$status
+
+.PHONY: test_remote_metadata
+
+# Skipped unless OPENIVM_POSTGRES_DSN names a disposable local PostgreSQL database
+# (see docs/build/testing.md). CI runs it with --require against a service container.
+test_release_internal: test_remote_metadata
+
+test_remote_metadata:
+	python3 test/integration/test_remote_metadata.py ./build/release/duckdb
+
+.PHONY: test_source_delta_publication
+
+test_release_internal: test_source_delta_publication
+
+test_source_delta_publication:
+	cmake --build build/release --target source_delta_publication_test
+	python3 test/integration/test_source_delta_publication.py ./build/release/extension/openivm/source_delta_publication_test
+
+.PHONY: test_concurrency
+
+test_release_internal: test_concurrency
+
+test_concurrency:
+	cmake --build build/release --target concurrency_test
+	python3 test/integration/test_concurrency.py ./build/release/extension/openivm/concurrency_test

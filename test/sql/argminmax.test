@@ -270,3 +270,145 @@ query III
 SELECT region, ARG_MIN(name, priority) AS top_name, SUM(amount) AS total FROM events GROUP BY region
   EXCEPT ALL SELECT * FROM mv_mixed;
 ----
+
+# Native FILTER serialization must preserve the hidden group and sort columns
+# injected into the storage query. Reusing the original SQL loses these columns.
+statement ok
+CREATE TABLE hidden_filter_source(grp INT, id INT, v INT, p BOOLEAN);
+
+statement ok
+INSERT INTO hidden_filter_source VALUES
+    (1, 1, 5, true), (1, 2, 9, false), (2, 3, 5, true),
+    (3, 4, NULL, true), (4, 5, 8, false);
+
+statement ok
+CREATE MATERIALIZED VIEW hidden_arg_filter AS
+SELECT ARG_MIN(v, id) FILTER (WHERE p) AS a FROM hidden_filter_source GROUP BY grp + 10;
+
+statement ok
+CREATE VIEW expected_hidden_arg_filter AS
+SELECT ARG_MIN(v, id) FILTER (WHERE p) AS a FROM hidden_filter_source GROUP BY grp + 10;
+
+statement ok
+CREATE MATERIALIZED VIEW hidden_list_filter AS
+SELECT LIST(v ORDER BY id) FILTER (WHERE p) AS a FROM hidden_filter_source GROUP BY grp;
+
+statement ok
+CREATE VIEW expected_hidden_list_filter AS
+SELECT LIST(v ORDER BY id) FILTER (WHERE p) AS a FROM hidden_filter_source GROUP BY grp;
+
+statement ok
+CREATE MATERIALIZED VIEW hidden_sort_filter AS
+SELECT grp, ARG_MIN(v, id) FILTER (WHERE p) AS a
+FROM hidden_filter_source GROUP BY grp ORDER BY MAX(v), grp LIMIT 2 OFFSET 1;
+
+statement ok
+CREATE VIEW expected_hidden_sort_filter AS
+SELECT grp, ARG_MIN(v, id) FILTER (WHERE p) AS a
+FROM hidden_filter_source GROUP BY grp ORDER BY MAX(v), grp LIMIT 2 OFFSET 1;
+
+# ARG_MAX without FILTER also needs the normalized plan's hidden grouping key.
+statement ok
+CREATE MATERIALIZED VIEW hidden_arg_max AS
+SELECT ARG_MAX(v, id) AS a FROM hidden_filter_source GROUP BY grp + 10;
+
+statement ok
+CREATE VIEW expected_hidden_arg_max AS
+SELECT ARG_MAX(v, id) AS a FROM hidden_filter_source GROUP BY grp + 10;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'hidden_arg_max';
+----
+0
+
+foreach mv hidden_arg_filter hidden_list_filter hidden_sort_filter
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = '{mv}';
+----
+6
+
+endloop
+
+foreach mv hidden_arg_filter hidden_list_filter hidden_sort_filter hidden_arg_max
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+
+# Conflicting writes change group membership, FILTER truth, and top-k ordering
+# before a single refresh. Group 5 is created and removed within the batch.
+statement ok
+INSERT INTO hidden_filter_source VALUES
+    (1, 6, 1, true), (2, 7, -4, true), (4, 8, 8, true), (5, 9, 9, true);
+
+statement ok
+UPDATE hidden_filter_source SET p = false WHERE id = 1;
+
+statement ok
+UPDATE hidden_filter_source SET v = -8, grp = 6 WHERE id = 8;
+
+statement ok
+DELETE FROM hidden_filter_source WHERE grp = 5 OR id = 3;
+
+foreach mv hidden_arg_filter hidden_list_filter hidden_sort_filter hidden_arg_max
+
+statement ok
+PRAGMA refresh('{mv}');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+
+# Retain excluded rows after deleting every qualifying row.
+statement ok
+DELETE FROM hidden_filter_source WHERE p;
+
+foreach mv hidden_arg_filter hidden_list_filter hidden_sort_filter hidden_arg_max
+
+statement ok
+PRAGMA refresh('{mv}');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM hidden_filter_source;
+
+foreach mv hidden_arg_filter hidden_list_filter hidden_sort_filter hidden_arg_max
+
+statement ok
+PRAGMA refresh('{mv}');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL
+    (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv})
+);
+----
+0
+
+endloop

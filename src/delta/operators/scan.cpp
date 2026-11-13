@@ -7,7 +7,7 @@ DeltaPlanFragment CompileScanDelta(DeltaOperatorInput input) {
 	auto &old_get = input.plan->Cast<LogicalGet>();
 	LogDeltaOperatorStrategy(input, DeltaOperatorStrategy::SCAN_DELTA);
 	OPENIVM_DEBUG_PRINT("[DeltaScan] Rewriting GET node (table_index=%lu) -> delta scan\n",
-	                    (unsigned long)old_get.table_index);
+	                    (unsigned long)old_get.table_index.index);
 	DeltaGetResult result = CreateDeltaGetNode(input.context.input.context, input.context.metadata_con,
 	                                           input.context.input.optimizer.binder, &old_get, input.context.view);
 	result.node->Verify(input.context.input.context);

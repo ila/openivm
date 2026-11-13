@@ -10,27 +10,20 @@
 
 namespace duckdb {
 
-struct DeltaCompileAssumptions {
-	bool all_sources_are_ducklake = false;
-	bool keep_window_join_partitions = true;
-	bool has_unsupported_incremental_construct = false;
-};
-
 struct DeltaCompileContext {
 	DeltaCompileContext(OptimizerExtensionInput &input, Connection &metadata_con, const string &view,
-	                    const DeltaViewModel &model, DeltaCompileAssumptions assumptions);
+	                    const DeltaViewModel &model);
 
 	OptimizerExtensionInput &input;
 	Connection &metadata_con;
 	const string &view;
 	const DeltaViewModel &model;
-	DeltaCompileAssumptions assumptions;
 };
 
 class DeltaCompiler {
 public:
 	DeltaCompiler(OptimizerExtensionInput &input, Connection &metadata_con, const string &view,
-	              const DeltaViewModel &model, DeltaCompileAssumptions assumptions = {});
+	              const DeltaViewModel &model);
 	explicit DeltaCompiler(DeltaCompileContext context);
 
 	DeltaPlanFragment Compile(unique_ptr<LogicalOperator> &plan, LogicalOperator *&root);
@@ -44,10 +37,10 @@ private:
 	unordered_map<const LogicalOperator *, idx_t> node_by_plan;
 };
 
-DeltaViewModel BuildRefreshDeltaViewModel(OptimizerExtensionInput &input, Connection &metadata_con,
-                                          const string &view_name, LogicalOperator *optimized_plan,
-                                          const vector<string> &output_names,
-                                          DeltaCompileAssumptions *out_assumptions = nullptr);
+// Refresh-time model: node kinds, max table index and a refresh type whose only consumer is the SIMPLE_PROJECTION
+// check in the join rule. Aux-state metadata and lineage are not loaded, so aux-dependent types are not refined.
+DeltaViewModel BuildRefreshDeltaViewModel(OptimizerExtensionInput &input, LogicalOperator *optimized_plan,
+                                          const vector<string> &output_names);
 
 void LogDeltaModelSummary(const DeltaViewModel &model);
 

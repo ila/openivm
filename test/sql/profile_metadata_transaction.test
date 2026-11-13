@@ -7,7 +7,7 @@ require openivm
 require parquet
 
 statement ok
-INSTALL ducklake;
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository';
 
 statement ok
 LOAD ducklake;
@@ -73,3 +73,66 @@ SELECT (SELECT count(*) FROM (SELECT * FROM dl.mv2 EXCEPT ALL SELECT * FROM dl.s
        (SELECT count(*) FROM (SELECT * FROM dl.source EXCEPT ALL SELECT * FROM dl.mv2));
 ----
 0	0
+
+# A staged native CREATE discovers its metadata through the data catalog's marker.
+# The frontend has no marker: reopening must not lose the CREATE profile there.
+load __TEST_DIR__/profile_owner_host.db
+
+statement ok
+ATTACH '__TEST_DIR__/profile_owner_data.db' AS data;
+
+statement ok
+ATTACH '__TEST_DIR__/profile_owner_control.db' AS control;
+
+statement ok
+SET openivm_metadata_catalog = 'control';
+
+statement ok
+SET openivm_metadata_schema = 'openivm';
+
+statement ok
+SET openivm_profile_refresh = true;
+
+statement ok
+CREATE TABLE data.main.source(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO data.main.source VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW data.main.first AS SELECT k, SUM(v) AS s FROM data.main.source GROUP BY k;
+
+statement ok
+SET openivm_metadata_catalog = '';
+
+statement ok
+RESET openivm_metadata_schema;
+
+restart
+
+statement ok
+ATTACH '__TEST_DIR__/profile_owner_data.db' AS data;
+
+statement ok
+ATTACH '__TEST_DIR__/profile_owner_control.db' AS control;
+
+statement ok
+SET openivm_profile_refresh = true;
+
+statement ok
+CREATE MATERIALIZED VIEW data.main.second AS SELECT k, SUM(v) AS s FROM data.main.source GROUP BY k;
+
+query II rowsort
+SELECT v.view_sql_name, count(p.refresh_id)
+FROM control.openivm.openivm_views v LEFT JOIN control.openivm.openivm_refresh_profile p
+ON v.view_name = p.view_name AND p.step_name = 'create_mv_total'
+GROUP BY v.view_sql_name;
+----
+first	1
+second	1
+
+query I
+SELECT count(*) FROM ((SELECT * FROM data.main.second EXCEPT ALL SELECT k, SUM(v) FROM data.main.source GROUP BY k)
+                     UNION ALL (SELECT k, SUM(v) FROM data.main.source GROUP BY k EXCEPT ALL SELECT * FROM data.main.second));
+----
+0

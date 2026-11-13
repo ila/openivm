@@ -1,0 +1,274 @@
+# name: test/sql/source_drop_cascade.test
+# description: DROP TABLE on a tracked native source resolves ownership by its delta-table identity
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+# ==========================================
+# Section 1: CASCADE removes every tracked consumer of the exact source
+# ==========================================
+
+statement ok
+CREATE SCHEMA a;
+
+statement ok
+CREATE SCHEMA b;
+
+statement ok
+CREATE TABLE a.s(i INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO a.s VALUES (1, 10), (2, 20), (2, 20);
+
+statement ok
+CREATE TABLE b.s(i INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO b.s VALUES (1, 100), (3, 300);
+
+# Same-named native table with no materialized views.
+statement ok
+CREATE TABLE main.s(i INTEGER);
+
+statement ok
+INSERT INTO main.s VALUES (5), (6);
+
+statement ok
+CREATE TABLE shared_n(i INTEGER, label VARCHAR);
+
+statement ok
+INSERT INTO shared_n VALUES (1, 'one'), (2, 'two');
+
+statement ok
+CREATE MATERIALIZED VIEW a_mv AS SELECT i, SUM(v) AS total, COUNT(*) AS n FROM a.s GROUP BY i;
+
+statement ok
+CREATE MATERIALIZED VIEW a_child AS SELECT i, total FROM a_mv WHERE total > 10;
+
+statement ok
+CREATE MATERIALIZED VIEW ab_join AS SELECT x.i, x.v AS av, y.v AS bv FROM a.s x JOIN b.s y ON x.i = y.i;
+
+statement ok
+CREATE MATERIALIZED VIEW a_shared AS SELECT x.i, n.label FROM a.s x JOIN shared_n n ON x.i = n.i;
+
+statement ok
+CREATE MATERIALIZED VIEW b_mv AS SELECT i, v FROM b.s;
+
+statement ok
+CREATE MATERIALIZED VIEW shared_mv AS SELECT i, label FROM shared_n;
+
+# Same-named sources in one view use qualified delta keys.
+query I
+SELECT count(*)
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'ab_join' AND contains(d.table_name, '.');
+----
+2
+
+# Pending changes: a.s deltas die with the source, shared_n deltas are still needed.
+statement ok
+INSERT INTO a.s VALUES (4, 40);
+
+statement ok
+INSERT INTO shared_n VALUES (3, 'three'), (3, 'three');
+
+statement ok
+DELETE FROM shared_n WHERE i = 1;
+
+statement ok
+DROP TABLE a.s CASCADE;
+
+query II
+SELECT
+    (SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'a' AND table_name = 's'),
+    (SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'b' AND table_name = 's');
+----
+0	1
+
+query I
+SELECT count(*) FROM main.s;
+----
+2
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_sql_name IN ('a_mv', 'a_child', 'ab_join', 'a_shared');
+----
+0
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_sql_name IN ('b_mv', 'shared_mv');
+----
+2
+
+statement error
+SELECT * FROM a_child;
+----
+does not exist
+
+statement error
+SELECT * FROM ab_join;
+----
+does not exist
+
+query TT
+SELECT schema_name, table_name FROM duckdb_tables()
+WHERE table_name IN ('openivm_delta_s', 'openivm_delta_shared_n')
+ORDER BY ALL;
+----
+b	openivm_delta_s
+main	openivm_delta_shared_n
+
+query I
+SELECT count(*) FROM openivm_delta_tables WHERE view_name NOT IN (SELECT view_name FROM openivm_views);
+----
+0
+
+query I
+SELECT count(*) FROM openivm_mv_dependencies
+WHERE parent_view NOT IN (SELECT view_name FROM openivm_views)
+   OR child_view NOT IN (SELECT view_name FROM openivm_views);
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() t
+WHERE contains(t.table_name, '__openivm_mv_')
+  AND NOT EXISTS (SELECT 1 FROM openivm_views v WHERE contains(t.table_name, v.view_name));
+----
+0
+
+# Survivors keep refreshing correctly, including changes recorded before the drop.
+statement ok
+INSERT INTO b.s VALUES (3, 300), (7, 700);
+
+statement ok
+UPDATE b.s SET v = v + 1 WHERE i = 1;
+
+statement ok
+DELETE FROM b.s WHERE i = 3 AND v = 300;
+
+statement ok
+PRAGMA refresh('b_mv');
+
+query I
+SELECT count(*) FROM (SELECT i, v FROM b_mv EXCEPT ALL SELECT i, v FROM b.s);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i, v FROM b.s EXCEPT ALL SELECT i, v FROM b_mv);
+----
+0
+
+statement ok
+UPDATE shared_n SET label = 'TWO' WHERE i = 2;
+
+statement ok
+INSERT INTO shared_n VALUES (4, 'four');
+
+statement ok
+PRAGMA refresh('shared_mv');
+
+query I
+SELECT count(*) FROM (SELECT i, label FROM shared_mv EXCEPT ALL SELECT i, label FROM shared_n);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i, label FROM shared_n EXCEPT ALL SELECT i, label FROM shared_mv);
+----
+0
+
+# Dropping the unowned same-named table is an ordinary drop.
+statement ok
+DROP TABLE main.s CASCADE;
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_sql_name IN ('b_mv', 'shared_mv');
+----
+2
+
+# ==========================================
+# Section 2: without CASCADE, MVs are retained and see retractions before a replacement
+# ==========================================
+
+statement ok
+CREATE TABLE c(i INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO c VALUES (1, 1), (1, 1), (2, 2);
+
+statement ok
+CREATE MATERIALIZED VIEW c_mv AS SELECT i, SUM(v) AS total, COUNT(*) AS n FROM c GROUP BY i;
+
+statement ok
+DROP TABLE c;
+
+query II
+SELECT
+    (SELECT count(*) FROM openivm_views WHERE view_sql_name = 'c_mv'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_c');
+----
+1	1
+
+statement ok
+CREATE TABLE c(i INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO c VALUES (2, 5), (3, 7), (3, 7);
+
+statement ok
+UPDATE c SET v = v + 1 WHERE i = 3;
+
+statement ok
+DELETE FROM c WHERE i = 2;
+
+statement ok
+INSERT INTO c VALUES (2, 9), (4, 40);
+
+statement ok
+PRAGMA refresh('c_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT i, total, n FROM c_mv
+    EXCEPT ALL
+    SELECT i, SUM(v), COUNT(*) FROM c GROUP BY i
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT i, SUM(v), COUNT(*) FROM c GROUP BY i
+    EXCEPT ALL
+    SELECT i, total, n FROM c_mv
+);
+----
+0
+
+# Ownership follows the source even when controller and maintenance schemas differ.
+statement ok
+SET openivm_metadata_schema='drop_control';
+SET openivm_internal_schema='drop_state';
+CREATE TABLE placed_source(k INTEGER,v INTEGER);
+INSERT INTO placed_source VALUES (1,10),(2,20);
+CREATE MATERIALIZED VIEW placed_parent AS SELECT * FROM placed_source;
+CREATE MATERIALIZED VIEW placed_child AS SELECT k,SUM(v) total FROM placed_parent GROUP BY k;
+DROP TABLE placed_source CASCADE;
+
+query I
+SELECT count(*) FROM drop_control.openivm_views WHERE view_sql_name IN ('placed_parent','placed_child');
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name=current_database() AND schema_name='drop_state';
+----
+0

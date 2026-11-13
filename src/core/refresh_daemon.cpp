@@ -1,5 +1,6 @@
 #include "core/refresh_daemon.hpp"
 
+#include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
@@ -87,10 +88,7 @@ void RefreshDaemon::Run() {
 			}
 
 			// Read adaptive backoff setting
-			Value backoff_val;
-			if (con.context->TryGetCurrentSetting("openivm_adaptive_backoff", backoff_val) && !backoff_val.IsNull()) {
-				adaptive_backoff_ = backoff_val.GetValue<bool>();
-			}
+			adaptive_backoff_ = SqlUtils::GetBoolSetting(*con.context, "openivm_adaptive_backoff", adaptive_backoff_);
 
 			RefreshMetadata metadata(con);
 			auto scheduled = metadata.GetScheduledViews();
@@ -104,7 +102,11 @@ void RefreshDaemon::Run() {
 					break;
 				}
 
-				RefreshMetadata::UseCatalog(*con.context, con, sv.metadata_catalog);
+				// Cascade lookups below read the location that registered this view.
+				MetadataLocation location;
+				location.catalog = sv.metadata_catalog;
+				location.schema = sv.metadata_schema;
+				MetadataLocator::Use(con, location);
 				auto view_key = SqlUtils::FullName(sv.catalog_name, sv.schema_name, sv.view_name);
 
 				// Skip if already refreshed via cascade from an earlier view in this cycle
@@ -124,11 +126,11 @@ void RefreshDaemon::Run() {
 
 				// Check if the view is due for refresh
 				if (!sv.last_update.empty()) {
-					auto elapsed_result = con.Query("SELECT EXTRACT(EPOCH FROM (now()::TIMESTAMP - '" + sv.last_update +
-					                                "'::TIMESTAMP))");
+					auto elapsed_result = con.Query("SELECT EXTRACT(EPOCH FROM (" + string(openivm::UTC_NOW_SQL) +
+					                                " - '" + sv.last_update + "'::TIMESTAMP))");
 					if (!elapsed_result->HasError() && elapsed_result->RowCount() > 0 &&
-					    !elapsed_result->GetValue(0, 0).IsNull()) {
-						auto elapsed_seconds = elapsed_result->GetValue(0, 0).GetValue<double>();
+					    !elapsed_result->Collection().GetValue(0, 0).IsNull()) {
+						auto elapsed_seconds = elapsed_result->Collection().GetValue(0, 0).GetValue<double>();
 						if (elapsed_seconds < static_cast<double>(interval)) {
 							continue; // not due yet
 						}

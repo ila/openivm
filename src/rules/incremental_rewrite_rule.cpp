@@ -6,6 +6,7 @@
 #include "core/published_view.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/parser_plan_helpers.hpp"
+#include "core/plan_rewrite.hpp"
 #include "core/scoped_optimizer_settings.hpp"
 #include "core/sql_utils.hpp"
 #include "core/time_travel_pins.hpp"
@@ -32,16 +33,18 @@ void IncrementalRewriteRule::AddInsertNode(ClientContext &context, Binder &binde
 	OPENIVM_DEBUG_PRINT("\n---end of insert node output---\n");
 #endif
 
-	auto table = Catalog::GetEntry<TableCatalogEntry>(context, view_catalog_name, view_schema_name,
-	                                                  SqlUtils::DeltaName(view_name), OnEntryNotFound::THROW_EXCEPTION,
-	                                                  QueryErrorContext());
+	auto table =
+	    Catalog::GetEntry<TableCatalogEntry>(context,
+	                                         QualifiedName(Identifier(view_catalog_name), Identifier(view_schema_name),
+	                                                       Identifier(SqlUtils::DeltaName(view_name))),
+	                                         OnEntryNotFound::THROW_EXCEPTION, QueryErrorContext());
 	auto insert_node = make_uniq<LogicalInsert>(*table, binder.GenerateTableIndex());
 
 	Value value;
 	unique_ptr<BoundConstantExpression> exp;
 	for (size_t i = 0; i < plan->expressions.size(); i++) {
-		insert_node->expected_types.emplace_back(plan->expressions[i]->return_type);
-		value = Value(plan->expressions[i]->return_type);
+		insert_node->expected_types.emplace_back(plan->expressions[i]->GetReturnType());
+		value = Value(plan->expressions[i]->GetReturnType());
 		exp = make_uniq<BoundConstantExpression>(std::move(value));
 		insert_node->bound_defaults.emplace_back(std::move(exp));
 	}
@@ -61,7 +64,8 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	while (!child->children.empty()) {
 		child = child->children[0].get();
 	}
-	if (!StringUtil::StartsWith(child->GetName(), "COMPUTEDELTA")) {
+	auto marker = dynamic_cast<LogicalGet *>(child);
+	if (!marker || !StringUtil::CIEquals(marker->function.GetName().GetIdentifierName(), "ComputeDelta")) {
 		return;
 	}
 
@@ -69,13 +73,10 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	OPENIVM_DEBUG_PRINT("Activating the rewrite rule\n");
 #endif
 
-	auto child_get = dynamic_cast<LogicalGet *>(child);
-	if (!child_get) {
-		throw InternalException("ComputeDelta marker must be represented as a logical get");
-	}
-	auto view = child_get->named_parameters["view_name"].ToString();
-	auto view_catalog = child_get->named_parameters["view_catalog_name"].ToString();
-	auto view_schema = child_get->named_parameters["view_schema_name"].ToString();
+	// ComputeDelta(view_catalog_name, view_schema_name, view_name)
+	auto view_catalog = StringValue::Get(marker->parameters[0]);
+	auto view_schema = StringValue::Get(marker->parameters[1]);
+	auto view = StringValue::Get(marker->parameters[2]);
 
 	Connection con(*input.context.db);
 	RefreshMetadata::UseCatalog(input.context, con, view_catalog);
@@ -83,18 +84,12 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 		RefreshMetadata(con).SnapshotTransaction(input.context);
 	}
 
-	auto v = con.Query("select sql_string from " + string(openivm::VIEWS_TABLE) + " where view_name = '" +
-	                   SqlUtils::EscapeValue(view) + "';");
-	if (v->HasError()) {
-		throw Exception(ExceptionType::CATALOG,
-		                "IVM: cannot read view definition for '" + view + "': " + v->GetError());
-	}
-	if (v->RowCount() == 0 || v->GetValue(0, 0).IsNull()) {
+	auto view_query = RefreshMetadata(con).GetViewQuery(view);
+	if (view_query.empty()) {
 		throw Exception(ExceptionType::CATALOG, "IVM: missing view definition for '" + view + "'");
 	}
-	string view_query = v->GetValue(0, 0).ToString();
 
-	Parser parser;
+	auto parser = Parser::GetBuiltinParser();
 	Planner planner(input.context);
 
 	parser.ParseQuery(view_query);
@@ -104,7 +99,7 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	openivm::TimeTravelPins::Peel(input.context, *parser.statements[0]);
 
 	OPENIVM_DEBUG_PRINT("[REWRITE] About to CreatePlan for view query\n");
-	planner.CreatePlan(std::move(parser.statements[0]));
+	PlanWithSourceColumns(planner, std::move(parser.statements[0]));
 	OPENIVM_DEBUG_PRINT("[REWRITE] CreatePlan done\n");
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Unoptimized plan: \n%s\n", planner.plan->ToString().c_str());
@@ -115,6 +110,11 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	ScopedDisabledOptimizers disabled_optimizers(input.context, openivm::TEMPLATE_DATA_DEPENDENT_OPTIMIZERS);
 	Optimizer optimizer(*planner.binder, input.context);
 	auto optimized_plan = optimizer.Optimize(std::move(planner.plan));
+	// LPTS stores repeated logical subplans once in a compact CTE graph so DuckDB
+	// can bind and optimize large generated SQL without recursive-plan blow-up.
+	// Delta joins, however, need one independently renumbered leaf per reference
+	// to generate all inclusion-exclusion terms (including delta/delta terms).
+	InlineMaterializedCteRefs(input.context, *planner.binder, optimized_plan);
 
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Optimized plan: \n%s\n", optimized_plan->ToString().c_str());
@@ -124,16 +124,15 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 		throw NotImplementedException("Plan contains single node, this is not supported");
 	}
 
-	auto output_names = PrepareOutputNames(optimized_plan.get(), planner.names);
-	DeltaCompileAssumptions assumptions;
-	auto delta_model = BuildRefreshDeltaViewModel(input, con, view, optimized_plan.get(), output_names, &assumptions);
+	auto output_names = PrepareOutputNames(optimized_plan.get(), IdentifiersToStrings(planner.names));
+	auto delta_model = BuildRefreshDeltaViewModel(input, optimized_plan.get(), output_names);
 	LogDeltaModelSummary(delta_model);
 
 	// Join delta compilation uses input.optimizer.binder, which may not have been advanced by the local optimizer.
-	while (input.optimizer.binder.GenerateTableIndex() <= delta_model.max_table_index) {
+	while (input.optimizer.binder.GenerateTableIndex().index <= delta_model.max_table_index) {
 	}
 
-	DeltaCompiler compiler(input, con, view, delta_model, assumptions);
+	DeltaCompiler compiler(input, con, view, delta_model);
 
 	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === Starting IR delta compilation ===\n");
 	auto root = optimized_plan.get();

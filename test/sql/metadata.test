@@ -57,6 +57,25 @@ mv2	2
 
 # type 0 = AGGREGATE_GROUP, type 2 = SIMPLE_PROJECTION
 
+# view_name is an encoded internal key; the SQL-facing name lives only in view_sql_name.
+# Tooling (e.g. the rewriter benchmark) must resolve the SQL name to the key before reading metadata.
+query I
+SELECT count(*) FROM openivm_views WHERE view_name = 'mv1';
+----
+0
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_name LIKE '\_\_openivm\_mv\_%' ESCAPE '\' AND view_name <> view_sql_name;
+----
+2
+
+query I
+SELECT type FROM openivm_views WHERE view_name = (
+    SELECT view_name FROM openivm_views
+    WHERE view_sql_name = 'mv1' AND view_catalog = current_database() AND view_schema = current_schema());
+----
+0
+
 # Verify the stored SQL is non-empty and contains the expected table/column references
 query I
 SELECT sql_string IS NOT NULL AND LENGTH(sql_string) > 0 AND sql_string LIKE '%sum%' AND sql_string LIKE '%grp%' FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d7631_';
@@ -562,5 +581,379 @@ SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'openivm_data_
 
 query I
 SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'openivm_delta___openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d765f64726f705f74657374_';
+----
+0
+
+# ==========================================
+# Compiled SQL archive: one lifecycle covers controls, ordered SQL, retention, failure and rollback.
+
+load __TEST_DIR__/archive_contract.db
+
+statement ok
+RESET openivm_archive_compiled_sql; RESET openivm_compiled_sql_retention; RESET openivm_files_path;
+
+query II
+SELECT current_setting('openivm_archive_compiled_sql'),current_setting('openivm_compiled_sql_retention');
+----
+false	10
+
+foreach invalid 0 -1 NULL
+
+statement error
+SET openivm_compiled_sql_retention=${invalid};
+----
+must be at least 1
+
+endloop
+
+statement ok
+CREATE TABLE arch_src(k INTEGER,v INTEGER);
+INSERT INTO arch_src VALUES (1,10),(1,10),(2,20);
+CREATE MATERIALIZED VIEW disabled AS SELECT * FROM arch_src;
+
+query I
+SELECT count(*) FROM openivm_compiled_programs;
+----
+0
+
+statement ok
+DROP VIEW disabled;
+SET SESSION openivm_archive_compiled_sql=true;
+SET openivm_compiled_sql_retention=2;
+SET openivm_files_path='__TEST_DIR__';
+CREATE MATERIALIZED VIEW mv AS SELECT k,SUM(v) total,COUNT(*) c FROM arch_src GROUP BY k;
+
+query TTI
+SELECT operation,last_outcome,committed_count FROM openivm_compiled_programs;
+----
+create	committed	1
+
+query II
+SELECT count(*)=any_value(p.statement_count) AND max(s.stmt_order)=count(*)-1,
+min(s.stmt_order) FILTER(WHERE s.sql ILIKE 'create table %openivm_data_%') <
+min(s.stmt_order) FILTER(WHERE s.sql ILIKE 'create view %')
+FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING(view_name,operation,version)
+WHERE p.operation='create';
+----
+true	true
+
+loop batch 1 4
+
+statement ok
+INSERT INTO arch_src VALUES (1,3),(3,4),(3,4),(4,5);
+UPDATE arch_src SET v=v+1 WHERE k=1;
+DELETE FROM arch_src WHERE k=4;
+
+statement ok
+PRAGMA refresh('mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM mv EXCEPT ALL SELECT k,SUM(v) total,COUNT(*) c FROM arch_src GROUP BY k)
+UNION ALL (SELECT k,SUM(v) total,COUNT(*) c FROM arch_src GROUP BY k EXCEPT ALL SELECT * FROM mv));
+----
+0
+
+endloop
+
+query III
+SELECT count(*),min(version),max(version) FROM openivm_compiled_programs WHERE operation='refresh';
+----
+2	2	3
+
+query II
+SELECT (SELECT count(*) FROM openivm_compiled_programs p WHERE p.statement_count<>
+(SELECT count(*) FROM openivm_compiled_statements s WHERE s.view_name=p.view_name AND s.operation=p.operation AND s.version=p.version)),
+(SELECT count(*) FROM openivm_compiled_statements s WHERE NOT EXISTS
+(SELECT 1 FROM openivm_compiled_programs p WHERE s.view_name=p.view_name AND s.operation=p.operation AND s.version=p.version));
+----
+0	0
+
+query II
+WITH f AS (SELECT replace(content,chr(13)||chr(10),chr(10)) AS content FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_617263686976655f636f6e7472616374_6d61696e_6d76_.sql')),
+s AS (SELECT s.stmt_order,position(s.sql IN f.content) pos
+FROM openivm_compiled_statements s,f WHERE operation='refresh' AND version=3)
+SELECT bool_and(pos>0),bool_and(pos>coalesce(prev,0))
+FROM (SELECT pos,lag(pos) OVER(ORDER BY stmt_order) prev FROM s);
+----
+true	true
+
+statement ok
+CREATE TEMP TABLE exported_before AS SELECT content FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_617263686976655f636f6e7472616374_6d61696e_6d76_.sql'); RESET openivm_files_path;
+
+# Disabled recording, an empty refresh, and compile-only calls leave the archive unchanged.
+
+statement ok
+CREATE TEMP TABLE programs_before AS SELECT * FROM openivm_compiled_programs;
+CREATE TEMP TABLE statements_before AS SELECT * FROM openivm_compiled_statements;
+SET openivm_archive_compiled_sql=false;
+INSERT INTO arch_src VALUES(2,6);
+
+statement ok
+PRAGMA refresh('mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM mv EXCEPT ALL SELECT k,SUM(v) total,COUNT(*) c FROM arch_src GROUP BY k)
+UNION ALL (SELECT k,SUM(v) total,COUNT(*) c FROM arch_src GROUP BY k EXCEPT ALL SELECT * FROM mv));
+----
+0
+
+statement ok
+SET openivm_archive_compiled_sql=true;
+
+statement ok
+PRAGMA refresh('mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM mv EXCEPT ALL SELECT k,SUM(v) total,COUNT(*) c FROM arch_src GROUP BY k)
+UNION ALL (SELECT k,SUM(v) total,COUNT(*) c FROM arch_src GROUP BY k EXCEPT ALL SELECT * FROM mv));
+----
+0
+
+query I
+SELECT count(*)>0 FROM openivm_compile_with_facts('mv','{"target_dialect":"duckdb","compile_only":true}');
+----
+true
+
+query I
+SELECT count(*) FROM ((SELECT * FROM openivm_compiled_programs EXCEPT ALL SELECT * FROM programs_before)
+UNION ALL (SELECT * FROM programs_before EXCEPT ALL SELECT * FROM openivm_compiled_programs));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM openivm_compiled_statements EXCEPT ALL SELECT * FROM statements_before)
+UNION ALL (SELECT * FROM statements_before EXCEPT ALL SELECT * FROM openivm_compiled_statements));
+----
+0
+
+# Identical full programs reuse a version. Lower retention prunes both archive tables.
+
+statement ok
+SET openivm_refresh_mode='full'; SET openivm_compiled_sql_retention=1;
+
+query TI
+SELECT current_setting('openivm_refresh_mode'),current_setting('openivm_compiled_sql_retention');
+----
+full	1
+
+loop repetition 0 2
+
+statement ok
+INSERT INTO arch_src VALUES(1,8),(7,2),(8,3);
+UPDATE arch_src SET v=v+1 WHERE k=7;
+DELETE FROM arch_src WHERE k=8;
+
+statement ok
+PRAGMA refresh('mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM mv EXCEPT ALL SELECT k,SUM(v) total,COUNT(*) c FROM arch_src GROUP BY k)
+UNION ALL (SELECT k,SUM(v) total,COUNT(*) c FROM arch_src GROUP BY k EXCEPT ALL SELECT * FROM mv));
+----
+0
+
+endloop
+
+query II
+SELECT count(*),min(committed_count) FROM openivm_compiled_programs WHERE operation='refresh';
+----
+1	2
+
+query I
+SELECT content=(SELECT content FROM exported_before) FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_617263686976655f636f6e7472616374_6d61696e_6d76_.sql');
+----
+true
+
+# Pruning and archive writes share the caller transaction, including rollback.
+
+foreach outcome ROLLBACK COMMIT
+
+statement ok
+CREATE OR REPLACE TEMP TABLE programs_before AS SELECT * FROM openivm_compiled_programs;
+CREATE OR REPLACE TEMP TABLE statements_before AS SELECT * FROM openivm_compiled_statements;
+BEGIN;
+INSERT INTO arch_src VALUES (1,7),(5,8),(5,8);
+UPDATE arch_src SET v=v+1 WHERE k=5;
+DELETE FROM arch_src WHERE k=2;
+
+statement ok
+PRAGMA refresh('mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM mv EXCEPT ALL SELECT k,SUM(v) total,COUNT(*) c FROM arch_src GROUP BY k)
+UNION ALL (SELECT k,SUM(v) total,COUNT(*) c FROM arch_src GROUP BY k EXCEPT ALL SELECT * FROM mv));
+----
+0
+
+statement ok
+${outcome};
+
+query I
+SELECT count(*) FROM ((SELECT * FROM mv EXCEPT ALL SELECT k,SUM(v) total,COUNT(*) c FROM arch_src GROUP BY k)
+UNION ALL (SELECT k,SUM(v) total,COUNT(*) c FROM arch_src GROUP BY k EXCEPT ALL SELECT * FROM mv));
+----
+0
+
+query I
+SELECT '${outcome}'='COMMIT' OR NOT EXISTS
+((SELECT * FROM openivm_compiled_programs EXCEPT ALL SELECT * FROM programs_before)
+UNION ALL (SELECT * FROM programs_before EXCEPT ALL SELECT * FROM openivm_compiled_programs));
+----
+true
+
+query I
+SELECT '${outcome}'='COMMIT' OR NOT EXISTS
+((SELECT * FROM openivm_compiled_statements EXCEPT ALL SELECT * FROM statements_before)
+UNION ALL (SELECT * FROM statements_before EXCEPT ALL SELECT * FROM openivm_compiled_statements));
+----
+true
+
+endloop
+
+# Failure to archive cannot turn a rolled-back native operation into success.
+
+statement ok
+SET openivm_refresh_mode='incremental';
+CREATE TEMP TABLE mv_before AS SELECT * FROM mv;
+CREATE TEMP TABLE archive_saved AS SELECT * FROM openivm_compiled_statements;
+DROP TABLE openivm_compiled_statements;
+CREATE TABLE openivm_compiled_statements(view_name VARCHAR,operation VARCHAR,version INTEGER,stmt_order INTEGER,
+sql VARCHAR CHECK(operation<>'refresh'),PRIMARY KEY(view_name,operation,version,stmt_order));
+INSERT INTO arch_src VALUES(8,9),(8,9),(9,10);
+UPDATE arch_src SET v=v+1 WHERE k=8;
+DELETE FROM arch_src WHERE k=9;
+
+statement error
+PRAGMA refresh('mv');
+----
+could not archive its compiled SQL
+
+query I
+SELECT count(*) FROM ((SELECT * FROM mv EXCEPT ALL SELECT * FROM mv_before)
+UNION ALL (SELECT * FROM mv_before EXCEPT ALL SELECT * FROM mv));
+----
+0
+
+statement ok
+DROP TABLE openivm_compiled_statements;
+CREATE TABLE openivm_compiled_statements(view_name VARCHAR,operation VARCHAR,version INTEGER,stmt_order INTEGER,
+sql VARCHAR CHECK(operation<>'create'),PRIMARY KEY(view_name,operation,version,stmt_order));
+
+statement error
+CREATE MATERIALIZED VIEW rejected_archive AS SELECT * FROM arch_src;
+----
+CHECK constraint
+
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name='rejected_archive';
+----
+0
+
+statement ok
+DROP TABLE openivm_compiled_statements;
+CREATE TABLE openivm_compiled_statements(view_name VARCHAR,operation VARCHAR,version INTEGER,stmt_order INTEGER,
+sql VARCHAR,PRIMARY KEY(view_name,operation,version,stmt_order));
+INSERT INTO openivm_compiled_statements SELECT * FROM archive_saved;
+
+statement ok
+PRAGMA refresh('mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM mv EXCEPT ALL SELECT k,SUM(v) total,COUNT(*) c FROM arch_src GROUP BY k)
+UNION ALL (SELECT k,SUM(v) total,COUNT(*) c FROM arch_src GROUP BY k EXCEPT ALL SELECT * FROM mv));
+----
+0
+
+# Failed execution is attempted, then a corrected retry commits; histories are qualified.
+
+statement ok
+CREATE SCHEMA other;
+CREATE TABLE cast_src(i INTEGER,txt VARCHAR);
+INSERT INTO cast_src VALUES(1,'10');
+CREATE MATERIALIZED VIEW other.mv AS SELECT i,CAST(txt AS INTEGER) n FROM cast_src;
+INSERT INTO cast_src VALUES(2,'invalid');
+
+statement error
+PRAGMA refresh('other.mv');
+----
+Could not convert
+
+query TI
+SELECT last_outcome,committed_count FROM openivm_compiled_programs WHERE view_schema='other' AND operation='refresh';
+----
+attempted	0
+
+statement ok
+UPDATE cast_src SET txt='20' WHERE i=2;
+
+statement ok
+PRAGMA refresh('other.mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM other.mv EXCEPT ALL SELECT i,CAST(txt AS INTEGER) FROM cast_src)
+UNION ALL (SELECT i,CAST(txt AS INTEGER) FROM cast_src EXCEPT ALL SELECT * FROM other.mv));
+----
+0
+
+query TI
+SELECT last_outcome,committed_count FROM openivm_compiled_programs WHERE view_schema='other' AND operation='refresh';
+----
+committed	1
+
+statement ok
+SET openivm_archive_compiled_sql=false;
+
+restart
+
+query I
+SELECT count(DISTINCT view_schema) FROM openivm_compiled_programs WHERE view_sql_name='mv';
+----
+2
+
+statement ok
+DROP VIEW mv; DROP VIEW other.mv;
+
+query I
+SELECT count(DISTINCT view_schema) FROM openivm_compiled_programs WHERE view_sql_name='mv';
+----
+2
+
+
+# The first CREATE and refresh can archive together before any durable view row exists.
+statement ok
+SET openivm_archive_compiled_sql=true;
+
+foreach outcome ROLLBACK COMMIT
+
+statement ok
+BEGIN;
+CREATE MATERIALIZED VIEW new_${outcome} AS SELECT k,SUM(v) total,COUNT(*) c FROM arch_src GROUP BY k;
+INSERT INTO arch_src VALUES (1,9),(20,10),(21,11);
+UPDATE arch_src SET v=v+1 WHERE k=20;
+DELETE FROM arch_src WHERE k=21;
+
+statement ok
+PRAGMA refresh('new_${outcome}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM new_${outcome} EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM arch_src GROUP BY k)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM arch_src GROUP BY k EXCEPT ALL SELECT * FROM new_${outcome}));
+----
+0
+
+statement ok
+${outcome};
+
+query I
+SELECT count(DISTINCT operation)=CASE WHEN '${outcome}'='COMMIT' THEN 2 ELSE 0 END
+FROM openivm_compiled_programs WHERE view_sql_name='new_${outcome}';
+----
+true
+
+endloop
+
+query I
+SELECT count(*) FROM ((SELECT * FROM new_COMMIT EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM arch_src GROUP BY k)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM arch_src GROUP BY k EXCEPT ALL SELECT * FROM new_COMMIT));
 ----
 0

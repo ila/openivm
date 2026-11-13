@@ -1,0 +1,104 @@
+# name: test/sql/metadata_schema.test
+# description: openivm_metadata_schema relocates OpenIVM control metadata only; MV state, publications, deltas and indexes keep their placement
+# group: [sql]
+
+require openivm
+
+load __TEST_DIR__/openivm_metadata_schema.db
+
+statement ok
+CREATE TABLE legacy_src(k INTEGER, v INTEGER);
+INSERT INTO legacy_src VALUES (1,10),(1,20),(2,5);
+CREATE MATERIALIZED VIEW legacy_mv AS SELECT k,SUM(v) s,COUNT(*) c FROM legacy_src GROUP BY k;
+
+# The combined archive/placement features migrate the complete archive atomically.
+statement ok
+SET openivm_archive_compiled_sql = true;
+
+statement ok
+INSERT INTO legacy_src VALUES (7, 7), (7, 9);
+
+statement ok
+UPDATE legacy_src SET v = v + 2 WHERE k = 7;
+
+statement ok
+DELETE FROM legacy_src WHERE k = 7 AND v = 11;
+
+statement ok
+PRAGMA refresh('legacy_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM legacy_mv EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM legacy_src GROUP BY k) UNION ALL (SELECT k, SUM(v), COUNT(*) FROM legacy_src GROUP BY k EXCEPT ALL SELECT * FROM legacy_mv));
+----
+0
+
+# CREATE archival uses the same qualified statements as execution and omits session/profile markers.
+statement ok
+CREATE MATERIALIZED VIEW archive_render_check AS SELECT k, v FROM legacy_src;
+
+query I
+SELECT count(*) FROM main.openivm_compiled_statements WHERE operation = 'create' AND (regexp_matches(sql, '^\s*(USE |SET search_path|(UPDATE|INSERT INTO|DELETE FROM) openivm_[a-z_]+[[:space:]])', 'i') OR starts_with(sql, '__openivm_'));
+----
+0
+
+statement ok
+CREATE TEMP TABLE archive_before_move AS SELECT * FROM main.openivm_compiled_programs;
+
+statement ok
+CREATE TEMP TABLE statements_before_move AS SELECT * FROM main.openivm_compiled_statements;
+
+statement ok
+CREATE SCHEMA "Failed Archive Move";
+
+# A later metadata table rejects its rows, after earlier tables have already copied.
+# The entire migration must roll back, including the old tables it dropped.
+statement ok
+CREATE TABLE "Failed Archive Move".openivm_compiled_statements(view_name VARCHAR CHECK (false), operation VARCHAR, version INTEGER, stmt_order INTEGER, sql VARCHAR, PRIMARY KEY(view_name, operation, version, stmt_order));
+
+statement ok
+SET openivm_metadata_schema = 'Failed Archive Move';
+
+statement error
+CREATE MATERIALIZED VIEW failed_archive_move AS SELECT * FROM legacy_src;
+----
+OpenIVM could not move its metadata
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.openivm_compiled_programs EXCEPT ALL SELECT * FROM archive_before_move) UNION ALL (SELECT * FROM archive_before_move EXCEPT ALL SELECT * FROM main.openivm_compiled_programs));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.openivm_compiled_statements EXCEPT ALL SELECT * FROM statements_before_move) UNION ALL (SELECT * FROM statements_before_move EXCEPT ALL SELECT * FROM main.openivm_compiled_statements));
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'Failed Archive Move' AND table_name = 'openivm_views';
+----
+0
+
+statement ok
+SET openivm_metadata_schema = 'Archived Control';
+
+# Disable new writes to prove migration preserves exact archive contents.
+statement ok
+SET openivm_archive_compiled_sql = false;
+
+statement ok
+PRAGMA refresh('legacy_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM legacy_mv EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM legacy_src GROUP BY k) UNION ALL (SELECT k, SUM(v), COUNT(*) FROM legacy_src GROUP BY k EXCEPT ALL SELECT * FROM legacy_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "Archived Control".openivm_compiled_programs EXCEPT ALL SELECT * FROM archive_before_move) UNION ALL (SELECT * FROM archive_before_move EXCEPT ALL SELECT * FROM "Archived Control".openivm_compiled_programs));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "Archived Control".openivm_compiled_statements EXCEPT ALL SELECT * FROM statements_before_move) UNION ALL (SELECT * FROM statements_before_move EXCEPT ALL SELECT * FROM "Archived Control".openivm_compiled_statements));
+----
+0

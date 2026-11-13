@@ -9,6 +9,47 @@ class TableCatalogEntry;
 
 enum class DeltaCaptureMode : uint8_t { INSERT, DELETE, UPDATE };
 
+class LogicalSourceLifecycle : public LogicalExtensionOperator {
+public:
+	LogicalSourceLifecycle(optional_ptr<TableCatalogEntry> old_table, optional_ptr<TableCatalogEntry> delta);
+	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
+	vector<ColumnBinding> GetColumnBindings() override;
+	string GetName() const override;
+	string GetExtensionName() const override;
+	bool SupportSerialization() const override {
+		return false;
+	}
+
+protected:
+	void ResolveTypes() override;
+
+private:
+	optional_ptr<TableCatalogEntry> old_table;
+	optional_ptr<TableCatalogEntry> delta;
+};
+
+// Admission is acquired while optimizing, including for EXPLAIN and PREPARE.
+// This wrapper marks a source write only when the DML plan is executed.
+class LogicalSourceWriteExecution : public LogicalExtensionOperator {
+public:
+	LogicalSourceWriteExecution(TableCatalogEntry &base_table, optional_ptr<TableCatalogEntry> delta_table);
+
+	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
+	vector<ColumnBinding> GetColumnBindings() override;
+	string GetName() const override;
+	string GetExtensionName() const override;
+	bool SupportSerialization() const override {
+		return false;
+	}
+
+protected:
+	void ResolveTypes() override;
+
+private:
+	TableCatalogEntry &base_table;
+	optional_ptr<TableCatalogEntry> delta_table;
+};
+
 // Streaming plan operator that writes the rows affected by a base-table DML statement
 // to its delta table through the caller's transaction before passing the input onward.
 class LogicalTransactionalDeltaCapture : public LogicalExtensionOperator {
@@ -55,6 +96,10 @@ public:
 protected:
 	void ResolveTypes() override;
 };
+
+// Admit cached source lifecycles before their native sinks run, and acquire the
+// mutation gate for plans that capture tracked deltas. This is one plan walk.
+void AdmitPlanMutations(ClientContext &context, PhysicalOperator &op);
 
 } // namespace duckdb
 

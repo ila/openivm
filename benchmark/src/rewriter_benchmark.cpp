@@ -9,6 +9,9 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/printer.hpp"
 #include "core/openivm_extension.hpp"
+#include "core/refresh_metadata.hpp"
+#include "core/sql_utils.hpp"
+#include "benchmark_metadata.hpp"
 #include "tpcc_helpers.hpp"
 #include "tpcdi_helpers.hpp"
 
@@ -158,7 +161,7 @@ static NormalizedVerify BuildNormalizedVerify(duckdb::Connection &con, const str
 		return result;
 	}
 	for (duckdb::idx_t r = 0; r < info->RowCount(); r++) {
-		string type = info->GetValue(2, r).ToString();
+		string type = info->Collection().GetValue(2, r).ToString();
 		string cname = "c" + std::to_string(r);
 		if (!result.column_list.empty())
 			result.column_list += ", ";
@@ -187,8 +190,7 @@ static NormalizedVerify BuildNormalizedVerify(duckdb::Connection &con, const str
 // cancel rows that exist only on one side.
 static string BuildBagMismatchCountQuery(const string &left, const string &right) {
 	return "SELECT (SELECT COUNT(*) FROM ((" + left + ") EXCEPT ALL (" + right +
-	       ")) __left_diff) + (SELECT COUNT(*) FROM ((" + right + ") EXCEPT ALL (" + left +
-	       ")) __right_diff)";
+	       ")) __left_diff) + (SELECT COUNT(*) FROM ((" + right + ") EXCEPT ALL (" + left + ")) __right_diff)";
 }
 
 static string LowerASCII(string s) {
@@ -557,11 +559,23 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 		{
 			auto cur = con.Query("SELECT current_database()");
 			if (cur && !cur->HasError() && cur->RowCount() > 0) {
-				native_catalog = cur->GetValue(0, 0).ToString();
+				native_catalog = cur->Collection().GetValue(0, 0).ToString();
 			}
 		}
 		string quoted_native_catalog = duckdb::KeywordHelper::WriteOptionallyQuoted(native_catalog);
 		string native_use = "USE " + quoted_native_catalog + ".main";
+		// OpenIVM keeps control metadata in the native catalog's metadata schema
+		// (openivm_metadata_schema, main by default). Find it rather than assume main.
+		auto metadata_table = [&](const string &table) {
+			string schema = "main";
+			auto found = con.Query("SELECT schema_name FROM duckdb_tables() WHERE database_name = " +
+			                       duckdb::Value(native_catalog).ToSQLString() +
+			                       " AND table_name = 'openivm_views' ORDER BY schema_name LIMIT 1");
+			if (found && !found->HasError() && found->RowCount() > 0) {
+				schema = found->Collection().GetValue(0, 0).ToString();
+			}
+			return quoted_native_catalog + "." + duckdb::KeywordHelper::WriteOptionallyQuoted(schema) + "." + table;
+		};
 
 		// DuckLake support is only for the tpcc workload — tpcdi has no DuckLake variants.
 		bool ducklake_ok = false;
@@ -577,7 +591,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 					auto have = con.Query("SELECT COUNT(*) FROM information_schema.tables "
 					                      "WHERE table_catalog = 'dl' AND LOWER(table_name) = 'warehouse'");
 					bool needs_init = !have || have->HasError() || have->RowCount() == 0 ||
-					                  have->GetValue(0, 0).GetValue<int64_t>() == 0;
+					                  have->Collection().GetValue(0, 0).GetValue<int64_t>() == 0;
 					if (needs_init) {
 						con.Query("USE dl.main");
 						CreateTPCCSchema(con);
@@ -598,13 +612,16 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 		// DuckLake MVs (created with USE dl.main) land in dl.main.*, so we use catalog-qualified
 		// drops via information_schema which spans all catalogs.
 		{
+			// Metadata is keyed by an encoded internal key, not the SQL-facing mv_q* name. Record the
+			// leftover keys (and their data-table locations) before any DROP VIEW removes the rows.
+			auto leftover_keys = openivm_bench::ListLeftoverViews(con, native_catalog, "mv_q%");
 			// Drop views from all catalogs
 			auto leftover = con.Query("SELECT table_catalog, table_name FROM information_schema.views "
 			                          "WHERE table_name LIKE 'mv_q%' AND table_schema = 'main'");
 			if (leftover && !leftover->HasError()) {
 				for (idx_t r = 0; r < leftover->RowCount(); r++) {
-					string cat = leftover->GetValue(0, r).ToString();
-					string vn = leftover->GetValue(1, r).ToString();
+					string cat = leftover->Collection().GetValue(0, r).ToString();
+					string vn = leftover->Collection().GetValue(1, r).ToString();
 					con.Query("DROP VIEW IF EXISTS " + cat + ".main." + vn);
 				}
 			}
@@ -614,19 +631,27 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			                          "'openivm_delta_mv_q%') AND table_schema = 'main'");
 			if (orphaned && !orphaned->HasError()) {
 				for (idx_t r = 0; r < orphaned->RowCount(); r++) {
-					string cat = orphaned->GetValue(0, r).ToString();
-					string tn = orphaned->GetValue(1, r).ToString();
+					string cat = orphaned->Collection().GetValue(0, r).ToString();
+					string tn = orphaned->Collection().GetValue(1, r).ToString();
 					con.Query("DROP TABLE IF EXISTS " + cat + ".main." + tn);
 				}
 			}
-			// Clean metadata tables (always in native catalog, unqualified)
-			con.Query("DELETE FROM openivm_views WHERE view_name LIKE 'mv_q%'");
-			con.Query("DELETE FROM openivm_delta_tables WHERE view_name LIKE 'mv_q%'");
+			// A crashed child may leave encoded backing tables after its user view is gone.
+			for (auto &view : leftover_keys) {
+				con.Query("DROP TABLE IF EXISTS " +
+				          duckdb::SqlUtils::FullName(view.catalog, view.schema, "openivm_data_" + view.key));
+			}
+			// Clean orphaned metadata rows in the native catalog. Views are keyed internally;
+			// match their SQL names as well as legacy keys equal to the SQL name.
+			string orphan_views = "SELECT view_name FROM " + metadata_table("openivm_views") +
+			                      " WHERE COALESCE(view_sql_name, view_name) LIKE 'mv_q%' OR view_name LIKE 'mv_q%'";
+			con.Query("DELETE FROM " + metadata_table("openivm_delta_tables") + " WHERE view_name IN (" + orphan_views +
+			          ")");
+			con.Query("DELETE FROM " + metadata_table("openivm_views") + " WHERE view_name IN (" + orphan_views + ")");
 		}
 
 		int delta_idx = 0;
 		int delta_batch_size = 10;
-		int query_counter = 0;
 
 		while (true) {
 			uint32_t query_len = 0;
@@ -681,8 +706,9 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				query.pop_back();
 			}
 
-			query_counter++;
-			string mv_name = "mv_q" + std::to_string(query_counter);
+			// Derive the view name from the query file, not this worker's local counter.
+			// A timeout restarts the worker; a reset counter must not reuse a prior MV name.
+			string mv_name = "mv_q" + worker_query_name;
 
 			// Switch default catalog before anything else. The MV, its data
 			// table, delta view, and any deltas applied below all target the
@@ -702,10 +728,9 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			// Phase 1: DuckDB validation
 			auto start = std::chrono::steady_clock::now();
 			try {
-				auto test_query = "SELECT * FROM (" + query + ") __q LIMIT 0";
-				auto test_result = con.Query(test_query);
-				if (test_result && test_result->HasError()) {
-					error = test_result->GetError();
+				auto prepared = con.Prepare(query);
+				if (prepared->HasError()) {
+					error = prepared->GetError();
 					phase_reached = IsFatalError(error) ? PHASE_CRASH : PHASE_DUCKDB_VALIDATION_FAILED;
 				} else {
 					auto end = std::chrono::steady_clock::now();
@@ -744,15 +769,15 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						// Qualify with native_catalog so the lookup works both when the active catalog
 						// is a DuckLake catalog (USE dl.main) and when the DB is file-based (catalog
 						// name = filename, never "memory").
-						auto check_result = con.Query("SELECT type FROM " + quoted_native_catalog +
-						                              ".main.openivm_views WHERE view_name = '" + mv_name + "'");
-						if (check_result && !check_result->HasError() && check_result->RowCount() > 0) {
-							int64_t refresh_type = check_result->GetValue(0, 0).GetValue<int64_t>();
-							is_incremental = (refresh_type != 3) ? 1 : 0;
+						// openivm_views.view_name holds an encoded internal key; the SQL-facing name is in
+						// view_sql_name. Resolve the qualified identity to its key via RefreshMetadata.
+						auto lookup = openivm_bench::LookupViewType(db, con, native_catalog, mv_name);
+						if (lookup.found) {
+							is_incremental = (lookup.type != 3) ? 1 : 0;
 						} else {
 							error = "OpenIVM metadata lookup failed for " + mv_name;
-							if (check_result && check_result->HasError()) {
-								error += ": " + check_result->GetError();
+							if (!lookup.error.empty()) {
+								error += ": " + lookup.error;
 							}
 							phase_reached = PHASE_MV_CREATION_FAILED;
 						}
@@ -814,7 +839,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 							}
 							auto verify_result = con.Query(verify_query);
 							if (verify_result && !verify_result->HasError() && verify_result->RowCount() > 0) {
-								int64_t mismatch_count = verify_result->GetValue(0, 0).GetValue<int64_t>();
+								int64_t mismatch_count = verify_result->Collection().GetValue(0, 0).GetValue<int64_t>();
 								if (mismatch_count != 0 && !nv.column_list.empty()) {
 									auto window_cols = WindowOutputColumns(query, nv.normalized_columns.size());
 									if (!window_cols.empty() && window_cols.size() < nv.normalized_columns.size()) {
@@ -838,7 +863,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 										auto relaxed_result = con.Query(relaxed_query);
 										if (relaxed_result && !relaxed_result->HasError() &&
 										    relaxed_result->RowCount() > 0 &&
-										    relaxed_result->GetValue(0, 0).GetValue<int64_t>() == 0) {
+										    relaxed_result->Collection().GetValue(0, 0).GetValue<int64_t>() == 0) {
 											mismatch_count = 0;
 										}
 									}
@@ -880,7 +905,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 											for (idx_t c = 0; c < rows->ColumnCount(); c++) {
 												if (c > 0)
 													row += " | ";
-												row += rows->GetValue(c, r).ToString();
+												row += rows->Collection().GetValue(c, r).ToString();
 											}
 											fprintf(stderr, "[DIFF %s]   %s: %s\n", mv_name.c_str(), label.c_str(),
 											        row.c_str());
@@ -933,7 +958,9 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				WriteAllBytes(write_fd, error.data(), err_len);
 
 			if (phase_reached == PHASE_CRASH) {
-				_exit(1);
+				// Return through the normal stack so DuckDB can close the database and
+				// finish or roll back its current transaction before the forked worker exits.
+				return;
 			}
 		}
 	} catch (std::exception &e) {
@@ -943,7 +970,6 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 		fprintf(stderr, "Child fatal: unknown exception\n");
 		_exit(2);
 	}
-	_exit(0);
 }
 
 struct ForkWorker {
@@ -992,7 +1018,7 @@ struct ForkWorker {
 			uint32_t zero = 0;
 			WriteAllBytes(to_child_fd, &zero, sizeof(zero));
 			int status;
-			for (int i = 0; i < 4; i++) {
+			for (int i = 0; i < 100; i++) {
 				int w = waitpid(child_pid, &status, WNOHANG);
 				if (w != 0)
 					break;
@@ -1291,18 +1317,6 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 		Log("✓ Database created");
 	}
 
-	// Delete any stale WAL before the first child opens the DB. A prior run killed
-	// by SIGKILL (timeout) never flushes its WAL; if we don't clean it up now,
-	// DuckDB's WAL replay throws "DatabaseManager::GetDefaultDatabase with no default
-	// database set" and the very first query crashes before doing any work.
-	{
-		string wal_path = db_path + ".wal";
-		if (FileExists(wal_path)) {
-			Log("Removing stale WAL: " + wal_path);
-			std::remove(wal_path.c_str());
-		}
-	}
-
 	vector<string> query_files = CollectQueryFiles(queries_dir);
 	int total = static_cast<int>(query_files.size());
 	Log("Running benchmark on " + std::to_string(total) + " queries...");
@@ -1342,19 +1356,6 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 
 		uint8_t phase = worker.result_phase;
 		string error_msg = worker.result_error;
-
-		// If the child died (crash OR SIGKILL'd timeout), delete the WAL before the
-		// next child opens the DB. A SIGKILL'd child never flushes its WAL, and
-		// DuckDB's WAL replay can then fail with "Calling DatabaseManager::
-		// GetDefaultDatabase with no default database set", killing every subsequent
-		// query.
-		bool child_died = (phase == PHASE_CRASH) || (phase == PHASE_TIMEOUT);
-		if (child_died) {
-			string wal_path = db_path + ".wal";
-			if (FileExists(wal_path)) {
-				std::remove(wal_path.c_str());
-			}
-		}
 
 		// Handle crash: attribute to root-cause query if INTERNAL error preceded it
 		if (phase == PHASE_CRASH) {

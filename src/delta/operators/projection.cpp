@@ -20,15 +20,15 @@ DeltaPlanFragment CompileProjectionDelta(DeltaOperatorInput input) {
 	projection_node->expressions.emplace_back(std::move(mul_expression));
 	projection_node->types.clear();
 	for (auto &expr : projection_node->expressions) {
-		projection_node->types.push_back(expr->return_type);
+		projection_node->types.push_back(expr->GetReturnType());
 	}
 
 	const auto new_bindings = projection_node->GetColumnBindings();
 	auto new_mul_binding = new_bindings.back();
 	projection_node->Verify(input.context.input.context);
 	OPENIVM_DEBUG_PRINT("[DeltaProjection] Done, %zu expressions (including mul), mul_binding: table=%lu col=%lu\n",
-	                    projection_node->expressions.size(), (unsigned long)new_mul_binding.table_index,
-	                    (unsigned long)new_mul_binding.column_index);
+	                    projection_node->expressions.size(), (unsigned long)new_mul_binding.table_index.index,
+	                    (unsigned long)new_mul_binding.column_index.GetIndex());
 	return {std::move(projection_node), new_mul_binding};
 }
 

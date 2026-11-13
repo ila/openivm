@@ -28,7 +28,7 @@ When a referenced column is renamed, OpenIVM updates the metadata needed by futu
 - Window partition lineage, projection-key lineage, and stored group-column source mappings are rewritten.
 - The base delta table is renamed after metadata rewrite succeeds.
 
-The metadata rewrite and the delta-table `ALTER` run in the caller transaction. OpenIVM snapshots the affected `openivm_views` rows first, so rolling back the `ALTER TABLE` also restores the rewritten metadata, including metadata stored in another attached native catalog.
+When the metadata and source share a native catalog, the metadata rewrite and delta-table `ALTER` run in the caller transaction. With metadata in another catalog, column rename requires autocommit: OpenIVM snapshots the affected rows and restores them if the ALTER fails. See [metadata transaction boundaries](metadata-placement.md#explicit-transactions).
 
 ## How it works
 
@@ -52,6 +52,34 @@ Repair is only allowed when no source deltas are pending. If deltas are pending,
 
 ## Limitations
 
-- `ALTER COLUMN TYPE` (changing a column's data type) and other `ALTER TABLE` forms besides ADD/DROP/RENAME COLUMN are not handled. The delta table keeps the old type, and captured delta rows may fail to convert.
+- `RENAME TO` (renaming a table) and `ALTER COLUMN TYPE` are rejected on IVM-tracked sources before changing the source or its delta. Drop dependent materialized views before making these changes, then recreate them. Untracked tables retain normal DuckDB behavior.
 - Adding a column with a `DEFAULT` value does not backfill the delta table. Only new INSERTs after the ALTER will include the new column.
 - `SELECT *` in an existing MV does not expand to include newly added base-table columns. Use `CREATE OR REPLACE MATERIALIZED VIEW` to pick up new columns.
+
+## Native source replacement
+
+Native `CREATE OR REPLACE TABLE ... AS SELECT ...` captures the previous rows as
+retractions and the replacement rows as insertions in the caller's transaction.
+Self-reading replacements evaluate the original bound source. Empty replacements,
+`DROP TABLE` followed by compatible CTAS, and transaction rollback preserve delta
+capture. Replacement column names and types must match the retained delta schema;
+incompatible schemas fail before the source is replaced. Drop dependent MVs before
+changing the source schema, then recreate them.
+
+Generated columns retain their column identity during compilation. Signed source
+deltas store their evaluated values, so a replacement can turn a generated column
+into a physical column, or change its generated expression, without reinterpreting
+pending old-row retractions. An explicit expression such as `v * 2` in the MV
+remains that expression; it does not become a reference to a generated column with
+an equivalent definition. Replacement columns may be reordered: delta scans map
+columns by name rather than assuming the source and delta have identical ordinals.
+
+MVs compiled by older versions retain their stored, expanded expressions. Recreate
+those generated-column MVs from their original definitions to adopt this boundary;
+the expanded SQL cannot distinguish a former column reference from an explicitly
+written expression.
+
+The same boundary applies through ordinary SQL views and scalar subqueries inside
+`VALUES`. Views retain their own catalog/schema search path and CTE scope, and
+source column aliases such as `FROM source AS s(a, b, c)` preserve the underlying
+column identities.

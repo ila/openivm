@@ -7,7 +7,7 @@ require openivm
 require parquet
 
 statement ok
-INSTALL ducklake;
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository';
 
 statement ok
 LOAD ducklake;
@@ -174,6 +174,129 @@ SELECT COUNT(*) FROM (
     SELECT id, score, category FROM dl.hot_events
     EXCEPT ALL
     SELECT id, score, category FROM dl.events WHERE score > 50
+);
+----
+0
+
+# DuckDB 2.0 flattens these scalar and quantified subquery filters. A single
+# refresh must account for changes on both sides of each comparison.
+statement ok
+CREATE TABLE dl.subquery_input (id INT, score INT, category VARCHAR);
+
+statement ok
+INSERT INTO dl.subquery_input VALUES (1, 10, 'A'), (2, 20, 'B'), (3, 30, 'A'), (4, 40, 'B');
+
+statement ok
+CREATE TABLE dl.subquery_threshold (category VARCHAR, cutoff INT);
+
+statement ok
+INSERT INTO dl.subquery_threshold VALUES ('A', 15), ('B', 25);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.subquery_scalar AS
+    SELECT id, score FROM dl.subquery_input
+    WHERE score > (SELECT AVG(score) FROM dl.subquery_input);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.subquery_joined AS
+    SELECT s.id, s.score FROM dl.subquery_input s
+    JOIN dl.subquery_threshold t ON s.category = t.category
+    WHERE t.cutoff > (SELECT AVG(cutoff) FROM dl.subquery_threshold);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.subquery_any AS
+    SELECT id, score FROM dl.subquery_input
+    WHERE score > ANY (SELECT score FROM dl.subquery_input WHERE category = 'B');
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_sql_name IN
+    ('subquery_scalar', 'subquery_joined', 'subquery_any') AND type <> 3;
+----
+3
+
+statement ok
+UPDATE dl.subquery_input SET score = 45 WHERE id = 1;
+
+statement ok
+DELETE FROM dl.subquery_input WHERE id = 2;
+
+statement ok
+INSERT INTO dl.subquery_input VALUES (5, 5, 'B'), (6, 50, 'A');
+
+statement ok
+UPDATE dl.subquery_threshold SET cutoff = 40 WHERE category = 'A';
+
+statement ok
+DELETE FROM dl.subquery_threshold WHERE category = 'B';
+
+statement ok
+INSERT INTO dl.subquery_threshold VALUES ('B', 60);
+
+statement ok
+PRAGMA refresh('subquery_scalar');
+
+statement ok
+PRAGMA refresh('subquery_joined');
+
+statement ok
+PRAGMA refresh('subquery_any');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, score FROM dl.subquery_scalar
+    EXCEPT ALL
+    SELECT id, score FROM dl.subquery_input WHERE score > (SELECT AVG(score) FROM dl.subquery_input)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, score FROM dl.subquery_input WHERE score > (SELECT AVG(score) FROM dl.subquery_input)
+    EXCEPT ALL
+    SELECT id, score FROM dl.subquery_scalar
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, score FROM dl.subquery_joined
+    EXCEPT ALL
+    SELECT s.id, s.score FROM dl.subquery_input s
+    JOIN dl.subquery_threshold t ON s.category = t.category
+    WHERE t.cutoff > (SELECT AVG(cutoff) FROM dl.subquery_threshold)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s.id, s.score FROM dl.subquery_input s
+    JOIN dl.subquery_threshold t ON s.category = t.category
+    WHERE t.cutoff > (SELECT AVG(cutoff) FROM dl.subquery_threshold)
+    EXCEPT ALL
+    SELECT id, score FROM dl.subquery_joined
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, score FROM dl.subquery_any
+    EXCEPT ALL
+    SELECT id, score FROM dl.subquery_input
+    WHERE score > ANY (SELECT score FROM dl.subquery_input WHERE category = 'B')
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, score FROM dl.subquery_input
+    WHERE score > ANY (SELECT score FROM dl.subquery_input WHERE category = 'B')
+    EXCEPT ALL
+    SELECT id, score FROM dl.subquery_any
 );
 ----
 0

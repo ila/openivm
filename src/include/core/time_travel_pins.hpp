@@ -21,6 +21,10 @@ namespace openivm {
 // snapshot is indistinguishable from an unpinned scan in the bound plan.
 class TimeTravelPins {
 public:
+	// Persist each public relation's identity while the CREATE caller's search path is active.
+	// Edit only identifier spans in the original SQL; retain its expressions and snapshot clauses.
+	static string QualifySources(ClientContext &context, const string &sql);
+
 	// Record relation -> qualifier, peeling only unbindable pins out of `statement`. Throws when a
 	// relation cannot be given one unambiguous pin (two different pins, or pinned in one scan and
 	// unpinned in another), because re-attaching by relation would conflate the two.

@@ -99,12 +99,13 @@ INSERT INTO ccfk_fact VALUES (12, 3, 300);
 statement ok
 PRAGMA openivm_declare_rely_fk('ccfk_fact', 'product_id', 'ccfk_dim', 'product_id');
 
-query TTTTTI
-SELECT table_name, constraint_kind, columns_json, referenced_table, referenced_columns_json, is_trusted
+query ITTITI
+SELECT table_name = current_database() || '.main.ccfk_fact', constraint_kind, columns_json,
+       referenced_table = current_database() || '.main.ccfk_dim', referenced_columns_json, is_trusted
 FROM openivm_constraints_cache
-WHERE table_name = 'ccfk_fact';
+WHERE table_name = current_database() || '.main.ccfk_fact';
 ----
-ccfk_fact	RELY_FK	["product_id"]	ccfk_dim	["product_id"]	true
+true	RELY_FK	["product_id"]	true	["product_id"]	true
 
 statement ok
 CREATE TABLE ccfk_refresh_sql AS

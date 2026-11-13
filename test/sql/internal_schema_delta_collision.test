@@ -1,0 +1,144 @@
+# name: test/sql/internal_schema_delta_collision.test
+# description: Moved and colocated source deltas with colliding preferred names retain distinct ownership
+# group: [sql]
+
+require openivm
+
+load __TEST_DIR__/openivm_internal_schema_delta_collision.db
+
+statement ok
+CREATE SCHEMA s1;
+
+foreach first_view,first_source,second_view,second_source,second_schema main.colocated_totals,main."7331_items",s1.moved_totals,s1.items,s1 s1.moved_totals,s1.items,main.colocated_totals,main."7331_items",main
+
+# Both allocation orders retain legacy ownership, reuse, replacement, and cleanup.
+
+statement ok
+SET openivm_internal_schema = 'main';
+
+statement ok
+CREATE TABLE main."7331_items" (id INTEGER, amount INTEGER);
+
+statement ok
+CREATE TABLE s1.items (id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO main."7331_items" VALUES (1,100),(1,100),(2,200),(3,300);
+
+statement ok
+INSERT INTO s1.items VALUES (1,10),(1,10),(2,20),(3,30);
+
+statement ok
+CREATE MATERIALIZED VIEW ${first_view} AS SELECT id, SUM(amount) AS total, COUNT(*) AS cnt FROM ${first_source} GROUP BY id;
+
+# Emulate metadata written before physical names were stored.
+
+statement ok
+UPDATE main.openivm_delta_tables SET delta_table_name = NULL;
+
+statement ok
+CREATE MATERIALIZED VIEW ${second_view} AS SELECT id, SUM(amount) AS total, COUNT(*) AS cnt FROM ${second_source} GROUP BY id;
+
+query I
+SELECT count(DISTINCT coalesce(delta_schema, source_schema) || '.' || coalesce(delta_table_name, 'openivm_delta_7331_items')) FROM main.openivm_delta_tables;
+----
+2
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'main' AND starts_with(table_name, 'openivm_delta_7331_items');
+----
+2
+
+# Reject a legacy/corrupt ownership row that aliases another source's physical delta.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE main.openivm_delta_tables SET delta_table_name = 'openivm_delta_7331_items' WHERE source_schema = '${second_schema}';
+
+statement error
+CREATE MATERIALIZED VIEW ${second_schema}.invalid_reference AS SELECT id, amount FROM ${second_source};
+----
+assigned to multiple sources
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM main.openivm_views;
+----
+2
+
+statement ok
+CREATE MATERIALIZED VIEW s1.joined_items AS SELECT a.id, a.amount AS moved_amount, b.amount AS colocated_amount FROM s1.items a JOIN main."7331_items" b USING (id);
+
+query II
+SELECT view_sql_name, type FROM main.openivm_views ORDER BY view_sql_name;
+----
+colocated_totals	0
+joined_items	2
+moved_totals	0
+
+# Reopen loses the placement setting; ownership and physical names must survive.
+restart
+
+statement ok
+SET search_path = 's1,main';
+
+statement ok
+INSERT INTO main."7331_items" VALUES (4,400),(4,400),(5,500),(1,100);
+
+statement ok
+DELETE FROM main."7331_items" WHERE id IN (2,5);
+
+statement ok
+UPDATE main."7331_items" SET amount = amount + 100 WHERE id IN (1,4);
+
+statement ok
+INSERT INTO s1.items VALUES (4,40),(4,40),(5,50),(1,10);
+
+statement ok
+DELETE FROM s1.items WHERE id IN (2,5);
+
+statement ok
+UPDATE s1.items SET amount = amount + 10 WHERE id IN (1,4);
+
+statement ok
+PRAGMA refresh('main.colocated_totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.colocated_totals EXCEPT ALL SELECT id, SUM(amount) AS total, COUNT(*) AS cnt FROM main."7331_items" GROUP BY id) UNION ALL (SELECT id, SUM(amount) AS total, COUNT(*) AS cnt FROM main."7331_items" GROUP BY id EXCEPT ALL SELECT * FROM main.colocated_totals));
+----
+0
+
+statement ok
+PRAGMA refresh('s1.moved_totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.moved_totals EXCEPT ALL SELECT id, SUM(amount) AS total, COUNT(*) AS cnt FROM s1.items GROUP BY id) UNION ALL (SELECT id, SUM(amount) AS total, COUNT(*) AS cnt FROM s1.items GROUP BY id EXCEPT ALL SELECT * FROM s1.moved_totals));
+----
+0
+
+statement ok
+PRAGMA refresh('s1.joined_items');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.joined_items EXCEPT ALL SELECT a.id, a.amount AS moved_amount, b.amount AS colocated_amount FROM s1.items a JOIN main."7331_items" b USING (id)) UNION ALL (SELECT a.id, a.amount AS moved_amount, b.amount AS colocated_amount FROM s1.items a JOIN main."7331_items" b USING (id) EXCEPT ALL SELECT * FROM s1.joined_items));
+----
+0
+
+statement ok
+DROP VIEW s1.joined_items;
+
+statement ok
+DROP VIEW main.colocated_totals;
+DROP VIEW s1.moved_totals;
+DROP TABLE main."7331_items";
+DROP TABLE s1.items;
+
+query I
+SELECT count(*) FROM main.openivm_source_deltas;
+----
+0
+
+endloop

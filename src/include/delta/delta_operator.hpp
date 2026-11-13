@@ -7,29 +7,32 @@
 
 namespace duckdb {
 
-enum class DeltaOperatorStrategy {
-	SCAN_DELTA,
-	FILTER_LINEAR,
-	FILTER_HAVING_STRIP,
-	PROJECTION_APPEND_MULTIPLICITY,
-	AGGREGATE_GROUP_BY_MULTIPLICITY,
-	JOIN_INCLUSION_EXCLUSION,
-	JOIN_REGULAR_N_TERM,
-	JOIN_DUCKLAKE_N_TERM,
-	DELIM_JOIN_INCLUSION_EXCLUSION,
-	UNION_ALL_LINEAR,
-	DISTINCT_COUNT_AGGREGATE,
-	WINDOW_PASSTHROUGH,
-	TOPK_STRIP,
-	CTE_MATERIALIZED,
-	CTE_REF,
-	UNNEST_LINEAR,
-	CONSTANT_ZERO_DELTA,
-	CONSTANT_STATIC,
-	ASOF_AFFECTED_RECOMPUTE,
-	POSITIONAL_GLOBAL_RECOMPUTE,
-	SAMPLE_GLOBAL_RECOMPUTE
-};
+#define OPENIVM_DELTA_OPERATOR_STRATEGIES(X)                                                                           \
+	X(SCAN_DELTA)                                                                                                      \
+	X(FILTER_LINEAR)                                                                                                   \
+	X(FILTER_HAVING_STRIP)                                                                                             \
+	X(PROJECTION_APPEND_MULTIPLICITY)                                                                                  \
+	X(AGGREGATE_GROUP_BY_MULTIPLICITY)                                                                                 \
+	X(JOIN_INCLUSION_EXCLUSION)                                                                                        \
+	X(JOIN_REGULAR_N_TERM)                                                                                             \
+	X(JOIN_DUCKLAKE_N_TERM)                                                                                            \
+	X(DELIM_JOIN_INCLUSION_EXCLUSION)                                                                                  \
+	X(UNION_ALL_LINEAR)                                                                                                \
+	X(DISTINCT_COUNT_AGGREGATE)                                                                                        \
+	X(WINDOW_PASSTHROUGH)                                                                                              \
+	X(TOPK_STRIP)                                                                                                      \
+	X(CTE_MATERIALIZED)                                                                                                \
+	X(CTE_REF)                                                                                                         \
+	X(UNNEST_LINEAR)                                                                                                   \
+	X(CONSTANT_ZERO_DELTA)                                                                                             \
+	X(CONSTANT_STATIC)                                                                                                 \
+	X(ASOF_AFFECTED_RECOMPUTE)                                                                                         \
+	X(POSITIONAL_GLOBAL_RECOMPUTE)                                                                                     \
+	X(SAMPLE_GLOBAL_RECOMPUTE)
+
+#define OPENIVM_DELTA_OPERATOR_STRATEGY_ENTRY(name) name,
+enum class DeltaOperatorStrategy { OPENIVM_DELTA_OPERATOR_STRATEGIES(OPENIVM_DELTA_OPERATOR_STRATEGY_ENTRY) };
+#undef OPENIVM_DELTA_OPERATOR_STRATEGY_ENTRY
 
 struct DeltaOperatorInput {
 	DeltaOperatorInput(DeltaCompileContext &context_, unique_ptr<LogicalOperator> &plan_, LogicalOperator *&root_,
@@ -56,12 +59,11 @@ struct DeltaOperatorInput {
 	const LogicalType mul_type = LogicalType::INTEGER;
 };
 
-const char *DeltaOperatorStrategyName(DeltaOperatorStrategy strategy);
 void LogDeltaOperatorStrategy(const DeltaOperatorInput &input, DeltaOperatorStrategy strategy);
 
-DeltaPlanFragment CompileDeltaOperatorWithModel(const DeltaOperatorInput &input, const DeltaModelNode &node);
-DeltaPlanFragment CompileCopiedDeltaSubtree(DeltaOperatorInput input);
-DeltaPlanFragment CompileNonModelLeaf(DeltaOperatorInput input);
+// Dispatches to the operator handler for `kind`. A CONSTANT leaf compiles to a static leaf inside a copied subtree and
+// to a zero delta otherwise.
+DeltaPlanFragment CompileDeltaOperatorByKind(const DeltaOperatorInput &input, DeltaModelNodeKind kind);
 
 DeltaPlanFragment CompileScanDelta(DeltaOperatorInput input);
 DeltaPlanFragment CompileFilterDelta(DeltaOperatorInput input);

@@ -5,14 +5,28 @@
 
 namespace duckdb {
 namespace openivm {
+constexpr const char *SOURCE_GENERATIONS_TABLE = "openivm_source_generations";
+static constexpr const char *SOURCE_DELTA_MAP_TABLE = "openivm_source_deltas";
 constexpr const char *RUNNING_INPUT_PREFIX = "openivm_running_";
 constexpr const char *ROWS_POSITION_PREFIX = "openivm_rows_position_";
+
+// Schema for control metadata. Unset keeps each catalog's existing metadata schema (main for new metadata).
+constexpr const char *METADATA_SCHEMA_SETTING = "openivm_metadata_schema";
+// Schema for internal maintenance tables within each data catalog. Unset keeps them beside
+// the materialized view and its sources. Applies to objects created while it is set.
+constexpr const char *INTERNAL_SCHEMA_SETTING = "openivm_internal_schema";
 
 // System table names
 constexpr const char *VIEWS_TABLE = "openivm_views";
 constexpr const char *DELTA_TABLES_TABLE = "openivm_delta_tables";
 constexpr const char *HISTORY_TABLE = "openivm_refresh_history";
 constexpr const char *PROFILE_TABLE = "openivm_refresh_profile";
+// Compiled CREATE/REFRESH SQL archive: one row per distinct program version, and
+// that version's statements in execution order.
+constexpr const char *COMPILED_PROGRAMS_TABLE = "openivm_compiled_programs";
+constexpr const char *COMPILED_STATEMENTS_TABLE = "openivm_compiled_statements";
+
+constexpr const char *REFRESH_HOOKS_TABLE = "openivm_refresh_hooks";
 
 // View-matching system tables.
 constexpr const char *MV_DEPS_TABLE = "openivm_mv_dependencies";
@@ -31,6 +45,7 @@ constexpr const char *VISIBLE_TABLE_PREFIX = "openivm_visible_";
 // Internal column names (added by IVM plan rewrites, hidden from users via VIEW)
 constexpr const char *LEFT_KEY_COL = "openivm_left_key";
 constexpr const char *RIGHT_KEY_COL = "openivm_right_key";
+constexpr const char *FULL_SCOPE_PREFIX = "openivm_full_scope_";
 constexpr const char *PUBLISHED_ORDINAL_COL = "openivm_ordinal";
 constexpr const char *SORT_VALUE_PREFIX = "openivm_sort_value_";
 constexpr const char *DISTINCT_COUNT_COL = "openivm_distinct_count";
@@ -87,7 +102,11 @@ constexpr const char *DISABLED_OPTIMIZERS = TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;
 // recurses through OpenIVM's chained CTE/subquery expansions (N-term telescoping over many tables)
 // and overflows the optimizer; the generated plan is already explicitly decorrelated so it has no
 // DELIM joins to eliminate. Pure robustness guard — not flag-gated.
-constexpr const char *REFRESH_DISABLED_OPTIMIZERS = "deliminator";
+// DuckDB 2.0's join-filter pushdown can install a Bloom filter whose selected
+// row indexes exceed the compact hash-vector capacity during generated
+// maintenance joins (notably Top-K publication diffs). Keep it out of refresh
+// execution until the native selection/capacity mismatch is fixed upstream.
+constexpr const char *REFRESH_DISABLED_OPTIMIZERS = "deliminator,join_filter_pushdown";
 
 // Timestamp::GetCurrentTimestamp() (used by transactional delta capture) is UTC. Casting now()
 // from TIMESTAMPTZ to TIMESTAMP applies the session time zone, so use an epoch round-trip for all
@@ -112,6 +131,13 @@ enum class RefreshType : uint8_t {
 	SEMI_ANTI_RECOMPUTE = 9,  // SEMI/ANTI join aux state: per-left-tuple match counts, transition-scoped MV updates
 	COUNT_DISTINCT_INCREMENTAL = 11 // COUNT(DISTINCT x) with per-(group,x) multiplicity aux state
 };
+
+// Persisted by name (index into the *_NAMES arrays) in openivm_views JSON metadata.
+enum class SemiAntiJoinType : uint8_t { SEMI, ANTI };
+constexpr const char *SEMI_ANTI_JOIN_TYPE_NAMES[] = {"semi", "anti"};
+// A window partition key read directly from a source, or through a lookup join.
+enum class WindowLineageKind : uint8_t { DIRECT, LOOKUP };
+constexpr const char *WINDOW_LINEAGE_KIND_NAMES[] = {"direct", "lookup"};
 
 inline bool IsValidRefreshTypeOrdinal(int64_t raw) {
 	return (raw >= 0 && raw <= 9) || raw == 11;

@@ -1503,6 +1503,14 @@ SELECT count(*) FROM ((SELECT * FROM cross_catalog_join EXCEPT ALL SELECT a.id,a
 ----
 0
 
+# The source delta lives in another native catalog than the metadata, so its cleanup is
+# deferred to the commit of the refresh's data transaction. With a single consumer that
+# consumed every row, nothing is left behind.
+query I
+SELECT count(*) FROM source_other.openivm_delta_cross_catalog_source;
+----
+0
+
 # An external source delta shared with a slower consumer must survive cleanup.
 statement ok
 CREATE MATERIALIZED VIEW cross_catalog_copy AS SELECT * FROM source_other.cross_catalog_source;

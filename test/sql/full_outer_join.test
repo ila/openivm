@@ -7,6 +7,767 @@ require openivm
 statement ok
 SET openivm_cascade_refresh = 'off';
 
+# Replacement scopes evaluate whole join inputs, including keys spanning
+# multiple sources and SQL operators in normalized string keys.
+
+statement ok
+CREATE TABLE rel_scope_a(id INT,k INT);
+
+statement ok
+CREATE TABLE rel_scope_b(k INT);
+
+statement ok
+CREATE TABLE rel_scope_d(k INT,v INT);
+
+statement ok
+CREATE TABLE rel_scope_e(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO rel_scope_a VALUES (1,1),(2,2),(3,3);
+
+statement ok
+INSERT INTO rel_scope_b VALUES (1),(2),(4);
+
+statement ok
+INSERT INTO rel_scope_d VALUES (1,2),(2,3),(4,4);
+
+statement ok
+INSERT INTO rel_scope_e VALUES (0,'default'),(2,'old'),(3,'kept'),(4,'four'),(99,'unrelated');
+
+statement ok
+CREATE VIEW expected_rel_scope AS WITH p AS (SELECT a.id,COALESCE(a.k,b.k) AS k FROM rel_scope_a a FULL JOIN rel_scope_b b ON a.k=b.k), q AS (SELECT p.id,COALESCE(d.v,0) AS next_key FROM p FULL JOIN rel_scope_d d ON p.k=d.k) SELECT q.id,e.label FROM q FULL JOIN rel_scope_e e ON q.next_key=e.k;
+
+statement ok
+CREATE MATERIALIZED VIEW rel_scope AS WITH p AS (SELECT a.id,COALESCE(a.k,b.k) AS k FROM rel_scope_a a FULL JOIN rel_scope_b b ON a.k=b.k), q AS (SELECT p.id,COALESCE(d.v,0) AS next_key FROM p FULL JOIN rel_scope_d d ON p.k=d.k) SELECT q.id,e.label FROM q FULL JOIN rel_scope_e e ON q.next_key=e.k;
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM rel_scope) EXCEPT ALL (SELECT * FROM expected_rel_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_rel_scope) EXCEPT ALL (SELECT * FROM rel_scope));
+----
+0
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='rel_scope';
+----
+2
+
+statement ok
+UPDATE rel_scope_d SET v=9 WHERE k=1;
+
+statement ok
+INSERT INTO rel_scope_d VALUES (1,9);
+
+statement ok
+DELETE FROM rel_scope_d WHERE k=1;
+
+statement ok
+PRAGMA refresh('rel_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM rel_scope) EXCEPT ALL (SELECT * FROM expected_rel_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_rel_scope) EXCEPT ALL (SELECT * FROM rel_scope));
+----
+0
+
+statement ok
+INSERT INTO rel_scope_d VALUES (1,4),(1,4);
+
+statement ok
+UPDATE rel_scope_b SET k=5 WHERE k=2;
+
+statement ok
+INSERT INTO rel_scope_b VALUES (2);
+
+statement ok
+UPDATE rel_scope_a SET k=4 WHERE id=3;
+
+statement ok
+UPDATE rel_scope_e SET label='new_default' WHERE k=0;
+
+statement ok
+PRAGMA refresh('rel_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM rel_scope) EXCEPT ALL (SELECT * FROM expected_rel_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_rel_scope) EXCEPT ALL (SELECT * FROM rel_scope));
+----
+0
+
+statement ok
+UPDATE rel_scope_d SET v=8 WHERE k=1;
+
+statement ok
+DELETE FROM rel_scope_d WHERE k=1 OR k=4;
+
+statement ok
+DELETE FROM rel_scope_a WHERE id=1;
+
+statement ok
+INSERT INTO rel_scope_a VALUES (1,5);
+
+statement ok
+INSERT INTO rel_scope_d VALUES (5,2);
+
+statement ok
+PRAGMA refresh('rel_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM rel_scope) EXCEPT ALL (SELECT * FROM expected_rel_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_rel_scope) EXCEPT ALL (SELECT * FROM rel_scope));
+----
+0
+
+statement ok
+CREATE TABLE concat_scope_a(id INT,s VARCHAR);
+
+statement ok
+CREATE TABLE concat_scope_b(k VARCHAR,v INT);
+
+statement ok
+CREATE TABLE concat_scope_d(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO concat_scope_a VALUES (1,'a'),(2,NULL);
+
+statement ok
+INSERT INTO concat_scope_b VALUES ('ax',2),('x',3);
+
+statement ok
+INSERT INTO concat_scope_d VALUES (0,'default'),(2,'old'),(3,'new');
+
+statement ok
+CREATE VIEW expected_concat_scope AS WITH n AS (SELECT id,COALESCE(s,'') || 'x' AS nk FROM concat_scope_a), p AS (SELECT n.id,COALESCE(b.v,0) AS lookup_key FROM n FULL JOIN concat_scope_b b ON n.nk=b.k) SELECT p.id,d.label FROM p FULL JOIN concat_scope_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW concat_scope AS WITH n AS (SELECT id,COALESCE(s,'') || 'x' AS nk FROM concat_scope_a), p AS (SELECT n.id,COALESCE(b.v,0) AS lookup_key FROM n FULL JOIN concat_scope_b b ON n.nk=b.k) SELECT p.id,d.label FROM p FULL JOIN concat_scope_d d ON p.lookup_key=d.k;
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM concat_scope) EXCEPT ALL (SELECT * FROM expected_concat_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_concat_scope) EXCEPT ALL (SELECT * FROM concat_scope));
+----
+0
+
+statement ok
+UPDATE concat_scope_b SET v=9 WHERE k='ax';
+
+statement ok
+INSERT INTO concat_scope_b VALUES ('ax',9);
+
+statement ok
+DELETE FROM concat_scope_b WHERE v=9;
+
+statement ok
+INSERT INTO concat_scope_b VALUES ('ax',3);
+
+statement ok
+PRAGMA refresh('concat_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM concat_scope) EXCEPT ALL (SELECT * FROM expected_concat_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_concat_scope) EXCEPT ALL (SELECT * FROM concat_scope));
+----
+0
+
+statement ok
+UPDATE concat_scope_b SET v=9 WHERE k='ax';
+
+statement ok
+INSERT INTO concat_scope_b VALUES ('ax',9);
+
+statement ok
+DELETE FROM concat_scope_b WHERE k='ax';
+
+statement ok
+PRAGMA refresh('concat_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM concat_scope) EXCEPT ALL (SELECT * FROM expected_concat_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_concat_scope) EXCEPT ALL (SELECT * FROM concat_scope));
+----
+0
+
+statement ok
+INSERT INTO concat_scope_b VALUES ('ax',2),('ax',2);
+
+statement ok
+UPDATE concat_scope_a SET s='a' WHERE id=2;
+
+statement ok
+UPDATE concat_scope_d SET label='changed' WHERE k=2;
+
+statement ok
+PRAGMA refresh('concat_scope');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM concat_scope) EXCEPT ALL (SELECT * FROM expected_concat_scope));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_concat_scope) EXCEPT ALL (SELECT * FROM concat_scope));
+----
+0
+
+# Computed inner join keys must survive source-lineage discovery. Both aliases
+# and COALESCE on either input retain NULL-padding replacement keys.
+
+statement ok
+CREATE TABLE scalar_padding_a(id INT,k INT);
+
+statement ok
+CREATE TABLE scalar_padding_b(k INT,v INT);
+
+statement ok
+CREATE TABLE scalar_padding_d(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO scalar_padding_a VALUES (1,NULL),(2,0),(3,3),(4,1),(5,1);
+
+statement ok
+INSERT INTO scalar_padding_b VALUES (0,2),(NULL,2),(3,3),(1,6);
+
+statement ok
+INSERT INTO scalar_padding_d VALUES (0,'default'),(2,'old'),(3,'kept'),(6,'six'),(99,'unrelated');
+
+statement ok
+CREATE VIEW expected_scalar_padding AS
+WITH normalized AS (SELECT id,COALESCE(k,0) AS nk FROM scalar_padding_a), p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM normalized a FULL JOIN scalar_padding_b b ON a.nk=b.k) SELECT p.id,d.label FROM p FULL JOIN scalar_padding_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW scalar_padding AS
+WITH normalized AS (SELECT id,COALESCE(k,0) AS nk FROM scalar_padding_a), p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM normalized a FULL JOIN scalar_padding_b b ON a.nk=b.k) SELECT p.id,d.label FROM p FULL JOIN scalar_padding_d d ON p.lookup_key=d.k;
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scalar_padding) EXCEPT ALL (SELECT * FROM expected_scalar_padding));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding) EXCEPT ALL (SELECT * FROM scalar_padding));
+----
+0
+
+statement ok
+CREATE VIEW expected_scalar_padding_mirror AS
+WITH normalized AS (SELECT id,COALESCE(k,0) AS nk FROM scalar_padding_a), normalized_b AS (SELECT COALESCE(k,0) AS nk,v FROM scalar_padding_b), p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM normalized_b b FULL JOIN normalized a ON b.nk=a.nk) SELECT p.id,d.label FROM scalar_padding_d d FULL JOIN p ON d.k=p.lookup_key;
+
+statement ok
+CREATE MATERIALIZED VIEW scalar_padding_mirror AS
+WITH normalized AS (SELECT id,COALESCE(k,0) AS nk FROM scalar_padding_a), normalized_b AS (SELECT COALESCE(k,0) AS nk,v FROM scalar_padding_b), p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM normalized_b b FULL JOIN normalized a ON b.nk=a.nk) SELECT p.id,d.label FROM scalar_padding_d d FULL JOIN p ON d.k=p.lookup_key;
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scalar_padding_mirror) EXCEPT ALL (SELECT * FROM expected_scalar_padding_mirror));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding_mirror) EXCEPT ALL (SELECT * FROM scalar_padding_mirror));
+----
+0
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_sql_name IN ('scalar_padding','scalar_padding_mirror') AND type=2;
+----
+2
+
+statement ok
+UPDATE scalar_padding_b SET v=9 WHERE k=0;
+
+statement ok
+INSERT INTO scalar_padding_b VALUES (0,9);
+
+statement ok
+DELETE FROM scalar_padding_b WHERE k=0 OR k IS NULL;
+
+statement ok
+PRAGMA refresh('scalar_padding');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scalar_padding) EXCEPT ALL (SELECT * FROM expected_scalar_padding));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding) EXCEPT ALL (SELECT * FROM scalar_padding));
+----
+0
+
+statement ok
+PRAGMA refresh('scalar_padding_mirror');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scalar_padding_mirror) EXCEPT ALL (SELECT * FROM expected_scalar_padding_mirror));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding_mirror) EXCEPT ALL (SELECT * FROM scalar_padding_mirror));
+----
+0
+
+statement ok
+INSERT INTO scalar_padding_b VALUES (0,2),(0,2),(NULL,7);
+
+statement ok
+UPDATE scalar_padding_a SET k=0 WHERE id=3;
+
+statement ok
+UPDATE scalar_padding_d SET label='new_default' WHERE k=0;
+
+statement ok
+INSERT INTO scalar_padding_b VALUES (4,9);
+
+statement ok
+DELETE FROM scalar_padding_b WHERE k=4;
+
+statement ok
+PRAGMA refresh('scalar_padding');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scalar_padding) EXCEPT ALL (SELECT * FROM expected_scalar_padding));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding) EXCEPT ALL (SELECT * FROM scalar_padding));
+----
+0
+
+statement ok
+PRAGMA refresh('scalar_padding_mirror');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scalar_padding_mirror) EXCEPT ALL (SELECT * FROM expected_scalar_padding_mirror));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding_mirror) EXCEPT ALL (SELECT * FROM scalar_padding_mirror));
+----
+0
+
+statement ok
+UPDATE scalar_padding_b SET v=8 WHERE k=0;
+
+statement ok
+DELETE FROM scalar_padding_b WHERE k=0;
+
+statement ok
+INSERT INTO scalar_padding_b VALUES (0,4);
+
+statement ok
+DELETE FROM scalar_padding_a WHERE id=2;
+
+statement ok
+INSERT INTO scalar_padding_a VALUES (2,NULL);
+
+statement ok
+INSERT INTO scalar_padding_d VALUES (4,'four'),(7,'seven');
+
+statement ok
+PRAGMA refresh('scalar_padding');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scalar_padding) EXCEPT ALL (SELECT * FROM expected_scalar_padding));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding) EXCEPT ALL (SELECT * FROM scalar_padding));
+----
+0
+
+statement ok
+PRAGMA refresh('scalar_padding_mirror');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scalar_padding_mirror) EXCEPT ALL (SELECT * FROM expected_scalar_padding_mirror));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_scalar_padding_mirror) EXCEPT ALL (SELECT * FROM scalar_padding_mirror));
+----
+0
+
+# A downstream FULL JOIN key changes when an inner FULL JOIN loses its last
+# match. Both the old key and the NULL-extended replacement key need refresh.
+statement ok
+CREATE TABLE padding_a(id INT,k INT);
+
+statement ok
+CREATE TABLE padding_b(k INT,v INT);
+
+statement ok
+CREATE TABLE padding_d(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO padding_a VALUES (1,1),(3,3),(NULL,NULL);
+
+statement ok
+INSERT INTO padding_b VALUES (1,2),(3,3),(NULL,4);
+
+statement ok
+INSERT INTO padding_d VALUES (0,'default'),(2,'old'),(3,'kept'),(99,'unrelated');
+
+statement ok
+CREATE VIEW expected_padding_full AS
+WITH p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM padding_a a FULL JOIN padding_b b ON a.k=b.k)
+SELECT p.id,d.label FROM p FULL JOIN padding_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW padding_full AS
+WITH p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM padding_a a FULL JOIN padding_b b ON a.k=b.k)
+SELECT p.id,d.label FROM p FULL JOIN padding_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW padding_full_mirror AS
+WITH p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM padding_b b FULL JOIN padding_a a ON b.k=a.k)
+SELECT p.id,d.label FROM padding_d d FULL JOIN p ON d.k=p.lookup_key;
+
+statement ok
+CREATE VIEW expected_padding_left AS
+WITH p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM padding_a a LEFT JOIN padding_b b ON a.k=b.k)
+SELECT p.id,d.label FROM p FULL JOIN padding_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW padding_left_inner AS
+WITH p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM padding_a a LEFT JOIN padding_b b ON a.k=b.k)
+SELECT p.id,d.label FROM p FULL JOIN padding_d d ON p.lookup_key=d.k;
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_sql_name IN ('padding_full','padding_full_mirror','padding_left_inner') AND type=2;
+----
+3
+
+query T
+SELECT string_agg(column_name,',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name='padding_full';
+----
+id,label
+
+# Pin a reader so checkpoints cannot renumber row IDs during the scope check.
+statement ok padding_snapshot
+BEGIN;
+
+statement ok padding_snapshot
+SELECT COUNT(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_70616464696e675f66756c6c_;
+
+statement ok
+CREATE TABLE padding_untouched AS SELECT rowid FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_70616464696e675f66756c6c_ WHERE label='unrelated';
+
+statement ok
+UPDATE padding_b SET v=9 WHERE k=1;
+
+statement ok
+INSERT INTO padding_b VALUES (1,9);
+
+statement ok
+DELETE FROM padding_b WHERE k=1;
+
+statement ok
+PRAGMA refresh('padding_full');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM padding_full) EXCEPT ALL (SELECT * FROM expected_padding_full));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_padding_full) EXCEPT ALL (SELECT * FROM padding_full));
+----
+0
+
+statement ok
+PRAGMA refresh('padding_full_mirror');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM padding_full_mirror) EXCEPT ALL (SELECT * FROM expected_padding_full));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_padding_full) EXCEPT ALL (SELECT * FROM padding_full_mirror));
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT rowid FROM padding_untouched EXCEPT ALL SELECT rowid FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_70616464696e675f66756c6c_ WHERE label='unrelated');
+----
+0
+
+statement ok
+PRAGMA refresh('padding_left_inner');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM padding_left_inner) EXCEPT ALL (SELECT * FROM expected_padding_left));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_padding_left) EXCEPT ALL (SELECT * FROM padding_left_inner));
+----
+0
+
+statement ok padding_snapshot
+COMMIT;
+
+statement ok
+INSERT INTO padding_b VALUES (1,2),(1,2),(NULL,7);
+
+statement ok
+UPDATE padding_a SET k=1 WHERE id=3;
+
+statement ok
+UPDATE padding_d SET label='new_default' WHERE k=0;
+
+statement ok
+DELETE FROM padding_d WHERE k=3;
+
+statement ok
+INSERT INTO padding_d VALUES (7,'seven');
+
+statement ok
+PRAGMA refresh('padding_full');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM padding_full) EXCEPT ALL (SELECT * FROM expected_padding_full));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_padding_full) EXCEPT ALL (SELECT * FROM padding_full));
+----
+0
+
+statement ok
+PRAGMA refresh('padding_full_mirror');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM padding_full_mirror) EXCEPT ALL (SELECT * FROM expected_padding_full));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_padding_full) EXCEPT ALL (SELECT * FROM padding_full_mirror));
+----
+0
+
+statement ok
+PRAGMA refresh('padding_left_inner');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM padding_left_inner) EXCEPT ALL (SELECT * FROM expected_padding_left));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_padding_left) EXCEPT ALL (SELECT * FROM padding_left_inner));
+----
+0
+
+# A FULL JOIN delta must retain its unmatched changed side. Otherwise an
+# intermediate input can gain a downstream match without producing any key.
+statement ok
+CREATE TABLE chain_full_a(id INT, k INT);
+
+statement ok
+CREATE TABLE chain_full_b(k INT, v INT);
+
+statement ok
+CREATE TABLE chain_full_d(id INT, v INT);
+
+statement ok
+INSERT INTO chain_full_a VALUES (1,1),(3,3),(3,3),(NULL,NULL);
+
+statement ok
+INSERT INTO chain_full_d VALUES (2,12),(3,13),(4,14),(NULL,15);
+
+statement ok
+CREATE VIEW expected_chain_full AS
+WITH p AS (
+    SELECT a.id,COALESCE(a.k,b.k) AS k,b.v
+    FROM chain_full_a a FULL JOIN chain_full_b b ON a.k=b.k
+)
+SELECT p.id,p.v,d.v AS dv FROM p FULL JOIN chain_full_d d ON p.k=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW chain_full AS
+WITH p AS (
+    SELECT a.id,COALESCE(a.k,b.k) AS k,b.v
+    FROM chain_full_a a FULL JOIN chain_full_b b ON a.k=b.k
+)
+SELECT p.id,p.v,d.v AS dv FROM p FULL JOIN chain_full_d d ON p.k=d.id;
+
+# Mirror both joins to cover unmatched deltas on either physical input.
+statement ok
+CREATE MATERIALIZED VIEW chain_full_mirror AS
+WITH p AS (
+    SELECT a.id,COALESCE(a.k,b.k) AS k,b.v
+    FROM chain_full_b b FULL JOIN chain_full_a a ON b.k=a.k
+)
+SELECT p.id,p.v,d.v AS dv FROM chain_full_d d FULL JOIN p ON d.id=p.k;
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_sql_name IN ('chain_full','chain_full_mirror') AND type=2;
+----
+2
+
+# The sole changed leaf has no match in A but does match the downstream D.
+statement ok
+INSERT INTO chain_full_b VALUES (2,0);
+
+statement ok
+PRAGMA refresh('chain_full');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM chain_full) EXCEPT ALL (SELECT * FROM expected_chain_full));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_chain_full) EXCEPT ALL (SELECT * FROM chain_full));
+----
+0
+
+statement ok
+PRAGMA refresh('chain_full_mirror');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM chain_full_mirror) EXCEPT ALL (SELECT * FROM expected_chain_full));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_chain_full) EXCEPT ALL (SELECT * FROM chain_full_mirror));
+----
+0
+
+# Conflicting operations gain/lose matches at both joins, with duplicates and
+# genuine NULL keys. B-only rows must survive even when they have no D match.
+statement ok
+UPDATE chain_full_b SET v=99 WHERE k=2;
+
+statement ok
+DELETE FROM chain_full_b WHERE k=2;
+
+statement ok
+INSERT INTO chain_full_b VALUES (3,30),(3,30),(5,50),(NULL,60),(2,20);
+
+statement ok
+UPDATE chain_full_a SET k=4 WHERE id=1;
+
+statement ok
+INSERT INTO chain_full_a VALUES (5,5),(6,6);
+
+statement ok
+DELETE FROM chain_full_a WHERE id=6;
+
+statement ok
+UPDATE chain_full_d SET v=33 WHERE id=3;
+
+statement ok
+DELETE FROM chain_full_d WHERE id=2;
+
+statement ok
+INSERT INTO chain_full_d VALUES (5,15),(5,15);
+
+statement ok
+PRAGMA refresh('chain_full');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM chain_full) EXCEPT ALL (SELECT * FROM expected_chain_full));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_chain_full) EXCEPT ALL (SELECT * FROM chain_full));
+----
+0
+
+statement ok
+PRAGMA refresh('chain_full_mirror');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM chain_full_mirror) EXCEPT ALL (SELECT * FROM expected_chain_full));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_chain_full) EXCEPT ALL (SELECT * FROM chain_full_mirror));
+----
+0
+
+# Losing B's last match must restore D's unmatched row, including after a
+# transient duplicate, and retain A's replacement NULL-padded projection.
+statement ok
+INSERT INTO chain_full_b VALUES (3,300);
+
+statement ok
+UPDATE chain_full_b SET v=-1 WHERE k IN (3,5);
+
+statement ok
+DELETE FROM chain_full_b WHERE k IN (3,5);
+
+statement ok
+INSERT INTO chain_full_d VALUES (2,22);
+
+statement ok
+UPDATE chain_full_d SET v=55 WHERE id=5;
+
+statement ok
+PRAGMA refresh('chain_full');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM chain_full) EXCEPT ALL (SELECT * FROM expected_chain_full));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_chain_full) EXCEPT ALL (SELECT * FROM chain_full));
+----
+0
+
+statement ok
+PRAGMA refresh('chain_full_mirror');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM chain_full_mirror) EXCEPT ALL (SELECT * FROM expected_chain_full));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_chain_full) EXCEPT ALL (SELECT * FROM chain_full_mirror));
+----
+0
+
 # ============================================================
 # Setup
 # ============================================================
@@ -1435,5 +2196,1436 @@ PRAGMA refresh('foj_transition_right_mv');
 
 query I
 SELECT COUNT(*) FROM ((SELECT * FROM foj_transition_right_mv EXCEPT ALL SELECT d.did,COUNT(w.wid) AS nw FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY d.did) UNION ALL (SELECT d.did,COUNT(w.wid) AS nw FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY d.did EXCEPT ALL SELECT * FROM foj_transition_right_mv));
+----
+0
+
+# A nested FULL JOIN retains both hidden keys. Its downstream lookup must
+# contribute affected keys even when both FULL JOIN inputs have empty deltas.
+
+statement ok
+CREATE TABLE nested_full_a(id INTEGER,k INTEGER);
+
+statement ok
+CREATE TABLE nested_full_b(k INTEGER,label VARCHAR);
+
+statement ok
+CREATE TABLE nested_full_d(k INTEGER,label VARCHAR);
+
+statement ok
+INSERT INTO nested_full_a VALUES (1,1),(2,2),(3,3),(NULL,NULL);
+
+statement ok
+INSERT INTO nested_full_b VALUES (1,'one'),(2,'two'),(4,'four'),(NULL,'null_right');
+
+statement ok
+INSERT INTO nested_full_d VALUES (1,'d1'),(2,'d2'),(3,'d3'),(4,'d4'),(NULL,'null_dim');
+
+statement ok
+CREATE VIEW expected_nested_full_left AS WITH p AS (SELECT a.id,COALESCE(a.k,b.k) AS lookup_key,b.label AS b_label FROM nested_full_a a FULL JOIN nested_full_b b ON a.k=b.k) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN nested_full_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW nested_full_left AS WITH p AS (SELECT a.id,COALESCE(a.k,b.k) AS lookup_key,b.label AS b_label FROM nested_full_a a FULL JOIN nested_full_b b ON a.k=b.k) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN nested_full_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE VIEW expected_nested_full_right AS WITH p AS (SELECT a.id,COALESCE(a.k,b.k) AS lookup_key,b.label AS b_label FROM nested_full_a a FULL JOIN nested_full_b b ON a.k=b.k) SELECT p.id,p.b_label,d.label AS d_label FROM nested_full_d d RIGHT JOIN p ON d.k=p.lookup_key;
+
+statement ok
+CREATE MATERIALIZED VIEW nested_full_right AS WITH p AS (SELECT a.id,COALESCE(a.k,b.k) AS lookup_key,b.label AS b_label FROM nested_full_a a FULL JOIN nested_full_b b ON a.k=b.k) SELECT p.id,p.b_label,d.label AS d_label FROM nested_full_d d RIGHT JOIN p ON d.k=p.lookup_key;
+
+statement ok
+CREATE VIEW expected_nested_full_null_lookup AS WITH p AS (SELECT a.id,COALESCE(a.k,b.k) AS lookup_key,b.label AS b_label FROM nested_full_a a FULL JOIN nested_full_b b ON a.k=b.k) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN nested_full_d d ON p.lookup_key IS NOT DISTINCT FROM d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW nested_full_null_lookup AS WITH p AS (SELECT a.id,COALESCE(a.k,b.k) AS lookup_key,b.label AS b_label FROM nested_full_a a FULL JOIN nested_full_b b ON a.k=b.k) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN nested_full_d d ON p.lookup_key IS NOT DISTINCT FROM d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW nested_full_child AS SELECT d_label,COUNT(*) AS n FROM nested_full_left GROUP BY d_label;
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_sql_name IN ('nested_full_left','nested_full_right','nested_full_null_lookup') AND type=2;
+----
+3
+
+# Pin the read snapshot so storage checkpoints cannot renumber row IDs
+# while the test measures which rows the refresh actually replaces.
+statement ok rowid_snapshot
+BEGIN;
+
+statement ok rowid_snapshot
+SELECT COUNT(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e65737465645f66756c6c5f6c656674_;
+
+statement ok
+CREATE TABLE nested_full_untouched AS SELECT rowid AS old_rowid FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e65737465645f66756c6c5f6c656674_ WHERE NOT (openivm_left_key IS NOT DISTINCT FROM 1 OR openivm_left_key IS NOT DISTINCT FROM 2 OR openivm_right_key IS NOT DISTINCT FROM 1 OR openivm_right_key IS NOT DISTINCT FROM 2);
+
+statement ok
+UPDATE nested_full_d SET label='temporary' WHERE k=1;
+
+statement ok
+DELETE FROM nested_full_d WHERE k=1;
+
+statement ok
+INSERT INTO nested_full_d VALUES (1,'replaced');
+
+statement ok
+UPDATE nested_full_d SET label='updated' WHERE k=2;
+
+statement ok
+PRAGMA refresh('nested_full_left');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM nested_full_left) EXCEPT ALL (SELECT * FROM expected_nested_full_left));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_nested_full_left) EXCEPT ALL (SELECT * FROM nested_full_left));
+----
+0
+
+statement ok
+PRAGMA refresh('nested_full_right');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM nested_full_right) EXCEPT ALL (SELECT * FROM expected_nested_full_right));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_nested_full_right) EXCEPT ALL (SELECT * FROM nested_full_right));
+----
+0
+
+statement ok
+PRAGMA refresh('nested_full_null_lookup');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM nested_full_null_lookup) EXCEPT ALL (SELECT * FROM expected_nested_full_null_lookup));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_nested_full_null_lookup) EXCEPT ALL (SELECT * FROM nested_full_null_lookup));
+----
+0
+
+statement ok
+PRAGMA refresh('nested_full_child');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM nested_full_child) EXCEPT ALL (SELECT d_label,COUNT(*) AS n FROM expected_nested_full_left GROUP BY d_label));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT d_label,COUNT(*) AS n FROM expected_nested_full_left GROUP BY d_label) EXCEPT ALL (SELECT * FROM nested_full_child));
+----
+0
+
+query I
+SELECT COUNT(*) FROM nested_full_untouched old WHERE NOT EXISTS (SELECT 1 FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e65737465645f66756c6c5f6c656674_ current_rows WHERE current_rows.rowid=old.old_rowid);
+----
+0
+
+statement ok rowid_snapshot
+COMMIT;
+
+# Updating a lookup for an unmatched-right row must not pull NULL-padding
+# keys into the scope and replace other unmatched rows.
+
+# Pin the read snapshot so storage checkpoints cannot renumber row IDs
+# while the test measures which rows the refresh actually replaces.
+statement ok rowid_snapshot
+BEGIN;
+
+statement ok rowid_snapshot
+SELECT COUNT(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e65737465645f66756c6c5f6c656674_;
+
+statement ok
+CREATE TABLE nested_full_unmatched_untouched AS SELECT rowid AS old_rowid FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e65737465645f66756c6c5f6c656674_ WHERE NOT (openivm_left_key IS NOT DISTINCT FROM 4 OR openivm_right_key IS NOT DISTINCT FROM 4);
+
+statement ok
+UPDATE nested_full_d SET label='temporary' WHERE k=4;
+
+statement ok
+DELETE FROM nested_full_d WHERE k=4;
+
+statement ok
+INSERT INTO nested_full_d VALUES (4,'new_d4');
+
+statement ok
+PRAGMA refresh('nested_full_left');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM nested_full_left) EXCEPT ALL (SELECT * FROM expected_nested_full_left));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_nested_full_left) EXCEPT ALL (SELECT * FROM nested_full_left));
+----
+0
+
+statement ok
+PRAGMA refresh('nested_full_right');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM nested_full_right) EXCEPT ALL (SELECT * FROM expected_nested_full_right));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_nested_full_right) EXCEPT ALL (SELECT * FROM nested_full_right));
+----
+0
+
+statement ok
+PRAGMA refresh('nested_full_null_lookup');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM nested_full_null_lookup) EXCEPT ALL (SELECT * FROM expected_nested_full_null_lookup));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_nested_full_null_lookup) EXCEPT ALL (SELECT * FROM nested_full_null_lookup));
+----
+0
+
+statement ok
+PRAGMA refresh('nested_full_child');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM nested_full_child) EXCEPT ALL (SELECT d_label,COUNT(*) AS n FROM expected_nested_full_left GROUP BY d_label));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT d_label,COUNT(*) AS n FROM expected_nested_full_left GROUP BY d_label) EXCEPT ALL (SELECT * FROM nested_full_child));
+----
+0
+
+query I
+SELECT COUNT(*) FROM nested_full_unmatched_untouched old WHERE NOT EXISTS (SELECT 1 FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e65737465645f66756c6c5f6c656674_ current_rows WHERE current_rows.rowid=old.old_rowid);
+----
+0
+
+statement ok rowid_snapshot
+COMMIT;
+
+# Change FULL JOIN matches and lookup multiplicities in the same batch.
+
+statement ok
+DELETE FROM nested_full_a WHERE id=2;
+
+statement ok
+DELETE FROM nested_full_b WHERE k=1;
+
+statement ok
+INSERT INTO nested_full_b VALUES (3,'three'),(5,'five');
+
+statement ok
+DELETE FROM nested_full_d WHERE k=3;
+
+statement ok
+DELETE FROM nested_full_d WHERE k=4;
+
+statement ok
+INSERT INTO nested_full_d VALUES (4,'duplicate'),(4,'duplicate');
+
+statement ok
+UPDATE nested_full_d SET k=5 WHERE k=2;
+
+statement ok
+INSERT INTO nested_full_a VALUES (6,6);
+
+statement ok
+UPDATE nested_full_a SET k=7 WHERE id=6;
+
+statement ok
+DELETE FROM nested_full_a WHERE id=6;
+
+statement ok
+INSERT INTO nested_full_a VALUES (6,6);
+
+statement ok
+INSERT INTO nested_full_d VALUES (6,'d6');
+
+statement ok
+PRAGMA refresh('nested_full_left');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM nested_full_left) EXCEPT ALL (SELECT * FROM expected_nested_full_left));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_nested_full_left) EXCEPT ALL (SELECT * FROM nested_full_left));
+----
+0
+
+statement ok
+PRAGMA refresh('nested_full_right');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM nested_full_right) EXCEPT ALL (SELECT * FROM expected_nested_full_right));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_nested_full_right) EXCEPT ALL (SELECT * FROM nested_full_right));
+----
+0
+
+statement ok
+PRAGMA refresh('nested_full_null_lookup');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM nested_full_null_lookup) EXCEPT ALL (SELECT * FROM expected_nested_full_null_lookup));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_nested_full_null_lookup) EXCEPT ALL (SELECT * FROM nested_full_null_lookup));
+----
+0
+
+statement ok
+PRAGMA refresh('nested_full_child');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM nested_full_child) EXCEPT ALL (SELECT d_label,COUNT(*) AS n FROM expected_nested_full_left GROUP BY d_label));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT d_label,COUNT(*) AS n FROM expected_nested_full_left GROUP BY d_label) EXCEPT ALL (SELECT * FROM nested_full_child));
+----
+0
+
+# Lookup-only NULL-padding transitions after previous FULL JOIN mutations.
+
+statement ok
+INSERT INTO nested_full_d VALUES (3,'restored_d3');
+
+statement ok
+UPDATE nested_full_d SET label='new_null_dim' WHERE k IS NULL;
+
+statement ok
+UPDATE nested_full_d SET label='temporary' WHERE k=1;
+
+statement ok
+DELETE FROM nested_full_d WHERE k=1;
+
+statement ok
+INSERT INTO nested_full_d VALUES (5,'new_d5');
+
+statement ok
+PRAGMA refresh('nested_full_left');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM nested_full_left) EXCEPT ALL (SELECT * FROM expected_nested_full_left));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_nested_full_left) EXCEPT ALL (SELECT * FROM nested_full_left));
+----
+0
+
+statement ok
+PRAGMA refresh('nested_full_right');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM nested_full_right) EXCEPT ALL (SELECT * FROM expected_nested_full_right));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_nested_full_right) EXCEPT ALL (SELECT * FROM nested_full_right));
+----
+0
+
+statement ok
+PRAGMA refresh('nested_full_null_lookup');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM nested_full_null_lookup) EXCEPT ALL (SELECT * FROM expected_nested_full_null_lookup));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_nested_full_null_lookup) EXCEPT ALL (SELECT * FROM nested_full_null_lookup));
+----
+0
+
+statement ok
+PRAGMA refresh('nested_full_child');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM nested_full_child) EXCEPT ALL (SELECT d_label,COUNT(*) AS n FROM expected_nested_full_left GROUP BY d_label));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT d_label,COUNT(*) AS n FROM expected_nested_full_left GROUP BY d_label) EXCEPT ALL (SELECT * FROM nested_full_child));
+----
+0
+
+# Matched-to-matched changes cannot manufacture a default-key scope.
+
+statement ok
+CREATE TABLE scope_a(id INT,k INT);
+
+statement ok
+CREATE TABLE scope_b(k INT,v INT);
+
+statement ok
+CREATE TABLE scope_d(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO scope_a VALUES (1,1);
+
+statement ok
+INSERT INTO scope_a SELECT i,i FROM range(100,1100)t(i);
+
+statement ok
+INSERT INTO scope_b VALUES (1,2);
+
+statement ok
+INSERT INTO scope_d VALUES (0,'default'),(2,'old'),(3,'new');
+
+statement ok
+CREATE VIEW scope_expected AS WITH p AS (SELECT a.id,COALESCE(b.v,0) AS k FROM scope_a a FULL JOIN scope_b b ON a.k=b.k) SELECT p.id,d.label FROM p FULL JOIN scope_d d ON p.k=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW scope_mv AS WITH p AS (SELECT a.id,COALESCE(b.v,0) AS k FROM scope_a a FULL JOIN scope_b b ON a.k=b.k) SELECT p.id,d.label FROM p FULL JOIN scope_d d ON p.k=d.k;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='scope_mv';
+----
+2
+
+statement ok rowid_snapshot
+BEGIN;
+
+statement ok rowid_snapshot
+SELECT COUNT(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_73636f70655f6d76_;
+
+statement ok
+CREATE TABLE scope_untouched AS SELECT rowid AS old_rowid,id FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_73636f70655f6d76_ WHERE id>=100;
+
+statement ok
+UPDATE scope_b SET v=99 WHERE k=1;
+
+statement ok
+INSERT INTO scope_b VALUES (1,99);
+
+statement ok
+DELETE FROM scope_b WHERE v=99;
+
+statement ok
+INSERT INTO scope_b VALUES (1,3);
+
+statement ok
+PRAGMA refresh('scope_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_mv) EXCEPT ALL (SELECT * FROM scope_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_expected) EXCEPT ALL (SELECT * FROM scope_mv));
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM scope_untouched EXCEPT ALL SELECT rowid,id FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_73636f70655f6d76_ WHERE id>=100);
+----
+0
+
+statement ok rowid_snapshot
+COMMIT;
+
+statement ok
+DELETE FROM scope_b;
+
+statement ok
+INSERT INTO scope_b VALUES (1,99);
+
+statement ok
+DELETE FROM scope_b;
+
+statement ok
+PRAGMA refresh('scope_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_mv) EXCEPT ALL (SELECT * FROM scope_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_expected) EXCEPT ALL (SELECT * FROM scope_mv));
+----
+0
+
+statement ok
+INSERT INTO scope_b VALUES (1,2);
+
+statement ok
+UPDATE scope_b SET v=3;
+
+statement ok
+INSERT INTO scope_b VALUES (1,3);
+
+statement ok
+DELETE FROM scope_b WHERE rowid=(SELECT max(rowid) FROM scope_b);
+
+statement ok
+PRAGMA refresh('scope_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_mv) EXCEPT ALL (SELECT * FROM scope_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_expected) EXCEPT ALL (SELECT * FROM scope_mv));
+----
+0
+
+# A delta in one UNION ALL arm must not replace the other arm.
+
+statement ok
+CREATE TABLE branch_a(id INT,k INT,payload VARCHAR);
+
+statement ok
+CREATE TABLE branch_b(id INT,k INT,payload VARCHAR);
+
+statement ok
+CREATE TABLE branch_d(k INT,v INT);
+
+statement ok
+CREATE TABLE branch_e(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO branch_a VALUES (1,1,'a'),(1,1,'a');
+
+statement ok
+INSERT INTO branch_b SELECT i,i,'unchanged' FROM range(100,1100)t(i);
+
+statement ok
+INSERT INTO branch_d VALUES (1,2);
+
+statement ok
+INSERT INTO branch_d SELECT i,i FROM range(100,1100)t(i);
+
+statement ok
+INSERT INTO branch_e VALUES (0,'default'),(2,'two');
+
+statement ok
+INSERT INTO branch_e SELECT i,'unchanged' FROM range(100,1100)t(i);
+
+statement ok
+CREATE VIEW branch_expected AS WITH u AS (SELECT id,k,payload FROM branch_a UNION ALL SELECT id,k,payload FROM branch_b), p AS (SELECT u.id,u.payload,COALESCE(d.v,0) AS lookup_key FROM u FULL JOIN branch_d d ON u.k=d.k) SELECT p.id,p.payload,e.label FROM p FULL JOIN branch_e e ON p.lookup_key=e.k;
+
+statement ok
+CREATE MATERIALIZED VIEW branch_mv AS WITH u AS (SELECT id,k,payload FROM branch_a UNION ALL SELECT id,k,payload FROM branch_b), p AS (SELECT u.id,u.payload,COALESCE(d.v,0) AS lookup_key FROM u FULL JOIN branch_d d ON u.k=d.k) SELECT p.id,p.payload,e.label FROM p FULL JOIN branch_e e ON p.lookup_key=e.k;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='branch_mv';
+----
+2
+
+statement ok rowid_snapshot
+BEGIN;
+
+statement ok rowid_snapshot
+SELECT COUNT(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6272616e63685f6d76_;
+
+statement ok
+CREATE OR REPLACE TABLE branch_untouched AS SELECT rowid AS old_rowid FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6272616e63685f6d76_ WHERE id>=100;
+
+statement ok
+UPDATE branch_a SET payload='temporary' WHERE id IN (1,100);
+
+statement ok
+INSERT INTO branch_a VALUES (2,1,'temporary');
+
+statement ok
+DELETE FROM branch_a WHERE id=2;
+
+statement ok
+UPDATE branch_a SET payload='new' WHERE id IN (1,100);
+
+statement ok
+PRAGMA refresh('branch_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM branch_mv) EXCEPT ALL (SELECT * FROM branch_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM branch_expected) EXCEPT ALL (SELECT * FROM branch_mv));
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT old_rowid FROM branch_untouched EXCEPT ALL SELECT rowid FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6272616e63685f6d76_ WHERE id>=100);
+----
+0
+
+statement ok rowid_snapshot
+COMMIT;
+
+statement ok rowid_snapshot
+BEGIN;
+
+statement ok rowid_snapshot
+SELECT COUNT(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6272616e63685f6d76_;
+
+statement ok
+CREATE OR REPLACE TABLE branch_untouched AS SELECT rowid AS old_rowid FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6272616e63685f6d76_ WHERE id<>100 OR id IS NULL;
+
+statement ok
+UPDATE branch_b SET payload='temporary' WHERE id IN (1,100);
+
+statement ok
+INSERT INTO branch_b VALUES (2,1,'temporary');
+
+statement ok
+DELETE FROM branch_b WHERE id=2;
+
+statement ok
+UPDATE branch_b SET payload='new' WHERE id IN (1,100);
+
+statement ok
+PRAGMA refresh('branch_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM branch_mv) EXCEPT ALL (SELECT * FROM branch_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM branch_expected) EXCEPT ALL (SELECT * FROM branch_mv));
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT old_rowid FROM branch_untouched EXCEPT ALL SELECT rowid FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6272616e63685f6d76_ WHERE id<>100 OR id IS NULL);
+----
+0
+
+statement ok rowid_snapshot
+COMMIT;
+
+# Padding existence uses all join conditions, not only the first key.
+
+statement ok
+CREATE TABLE scope_multi_a(id INT,k INT,kind INT);
+
+statement ok
+CREATE TABLE scope_multi_b(k INT,kind INT,v INT);
+
+statement ok
+CREATE TABLE scope_multi_d(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO scope_multi_a VALUES (1,1,10),(2,2,20),(NULL,NULL,0);
+
+statement ok
+INSERT INTO scope_multi_b VALUES (1,10,2),(2,20,3);
+
+statement ok
+INSERT INTO scope_multi_d VALUES (0,'default'),(2,'two'),(3,'three');
+
+statement ok
+CREATE VIEW scope_multi_expected AS WITH p AS (SELECT a.id,COALESCE(b.v,0) AS k FROM scope_multi_a a FULL JOIN scope_multi_b b ON a.k=b.k AND a.kind=b.kind) SELECT p.id,d.label FROM p FULL JOIN scope_multi_d d ON p.k=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW scope_multi_mv AS WITH p AS (SELECT a.id,COALESCE(b.v,0) AS k FROM scope_multi_a a FULL JOIN scope_multi_b b ON a.k=b.k AND a.kind=b.kind) SELECT p.id,d.label FROM p FULL JOIN scope_multi_d d ON p.k=d.k;
+
+statement ok
+UPDATE scope_multi_b SET kind=99 WHERE k=1;
+
+statement ok
+INSERT INTO scope_multi_b VALUES (1,10,99);
+
+statement ok
+DELETE FROM scope_multi_b WHERE v=99;
+
+statement ok
+PRAGMA refresh('scope_multi_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_multi_mv) EXCEPT ALL (SELECT * FROM scope_multi_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_multi_expected) EXCEPT ALL (SELECT * FROM scope_multi_mv));
+----
+0
+
+statement ok
+UPDATE scope_multi_b SET kind=10 WHERE k=1;
+
+statement ok
+DELETE FROM scope_multi_b WHERE k=2;
+
+statement ok
+INSERT INTO scope_multi_b VALUES (2,20,3);
+
+statement ok
+PRAGMA refresh('scope_multi_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_multi_mv) EXCEPT ALL (SELECT * FROM scope_multi_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_multi_expected) EXCEPT ALL (SELECT * FROM scope_multi_mv));
+----
+0
+
+# Outer joins inside UNION arms retain their scope markers after LPTS renaming.
+
+statement ok
+CREATE TABLE arm_a(id INT,k INT);
+
+statement ok
+CREATE TABLE arm_b(id INT,k INT);
+
+statement ok
+CREATE TABLE arm_d(k INT,v INT);
+
+statement ok
+CREATE TABLE arm_e(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO arm_a VALUES(1,1),(2,2),(NULL,NULL);
+
+statement ok
+INSERT INTO arm_b VALUES(100,100);
+
+statement ok
+INSERT INTO arm_d VALUES(1,2),(2,3),(NULL,9);
+
+statement ok
+INSERT INTO arm_e VALUES(0,'default'),(1,'one'),(2,'two'),(3,'three'),(4,'four'),(100,'hundred');
+
+statement ok
+CREATE VIEW arm_full_expected AS WITH p AS (SELECT a.id,a.k,d.v FROM arm_a a FULL JOIN arm_d d ON a.k=d.k UNION ALL SELECT b.id,b.k,dx.v FROM arm_b b LEFT JOIN arm_d dx ON b.k=dx.k) SELECT p.id,p.v,e.label FROM p FULL JOIN arm_e e ON p.k=e.k;
+
+statement ok
+CREATE MATERIALIZED VIEW arm_full_mv AS WITH p AS (SELECT a.id,a.k,d.v FROM arm_a a FULL JOIN arm_d d ON a.k=d.k UNION ALL SELECT b.id,b.k,dx.v FROM arm_b b LEFT JOIN arm_d dx ON b.k=dx.k) SELECT p.id,p.v,e.label FROM p FULL JOIN arm_e e ON p.k=e.k;
+
+statement ok
+CREATE VIEW arm_left_expected AS WITH p AS (SELECT a.id,a.k,d.v FROM arm_a a LEFT JOIN arm_d d ON a.k=d.k UNION ALL SELECT b.id,b.k,dx.v FROM arm_b b LEFT JOIN arm_d dx ON b.k=dx.k) SELECT p.id,p.v,e.label FROM p FULL JOIN arm_e e ON p.k=e.k;
+
+statement ok
+CREATE MATERIALIZED VIEW arm_left_mv AS WITH p AS (SELECT a.id,a.k,d.v FROM arm_a a LEFT JOIN arm_d d ON a.k=d.k UNION ALL SELECT b.id,b.k,dx.v FROM arm_b b LEFT JOIN arm_d dx ON b.k=dx.k) SELECT p.id,p.v,e.label FROM p FULL JOIN arm_e e ON p.k=e.k;
+
+statement ok
+CREATE VIEW arm_right_expected AS WITH p AS (SELECT a.id,a.k,d.v FROM arm_d d RIGHT JOIN arm_a a ON d.k=a.k UNION ALL SELECT b.id,b.k,dx.v FROM arm_b b LEFT JOIN arm_d dx ON b.k=dx.k) SELECT p.id,p.v,e.label FROM p FULL JOIN arm_e e ON p.k=e.k;
+
+statement ok
+CREATE MATERIALIZED VIEW arm_right_mv AS WITH p AS (SELECT a.id,a.k,d.v FROM arm_d d RIGHT JOIN arm_a a ON d.k=a.k UNION ALL SELECT b.id,b.k,dx.v FROM arm_b b LEFT JOIN arm_d dx ON b.k=dx.k) SELECT p.id,p.v,e.label FROM p FULL JOIN arm_e e ON p.k=e.k;
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_sql_name IN ('arm_full_mv','arm_left_mv','arm_right_mv') AND type=2;
+----
+3
+
+statement ok
+UPDATE arm_e SET label='temporary' WHERE k=2;
+
+statement ok
+INSERT INTO arm_e VALUES(2,'transient');
+
+statement ok
+DELETE FROM arm_e WHERE label='transient';
+
+statement ok
+UPDATE arm_e SET label='new' WHERE k=2;
+
+statement ok
+PRAGMA refresh('arm_full_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_full_mv) EXCEPT ALL (SELECT * FROM arm_full_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_full_expected) EXCEPT ALL (SELECT * FROM arm_full_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('arm_left_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_left_mv) EXCEPT ALL (SELECT * FROM arm_left_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_left_expected) EXCEPT ALL (SELECT * FROM arm_left_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('arm_right_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_right_mv) EXCEPT ALL (SELECT * FROM arm_right_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_right_expected) EXCEPT ALL (SELECT * FROM arm_right_mv));
+----
+0
+
+statement ok
+UPDATE arm_d SET v=99 WHERE k=1;
+
+statement ok
+INSERT INTO arm_d VALUES(1,99);
+
+statement ok
+DELETE FROM arm_d WHERE v=99;
+
+statement ok
+INSERT INTO arm_d VALUES(1,4);
+
+statement ok
+PRAGMA refresh('arm_full_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_full_mv) EXCEPT ALL (SELECT * FROM arm_full_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_full_expected) EXCEPT ALL (SELECT * FROM arm_full_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('arm_left_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_left_mv) EXCEPT ALL (SELECT * FROM arm_left_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_left_expected) EXCEPT ALL (SELECT * FROM arm_left_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('arm_right_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_right_mv) EXCEPT ALL (SELECT * FROM arm_right_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_right_expected) EXCEPT ALL (SELECT * FROM arm_right_mv));
+----
+0
+
+statement ok
+INSERT INTO arm_a VALUES(3,3);
+
+statement ok
+INSERT INTO arm_d VALUES(3,2);
+
+statement ok
+UPDATE arm_a SET k=2 WHERE id=3;
+
+statement ok
+DELETE FROM arm_d WHERE k=3;
+
+statement ok
+INSERT INTO arm_b VALUES(101,2);
+
+statement ok
+UPDATE arm_b SET k=3 WHERE id=101;
+
+statement ok
+DELETE FROM arm_b WHERE id=101;
+
+statement ok
+INSERT INTO arm_b VALUES(101,2);
+
+statement ok
+PRAGMA refresh('arm_full_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_full_mv) EXCEPT ALL (SELECT * FROM arm_full_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_full_expected) EXCEPT ALL (SELECT * FROM arm_full_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('arm_left_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_left_mv) EXCEPT ALL (SELECT * FROM arm_left_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_left_expected) EXCEPT ALL (SELECT * FROM arm_left_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('arm_right_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_right_mv) EXCEPT ALL (SELECT * FROM arm_right_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM arm_right_expected) EXCEPT ALL (SELECT * FROM arm_right_mv));
+----
+0
+
+# Changed rows sharing an inner key do not widen to other final lookup keys.
+
+statement ok
+CREATE TABLE bucket_a(id INT,k INT,v INT,payload VARCHAR);
+
+statement ok
+CREATE TABLE bucket_b(k INT,v INT);
+
+statement ok
+CREATE TABLE bucket_d(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO bucket_a VALUES(1,1,1,'a');
+
+statement ok
+INSERT INTO bucket_a SELECT i,1,i,'unchanged' FROM range(100,1100)t(i);
+
+statement ok
+INSERT INTO bucket_d VALUES(0,'default'),(1,'one'),(42,'forty-two');
+
+statement ok
+INSERT INTO bucket_d SELECT i,'unchanged' FROM range(100,1100)t(i);
+
+statement ok
+CREATE VIEW bucket_expected AS WITH p AS (SELECT a.id,a.payload,COALESCE(b.v,a.v,0) AS lookup_key FROM bucket_a a FULL JOIN bucket_b b ON a.k=b.k) SELECT p.id,p.payload,d.label FROM p FULL JOIN bucket_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW bucket_mv AS WITH p AS (SELECT a.id,a.payload,COALESCE(b.v,a.v,0) AS lookup_key FROM bucket_a a FULL JOIN bucket_b b ON a.k=b.k) SELECT p.id,p.payload,d.label FROM p FULL JOIN bucket_d d ON p.lookup_key=d.k;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='bucket_mv';
+----
+2
+
+statement ok rowid_snapshot
+BEGIN;
+
+statement ok rowid_snapshot
+SELECT COUNT(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_;
+
+statement ok
+CREATE OR REPLACE TABLE bucket_untouched AS SELECT rowid AS old_rowid,id FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_ WHERE id>=100;
+
+statement ok
+UPDATE bucket_a SET payload='temporary' WHERE id=1;
+
+statement ok
+INSERT INTO bucket_a VALUES(2,1,1,'transient');
+
+statement ok
+DELETE FROM bucket_a WHERE id=2;
+
+statement ok
+UPDATE bucket_a SET payload='new' WHERE id=1;
+
+statement ok
+PRAGMA refresh('bucket_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_mv) EXCEPT ALL (SELECT * FROM bucket_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_expected) EXCEPT ALL (SELECT * FROM bucket_mv));
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM bucket_untouched EXCEPT ALL SELECT rowid,id FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_ WHERE id>=100);
+----
+0
+
+statement ok rowid_snapshot
+COMMIT;
+
+statement ok rowid_snapshot
+BEGIN;
+
+statement ok rowid_snapshot
+SELECT COUNT(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_;
+
+statement ok
+CREATE OR REPLACE TABLE bucket_untouched AS SELECT rowid AS old_rowid,id FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_ WHERE id>=100;
+
+statement ok
+UPDATE bucket_a SET v=99 WHERE id=1;
+
+statement ok
+INSERT INTO bucket_a VALUES(2,1,99,'transient');
+
+statement ok
+DELETE FROM bucket_a WHERE id=2;
+
+statement ok
+UPDATE bucket_a SET v=42 WHERE id=1;
+
+statement ok
+PRAGMA refresh('bucket_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_mv) EXCEPT ALL (SELECT * FROM bucket_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_expected) EXCEPT ALL (SELECT * FROM bucket_mv));
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM bucket_untouched EXCEPT ALL SELECT rowid,id FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_ WHERE id>=100);
+----
+0
+
+statement ok rowid_snapshot
+COMMIT;
+
+# A transient optional match does not replace unchanged preserved rows.
+statement ok rowid_snapshot
+BEGIN;
+
+statement ok rowid_snapshot
+SELECT COUNT(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_;
+
+statement ok
+CREATE OR REPLACE TABLE bucket_untouched AS SELECT rowid AS old_rowid,id FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_ WHERE id>=100;
+
+statement ok
+INSERT INTO bucket_b VALUES(1,99);
+
+statement ok
+UPDATE bucket_b SET v=42;
+
+statement ok
+DELETE FROM bucket_b;
+
+statement ok
+PRAGMA refresh('bucket_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_mv) EXCEPT ALL (SELECT * FROM bucket_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_expected) EXCEPT ALL (SELECT * FROM bucket_mv));
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM bucket_untouched EXCEPT ALL SELECT rowid,id FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_ WHERE id>=100);
+----
+0
+
+statement ok rowid_snapshot
+COMMIT;
+
+statement ok
+INSERT INTO bucket_b VALUES(1,99);
+
+statement ok
+UPDATE bucket_b SET v=42;
+
+statement ok
+INSERT INTO bucket_b VALUES(1,100);
+
+statement ok
+DELETE FROM bucket_b WHERE v=100;
+
+statement ok
+PRAGMA refresh('bucket_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_mv) EXCEPT ALL (SELECT * FROM bucket_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_expected) EXCEPT ALL (SELECT * FROM bucket_mv));
+----
+0
+
+statement ok
+UPDATE bucket_b SET v=99;
+
+statement ok
+DELETE FROM bucket_b;
+
+statement ok
+INSERT INTO bucket_b VALUES(1,100);
+
+statement ok
+DELETE FROM bucket_b;
+
+statement ok
+PRAGMA refresh('bucket_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_mv) EXCEPT ALL (SELECT * FROM bucket_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_expected) EXCEPT ALL (SELECT * FROM bucket_mv));
+----
+0
+
+# DISTINCT markers preserve groups shared by different UNION arms.
+
+statement ok
+CREATE TABLE distinct_a(id INT,k INT);
+
+statement ok
+CREATE TABLE distinct_c(id INT,k INT);
+
+statement ok
+CREATE TABLE distinct_b(k INT,v INT);
+
+statement ok
+CREATE TABLE distinct_d(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO distinct_a VALUES(1,1),(1,1),(2,2),(3,3);
+
+statement ok
+INSERT INTO distinct_c VALUES(1,1),(2,2);
+
+statement ok
+INSERT INTO distinct_b VALUES(1,2),(2,3);
+
+statement ok
+INSERT INTO distinct_d VALUES(0,'default'),(1,'one'),(2,'two'),(3,'three'),(4,'four');
+
+statement ok
+CREATE VIEW distinct_input_expected AS WITH n AS (SELECT DISTINCT id,k FROM distinct_a), p AS (SELECT n.id,COALESCE(b.v,n.k,0) AS lookup_key,b.v FROM n FULL JOIN distinct_b b ON n.k=b.k) SELECT p.id,p.v,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_mv AS WITH n AS (SELECT DISTINCT id,k FROM distinct_a), p AS (SELECT n.id,COALESCE(b.v,n.k,0) AS lookup_key,b.v FROM n FULL JOIN distinct_b b ON n.k=b.k) SELECT p.id,p.v,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k;
+
+query I
+SELECT CAST(type IN (2,6) AS INTEGER) FROM openivm_views WHERE view_sql_name='distinct_input_mv';
+----
+1
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_input_mv) EXCEPT ALL (SELECT * FROM distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_input_expected) EXCEPT ALL (SELECT * FROM distinct_input_mv));
+----
+0
+
+statement ok
+CREATE VIEW union_distinct_input_expected AS WITH n AS (SELECT id,k FROM distinct_a UNION SELECT id,k FROM distinct_c), p AS (SELECT n.id,COALESCE(b.v,n.k,0) AS lookup_key,b.v FROM n FULL JOIN distinct_b b ON n.k=b.k) SELECT p.id,p.v,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW union_distinct_input_mv AS WITH n AS (SELECT id,k FROM distinct_a UNION SELECT id,k FROM distinct_c), p AS (SELECT n.id,COALESCE(b.v,n.k,0) AS lookup_key,b.v FROM n FULL JOIN distinct_b b ON n.k=b.k) SELECT p.id,p.v,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k;
+
+query I
+SELECT CAST(type IN (2,6) AS INTEGER) FROM openivm_views WHERE view_sql_name='union_distinct_input_mv';
+----
+1
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM union_distinct_input_mv) EXCEPT ALL (SELECT * FROM union_distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM union_distinct_input_expected) EXCEPT ALL (SELECT * FROM union_distinct_input_mv));
+----
+0
+
+statement ok
+CREATE VIEW self_union_distinct_input_expected AS WITH n AS (SELECT id,k FROM distinct_a UNION SELECT id,k FROM distinct_a), p AS (SELECT n.id,COALESCE(b.v,n.k,0) AS lookup_key,b.v FROM n FULL JOIN distinct_b b ON n.k=b.k) SELECT p.id,p.v,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW self_union_distinct_input_mv AS WITH n AS (SELECT id,k FROM distinct_a UNION SELECT id,k FROM distinct_a), p AS (SELECT n.id,COALESCE(b.v,n.k,0) AS lookup_key,b.v FROM n FULL JOIN distinct_b b ON n.k=b.k) SELECT p.id,p.v,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k;
+
+query I
+SELECT CAST(type IN (2,6) AS INTEGER) FROM openivm_views WHERE view_sql_name='self_union_distinct_input_mv';
+----
+1
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM self_union_distinct_input_mv) EXCEPT ALL (SELECT * FROM self_union_distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM self_union_distinct_input_expected) EXCEPT ALL (SELECT * FROM self_union_distinct_input_mv));
+----
+0
+
+statement ok
+CREATE VIEW distinct_join_expected AS WITH p AS (SELECT DISTINCT a.id,COALESCE(b.v,a.k,0) AS lookup_key FROM distinct_a a FULL JOIN distinct_b b ON a.k=b.k) SELECT p.id,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_join_mv AS WITH p AS (SELECT DISTINCT a.id,COALESCE(b.v,a.k,0) AS lookup_key FROM distinct_a a FULL JOIN distinct_b b ON a.k=b.k) SELECT p.id,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k;
+
+query I
+SELECT CAST(type IN (2,6) AS INTEGER) FROM openivm_views WHERE view_sql_name='distinct_join_mv';
+----
+1
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_join_mv) EXCEPT ALL (SELECT * FROM distinct_join_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_join_expected) EXCEPT ALL (SELECT * FROM distinct_join_mv));
+----
+0
+
+statement ok
+UPDATE distinct_d SET label='temporary' WHERE k=2;
+
+statement ok
+INSERT INTO distinct_d VALUES(2,'transient');
+
+statement ok
+DELETE FROM distinct_d WHERE label='transient';
+
+statement ok
+UPDATE distinct_d SET label='new' WHERE k=2;
+
+statement ok
+PRAGMA refresh('distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_input_mv) EXCEPT ALL (SELECT * FROM distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_input_expected) EXCEPT ALL (SELECT * FROM distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('union_distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM union_distinct_input_mv) EXCEPT ALL (SELECT * FROM union_distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM union_distinct_input_expected) EXCEPT ALL (SELECT * FROM union_distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('self_union_distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM self_union_distinct_input_mv) EXCEPT ALL (SELECT * FROM self_union_distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM self_union_distinct_input_expected) EXCEPT ALL (SELECT * FROM self_union_distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('distinct_join_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_join_mv) EXCEPT ALL (SELECT * FROM distinct_join_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_join_expected) EXCEPT ALL (SELECT * FROM distinct_join_mv));
+----
+0
+
+statement ok
+DELETE FROM distinct_a WHERE id=1;
+
+statement ok
+INSERT INTO distinct_a VALUES(1,1),(4,4),(5,5);
+
+statement ok
+UPDATE distinct_a SET k=6 WHERE id=5;
+
+statement ok
+DELETE FROM distinct_a WHERE id=5;
+
+statement ok
+UPDATE distinct_a SET k=2 WHERE id=4;
+
+statement ok
+PRAGMA refresh('distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_input_mv) EXCEPT ALL (SELECT * FROM distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_input_expected) EXCEPT ALL (SELECT * FROM distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('union_distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM union_distinct_input_mv) EXCEPT ALL (SELECT * FROM union_distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM union_distinct_input_expected) EXCEPT ALL (SELECT * FROM union_distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('self_union_distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM self_union_distinct_input_mv) EXCEPT ALL (SELECT * FROM self_union_distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM self_union_distinct_input_expected) EXCEPT ALL (SELECT * FROM self_union_distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('distinct_join_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_join_mv) EXCEPT ALL (SELECT * FROM distinct_join_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_join_expected) EXCEPT ALL (SELECT * FROM distinct_join_mv));
+----
+0
+
+statement ok
+DELETE FROM distinct_c WHERE id=1;
+
+statement ok
+DELETE FROM distinct_a WHERE id=1;
+
+statement ok
+INSERT INTO distinct_c VALUES(3,3),(7,7);
+
+statement ok
+UPDATE distinct_c SET k=8 WHERE id=7;
+
+statement ok
+DELETE FROM distinct_c WHERE id=7;
+
+statement ok
+UPDATE distinct_b SET v=9 WHERE k=1;
+
+statement ok
+DELETE FROM distinct_b WHERE k=1;
+
+statement ok
+INSERT INTO distinct_b VALUES(4,4);
+
+statement ok
+PRAGMA refresh('distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_input_mv) EXCEPT ALL (SELECT * FROM distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_input_expected) EXCEPT ALL (SELECT * FROM distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('union_distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM union_distinct_input_mv) EXCEPT ALL (SELECT * FROM union_distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM union_distinct_input_expected) EXCEPT ALL (SELECT * FROM union_distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('self_union_distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM self_union_distinct_input_mv) EXCEPT ALL (SELECT * FROM self_union_distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM self_union_distinct_input_expected) EXCEPT ALL (SELECT * FROM self_union_distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('distinct_join_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_join_mv) EXCEPT ALL (SELECT * FROM distinct_join_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_join_expected) EXCEPT ALL (SELECT * FROM distinct_join_mv));
 ----
 0

@@ -1,0 +1,72 @@
+# name: test/sql/missing_aux_meta_refresh_error.test
+# description: Refresh of aux-state views with lost aux metadata fails instead of silently falling back to GROUP_RECOMPUTE
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE mam_l (id INT, x INT);
+
+statement ok
+CREATE TABLE mam_r (rid INT, y INT);
+
+statement ok
+INSERT INTO mam_l VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+INSERT INTO mam_r VALUES (100, 9);
+
+statement ok
+CREATE MATERIALIZED VIEW mam_semi AS
+    SELECT l.id, l.x FROM mam_l l SEMI JOIN mam_r r ON abs(l.x - r.y) <= 2;
+
+query I
+SELECT type FROM openivm_views WHERE type = 9;
+----
+9
+
+statement ok
+UPDATE openivm_views SET semi_anti_aux_meta_json = NULL WHERE type = 9;
+
+statement ok
+INSERT INTO mam_r VALUES (101, 21);
+
+statement error
+PRAGMA refresh('mam_semi');
+----
+has no aux metadata
+
+# DISTINCT_INCREMENTAL: same contract.
+statement ok
+SET openivm_distinct_aux_state = true;
+
+statement ok
+CREATE TABLE mam_src (grp INT, machine VARCHAR, cores INT);
+
+statement ok
+INSERT INTO mam_src VALUES (1, 'm1', 8), (1, 'm1', 8), (1, 'm2', 16), (2, 'm3', 4);
+
+statement ok
+CREATE MATERIALIZED VIEW mam_distinct AS
+    SELECT grp, SUM(cores) AS total_cores
+    FROM (SELECT DISTINCT grp, machine, cores FROM mam_src) d
+    GROUP BY grp;
+
+query I
+SELECT type FROM openivm_views WHERE type = 8;
+----
+8
+
+statement ok
+UPDATE openivm_views SET distinct_aux_meta_json = NULL WHERE type = 8;
+
+statement ok
+INSERT INTO mam_src VALUES (2, 'm4', 5);
+
+statement error
+PRAGMA refresh('mam_distinct');
+----
+has no aux metadata
+
+statement ok
+SET openivm_distinct_aux_state = false;

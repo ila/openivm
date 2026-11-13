@@ -1,4 +1,5 @@
 #include "core/parser_create_mv_helpers.hpp"
+#include "match/constraint_cache.hpp"
 #define DUCKDB_EXTENSION_MAIN
 
 #include "core/openivm_extension.hpp"
@@ -16,6 +17,8 @@
 #include "upsert/refresh_internal.hpp"
 
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/common/file_system.hpp"
@@ -33,7 +36,9 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/planner/planner_extension.hpp"
 #include "core/parser.hpp"
+#include "core/parser_plan_helpers.hpp"
 #include "core/parser_ddl.hpp"
 #include "rules/incremental_rewrite_rule.hpp"
 #include "rules/refresh_insert_rule.hpp"
@@ -48,74 +53,12 @@ namespace duckdb {
 // The daemon sleeps and periodically checks for scheduled views; no work if none exist.
 static shared_ptr<RefreshDaemon> global_daemon;
 
-static vector<string> ParsePragmaColumnList(string input) {
-	vector<string> columns;
-	StringUtil::Trim(input);
-	if (input.empty()) {
-		return columns;
-	}
-	if (input.front() == '[') {
-		size_t pos = 0;
-		while ((pos = input.find('"', pos)) != string::npos) {
-			pos++;
-			string value;
-			while (pos < input.size()) {
-				char c = input[pos++];
-				if (c == '\\' && pos < input.size()) {
-					char esc = input[pos++];
-					value += (esc == 'n') ? '\n' : esc;
-					continue;
-				}
-				if (c == '"') {
-					StringUtil::Trim(value);
-					if (!value.empty()) {
-						columns.push_back(value);
-					}
-					break;
-				}
-				value += c;
-			}
-		}
-		return columns;
-	}
-	size_t start = 0;
-	while (start <= input.size()) {
-		size_t end = input.find(',', start);
-		string value = input.substr(start, end == string::npos ? string::npos : end - start);
-		StringUtil::Trim(value);
-		if (!value.empty()) {
-			columns.push_back(value);
-		}
-		if (end == string::npos) {
-			break;
-		}
-		start = end + 1;
-	}
-	return columns;
-}
-
-struct ComputeDeltaData : public GlobalTableFunctionState {
-	ComputeDeltaData() : offset(0) {
-	}
-	idx_t offset;
-	string view_name;
-};
-
-unique_ptr<GlobalTableFunctionState> ComputeDeltaInit(ClientContext &context, TableFunctionInitInput &input) {
-	auto result = make_uniq<ComputeDeltaData>();
-	return std::move(result);
-}
-
 static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context, TableFunctionBindInput &input,
-                                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	string view_catalog_name = StringValue::Get(input.inputs[0]);
 	string view_schema_name = StringValue::Get(input.inputs[1]);
 	string view_name = StringValue::Get(input.inputs[2]);
 	OPENIVM_DEBUG_PRINT("View to be incrementally maintained: %s \n", view_name.c_str());
-
-	input.named_parameters["view_name"] = view_name;
-	input.named_parameters["view_catalog_name"] = view_catalog_name;
-	input.named_parameters["view_schema_name"] = view_schema_name;
 
 	Connection con(*context.db);
 	RefreshMetadata::UseCatalog(context, con, view_catalog_name);
@@ -129,7 +72,7 @@ static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context,
 	}
 	OPENIVM_DEBUG_PRINT("[ComputeDelta Bind] View: %s, Query: %s\n", view_name.c_str(), view_query.c_str());
 
-	Parser parser;
+	auto parser = Parser::GetBuiltinParser();
 	parser.ParseQuery(view_query);
 	duckdb::openivm::TimeTravelPins::Peel(context, *parser.statements[0]);
 	Planner planner(context);
@@ -150,12 +93,8 @@ static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context,
 	return std::move(result);
 }
 
-static void ComputeDeltaFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &data = dynamic_cast<ComputeDeltaData &>(*data_p.global_state);
-	if (data.offset >= 1) {
-		return;
-	}
-	return;
+// ComputeDelta only marks a plan for IncrementalRewriteRule, which replaces it; it never produces rows.
+static void ComputeDeltaFunction(ClientContext &, TableFunctionInput &, DataChunk &) {
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
@@ -174,7 +113,106 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	RegisterSparkScalarFunctions(loader);
 
-	db_config.AddExtensionOption("openivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR);
+	// Plain options: {name, description, type, default}. Options with validation are registered below.
+	struct PlainOption {
+		const char *name;
+		const char *description;
+		LogicalType type;
+		Value default_value;
+	};
+	const auto on = Value::BOOLEAN(true);
+	const auto off = Value::BOOLEAN(false);
+	const vector<PlainOption> plain_options = {
+	    {"openivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR, Value()},
+	    {"openivm_adaptive_refresh", "experimental: enable adaptive cost model (when off, always use IVM)",
+	     LogicalType::BOOLEAN, off},
+	    {"openivm_cascade_refresh", "cascade mode: off, upstream, downstream, or both", LogicalType::VARCHAR,
+	     Value("downstream")},
+	    {"openivm_adaptive_backoff", "auto-increase refresh interval when refresh takes longer than the interval",
+	     LogicalType::BOOLEAN, on},
+	    {"openivm_disable_daemon", "disable the refresh daemon (for shadow/compile-only DBs)", LogicalType::BOOLEAN,
+	     off},
+	    {openivm::METADATA_LEASE_SETTING,
+	     "seconds a client of a remote metadata catalog owns a view's refresh before another client may take it over "
+	     "(renewed while the refresh runs)",
+	     LogicalType::BIGINT, Value::BIGINT(600)},
+	    {openivm::TEST_FAIL_POINT_SETTING,
+	     "testing only: simulate a crash at a refresh protocol step (after_intent, after_view_delta, "
+	     "before_data_commit, after_data_commit), a failing data statement (data_statement_error), a lease takeover "
+	     "(lease_lost_before_data, lease_lost_mid_data, lease_lost_before_watermark) or a concurrent commit "
+	     "(concurrent_commit_before_data, concurrent_commit_after_data, or concurrent_commit_then_data_error after the "
+	     "interruption marker, followed by a failing data statement)",
+	     LogicalType::VARCHAR, Value("")},
+	    {openivm::TEST_CONCURRENT_SQL_SETTING,
+	     "testing only: SQL that a concurrent_commit_* fail point commits from another connection during the first "
+	     "refresh attempt",
+	     LogicalType::VARCHAR, Value("")},
+	    // Native refresh can optimize the finished incremental plan against the current deltas because the
+	    // generated SQL is executed immediately. The reusable base-view template always stays data-independent.
+	    {"openivm_enable_data_dependent_optimizers",
+	     "optimize the finished incremental plan using current delta statistics", LogicalType::BOOLEAN, on},
+	    // Per-optimization flags
+	    {"openivm_skip_empty_deltas", "skip refresh or join terms when deltas are empty", LogicalType::BOOLEAN, on},
+	    {"openivm_compact_deltas", "compact raw delta rows into net logical Z-set deltas before refresh",
+	     LogicalType::BOOLEAN, on},
+	    {"openivm_ducklake_nterm", "use N-term telescoping for DuckLake joins (vs 2^N-1 inclusion-exclusion)",
+	     LogicalType::BOOLEAN, on},
+	    {"openivm_regular_nterm", "use N-term telescoping for compile-only regular inner joins", LogicalType::BOOLEAN,
+	     on},
+	    {"openivm_regular_nterm_left", "extend compile-only N-term telescoping to LEFT-join projection views",
+	     LogicalType::BOOLEAN, on},
+	    {"openivm_fk_pruning", "prune inclusion-exclusion join terms using FK constraints", LogicalType::BOOLEAN, on},
+	    {"openivm_emit_spark_hints", "emit Spark optimizer hints in target_dialect=spark compiled refresh SQL",
+	     LogicalType::BOOLEAN, off},
+	    {"openivm_skip_aggregate_delete", "skip zero-row DELETE for grouped aggregates when deltas are insert-only",
+	     LogicalType::BOOLEAN, on},
+	    {"openivm_skip_projection_delete", "skip DELETE and consolidation for projections when deltas are insert-only",
+	     LogicalType::BOOLEAN, on},
+	    {"openivm_minmax_incremental", "use GREATEST/LEAST for MIN/MAX when deltas are insert-only",
+	     LogicalType::BOOLEAN, on},
+	    {"openivm_running_window_incremental",
+	     "extend cumulative running window aggregates for append-only suffix batches", LogicalType::BOOLEAN, off},
+	    {"openivm_having_merge",
+	     "use MERGE for HAVING views (store all groups, VIEW filters) instead of group-recompute", LogicalType::BOOLEAN,
+	     on},
+	    {"openivm_left_join_merge",
+	     "use incremental MERGE for LEFT JOIN aggregates (Larson & Zhou) instead of group-recompute",
+	     LogicalType::BOOLEAN, on},
+	    {"openivm_full_outer_merge",
+	     "use incremental MERGE for FULL OUTER JOIN aggregates (Zhang & Larson) instead of group-recompute",
+	     LogicalType::BOOLEAN, on},
+	    {"openivm_distinct_aux_state",
+	     "use auxiliary count state for inner DISTINCT under aggregate (DBSP distinct(R)=sgn(R[t]) — emit ±1 only on "
+	     "count transitions across zero) instead of GROUP_RECOMPUTE. Single-source views only in v0; multi-source "
+	     "views fall back to GROUP_RECOMPUTE.",
+	     LogicalType::BOOLEAN, off},
+	    {"openivm_stateful_auxstate",
+	     "use persisted auxiliary state for stateful operators such as COUNT(DISTINCT) instead of GROUP_RECOMPUTE",
+	     LogicalType::BOOLEAN, off},
+	    // Learned cost model
+	    {"openivm_cost_decay", "decay factor for learned cost model regression (0.0-1.0, higher = slower adaptation)",
+	     LogicalType::DOUBLE, Value::DOUBLE(0.9)},
+	    {"openivm_profile_refresh", "record per-step materialized view refresh timings", LogicalType::BOOLEAN, off},
+	    {"openivm_archive_compiled_sql", "archive executed CREATE and refresh SQL in metadata tables",
+	     LogicalType::BOOLEAN, off},
+	    {"openivm_profile_retention_days",
+	     "delete refresh profile rows older than this many days when profiling is written", LogicalType::BIGINT,
+	     Value::BIGINT(31)},
+	    {"openivm_explain_initial_load", "print CREATE MATERIALIZED VIEW initial-load SQL and EXPLAIN plans",
+	     LogicalType::BOOLEAN, off},
+	    {"openivm_snapshot_publication", "publish unordered DuckLake materialized views through retained snapshots",
+	     LogicalType::BOOLEAN, off},
+	    {"openivm_explain_initial_load_only", "diagnose CREATE MATERIALIZED VIEW initial load without executing DDL",
+	     LogicalType::BOOLEAN, off},
+	    {openivm::INTERNAL_SCHEMA_SETTING,
+	     "schema for OpenIVM internal maintenance tables within each data catalog; empty keeps them beside the "
+	     "materialized view and its sources",
+	     LogicalType::VARCHAR, Value("")},
+	};
+	for (auto &option : plain_options) {
+		db_config.AddExtensionOption(option.name, option.description, option.type, option.default_value);
+	}
+
 	// 'auto' is the non-forcing mode: like 'incremental', it never forces a full recompute; adaptive
 	// IVM-vs-full selection is controlled separately by openivm_adaptive_refresh.
 	db_config.AddExtensionOption(
@@ -189,85 +227,36 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    }
 		    parameter = Value(mode);
 	    });
-	db_config.AddExtensionOption("openivm_adaptive_refresh",
-	                             "experimental: enable adaptive cost model (when off, always use IVM)",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-	db_config.AddExtensionOption("openivm_cascade_refresh", "cascade mode: off, upstream, downstream, or both",
-	                             LogicalType::VARCHAR, Value("downstream"));
-	db_config.AddExtensionOption("openivm_adaptive_backoff",
-	                             "auto-increase refresh interval when refresh takes longer than the interval",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("openivm_disable_daemon", "disable the refresh daemon (for shadow/compile-only DBs)",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
-	// Native refresh can optimize the finished incremental plan against the current deltas because the
-	// generated SQL is executed immediately. The reusable base-view template always stays data-independent.
-	db_config.AddExtensionOption("openivm_enable_data_dependent_optimizers",
-	                             "optimize the finished incremental plan using current delta statistics",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-
-	// Per-optimization flags (default: all enabled)
-	db_config.AddExtensionOption("openivm_skip_empty_deltas", "skip refresh or join terms when deltas are empty",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("openivm_compact_deltas",
-	                             "compact raw delta rows into net logical Z-set deltas before refresh",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("openivm_ducklake_nterm",
-	                             "use N-term telescoping for DuckLake joins (vs 2^N-1 inclusion-exclusion)",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("openivm_regular_nterm", "use N-term telescoping for compile-only regular inner joins",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("openivm_regular_nterm_left",
-	                             "extend compile-only N-term telescoping to LEFT-join projection views",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("openivm_fk_pruning", "prune inclusion-exclusion join terms using FK constraints",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("openivm_emit_spark_hints",
-	                             "emit Spark optimizer hints in target_dialect=spark compiled refresh SQL",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	// Metadata placement is a property of the database, not of one session: two sessions
+	// using different locations would split one database's materialized views. Plain SET
+	// therefore applies globally, so helper connections and the daemon see it too.
+	auto validate_placement = [](ClientContext &, SetScope scope, Value &parameter) {
+		if (scope == SetScope::SESSION) {
+			throw InvalidInputException("OpenIVM metadata placement is database-wide; use SET or SET GLOBAL, not "
+			                            "SET SESSION");
+		}
+		if (parameter.IsNull()) {
+			parameter = Value("");
+		}
+	};
+	db_config.AddExtensionOption(openivm::METADATA_CATALOG_SETTING,
+	                             "attached catalog that stores OpenIVM metadata (empty: each native view catalog, or "
+	                             "the default database for external catalogs)",
+	                             LogicalType::VARCHAR, Value(""), validate_placement, SetScope::GLOBAL);
+	db_config.AddExtensionOption(openivm::METADATA_SCHEMA_SETTING,
+	                             "schema that stores OpenIVM metadata; empty retains its existing schema",
+	                             LogicalType::VARCHAR, Value(""), validate_placement, SetScope::GLOBAL);
 	db_config.AddExtensionOption(duckdb::OPENIVM_INPUT_DIALECT_SETTING,
 	                             "SQL dialect materialized-view bodies are written in: duckdb (default) or spark",
 	                             LogicalType::VARCHAR, Value("duckdb"), duckdb::SetOpenIvmInputDialect);
-	db_config.AddExtensionOption("openivm_skip_aggregate_delete",
-	                             "skip zero-row DELETE for grouped aggregates when deltas are insert-only",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("openivm_skip_projection_delete",
-	                             "skip DELETE and consolidation for projections when deltas are insert-only",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("openivm_minmax_incremental",
-	                             "use GREATEST/LEAST for MIN/MAX when deltas are insert-only", LogicalType::BOOLEAN,
-	                             Value::BOOLEAN(true));
-	db_config.AddExtensionOption("openivm_running_window_incremental",
-	                             "extend cumulative running window aggregates for append-only suffix batches",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-	db_config.AddExtensionOption("openivm_having_merge",
-	                             "use MERGE for HAVING views (store all groups, VIEW filters) "
-	                             "instead of group-recompute",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-
-	db_config.AddExtensionOption("openivm_left_join_merge",
-	                             "use incremental MERGE for LEFT JOIN aggregates (Larson & Zhou) "
-	                             "instead of group-recompute",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("openivm_full_outer_merge",
-	                             "use incremental MERGE for FULL OUTER JOIN aggregates (Zhang & Larson) "
-	                             "instead of group-recompute",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("openivm_distinct_aux_state",
-	                             "use auxiliary count state for inner DISTINCT under aggregate (DBSP "
-	                             "distinct(R)=sgn(R[t]) — emit ±1 only on count transitions across zero) "
-	                             "instead of GROUP_RECOMPUTE. Single-source views only in v0; multi-source "
-	                             "views fall back to GROUP_RECOMPUTE.",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-	db_config.AddExtensionOption("openivm_stateful_auxstate",
-	                             "use persisted auxiliary state for stateful operators such as "
-	                             "COUNT(DISTINCT) instead of GROUP_RECOMPUTE",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-
-	// Learned cost model
-	db_config.AddExtensionOption("openivm_cost_decay",
-	                             "decay factor for learned cost model regression (0.0-1.0, higher = slower adaptation)",
-	                             LogicalType::DOUBLE, Value::DOUBLE(0.9));
+	db_config.AddExtensionOption("openivm_compiled_sql_retention", "maximum archived versions per view and operation",
+	                             LogicalType::BIGINT, Value::BIGINT(10), [](ClientContext &, SetScope, Value &value) {
+		                             if (value.IsNull() || value.GetValue<int64_t>() < 1) {
+			                             throw InvalidInputException(
+			                                 "openivm_compiled_sql_retention must be at least 1");
+		                             }
+	                             });
 
 	// View matching (master flag — ALL matcher behavior gated by this).
 	// Default false: view matching is experimental.
@@ -287,147 +276,57 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	db_config.AddExtensionOption("openivm_match_log_retention", "max rows per query_hash retained in openivm_match_log",
 	                             LogicalType::BIGINT, Value::BIGINT(50));
-	db_config.AddExtensionOption("openivm_profile_refresh", "record per-step materialized view refresh timings",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-	db_config.AddExtensionOption("openivm_profile_retention_days",
-	                             "delete refresh profile rows older than this many days when profiling is written",
-	                             LogicalType::BIGINT, Value::BIGINT(31));
-	db_config.AddExtensionOption("openivm_explain_initial_load",
-	                             "print CREATE MATERIALIZED VIEW initial-load SQL and EXPLAIN plans",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-	db_config.AddExtensionOption("openivm_snapshot_publication",
-	                             "publish unordered DuckLake materialized views "
-	                             "through retained snapshots",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-	db_config.AddExtensionOption("openivm_explain_initial_load_only",
-	                             "diagnose CREATE MATERIALIZED VIEW initial load without executing DDL",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	Connection con(instance);
+	// Upgrade existing metadata in the schema that already holds it.
+	try {
+		RefreshMetadata::UseCatalog(*con.context, con);
+	} catch (std::exception &ex) {
+		OPENIVM_DEBUG_PRINT("[METADATA] Keeping the default schema for load-time upgrades: %s\n", ex.what());
+	}
 
-	// Migration: add new columns to existing openivm_views tables
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS refresh_interval BIGINT DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS refresh_in_progress BOOLEAN DEFAULT false");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS pending_after_hook BOOLEAN DEFAULT NULL");
+	// Use the complete definitions at LOAD as well as CREATE MV. Creating history
+	// without strategy and then ALTERing it leaves a timestamp-default rebind in
+	// the WAL, which cannot run before DuckDB initializes its default database.
+	for (auto &table : {openivm::HISTORY_TABLE, openivm::PROFILE_TABLE, openivm::MATCH_LOG_TABLE,
+	                    openivm::MV_DEPS_TABLE, openivm::CONSTRAINTS_CACHE_TABLE}) {
+		con.Query(CreateMetadataTableSQL(table));
+	}
+	// Upgrade view and source metadata created by older releases; fresh databases have none yet, so these
+	// fail harmlessly. CREATE MV runs the same migration for every other metadata location.
+	vector<string> migrations;
+	for (auto &table : {openivm::VIEWS_TABLE, openivm::DELTA_TABLES_TABLE, openivm::HISTORY_TABLE}) {
+		AppendMetadataMigrationSQL(migrations, table);
+	}
+	for (auto &sql : HasJoinBackfillSQL()) {
+		migrations.push_back(sql);
+	}
+	for (auto &sql : migrations) {
+		con.Query(sql);
+	}
 
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS published_query VARCHAR DEFAULT NULL");
-
-	// Migration: create refresh history table for learned cost model.
-	// Silently fails on fresh DB (core_functions not yet loaded → DEFAULT
-	// current_timestamp can't resolve). The parser recreates it with the
-	// default at first MV creation, so INSERTs (which omit refresh_timestamp)
-	// work. This stanza only matters for legacy DBs where the table already
-	// exists without the default.
-	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::HISTORY_TABLE) +
-	          " (view_name VARCHAR, refresh_timestamp TIMESTAMP DEFAULT current_timestamp,"
-	          " method VARCHAR, incremental_compute_est DOUBLE, incremental_upsert_est DOUBLE,"
-	          " recompute_compute_est DOUBLE, recompute_replace_est DOUBLE,"
-	          " actual_duration_ms BIGINT,"
-	          " PRIMARY KEY(view_name, refresh_timestamp))");
-	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::PROFILE_TABLE) +
-	          " (refresh_id VARCHAR, view_name VARCHAR, profile_timestamp TIMESTAMP DEFAULT current_timestamp,"
-	          " step_order INTEGER, step_name VARCHAR, duration_ms BIGINT, detail VARCHAR,"
-	          " PRIMARY KEY(refresh_id, step_order))");
-
-	// View-matching CREATEs first (always succeed), ALTERs after. ALTERs that
-	// hit not-yet-existing tables on a fresh DB fail silently — the parser's
-	// CREATE TABLE includes these columns directly, so fresh DBs are fine.
-	// ALTERs are backward-compat for legacy DBs.
-	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::MATCH_LOG_TABLE) +
-	          " (query_hash UBIGINT,"
-	          " log_timestamp TIMESTAMP,"
-	          " matched_view VARCHAR,"
-	          " chosen_strategy VARCHAR,"
-	          " bypass_cost_est DOUBLE,"
-	          " chosen_cost_est DOUBLE,"
-	          " actual_duration_ms BIGINT,"
-	          " PRIMARY KEY (query_hash, log_timestamp))");
-	con.Query(CreateMVDependenciesSQL());
-	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::CONSTRAINTS_CACHE_TABLE) +
-	          " (table_name VARCHAR, constraint_kind VARCHAR,"
-	          " columns_json VARCHAR, referenced_table VARCHAR,"
-	          " referenced_columns_json VARCHAR,"
-	          " is_trusted BOOLEAN DEFAULT true,"
-	          " PRIMARY KEY (table_name, constraint_kind, columns_json))");
-
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS signature_hash UBIGINT DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS canonical_plan_blob BLOB DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS output_columns_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS predicate_summary_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS fd_summary_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS source_tables_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS aggregate_decomposition_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS nullified_columns_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS distinct_aux_meta_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS count_distinct_aux_meta_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS semi_anti_aux_meta_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS leftjoin_secondary_meta_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS lineage_json VARCHAR DEFAULT NULL");
-
-	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS pending_row_estimate BIGINT DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS pending_estimate_ts TIMESTAMP DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS source_catalog VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS source_schema VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS source_table_id BIGINT DEFAULT NULL");
-
-	con.Query("ALTER TABLE " + string(openivm::HISTORY_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS strategy VARCHAR DEFAULT 'incremental'");
-
+	RegisterMaterializedViewGrammar(instance);
 	auto materialized_view_parser = duckdb::MaterializedViewParserExtension();
 
 	auto incremental_rewrite_rule = duckdb::IncrementalRewriteRule();
 	auto refresh_insert_rule = duckdb::RefreshInsertRule();
 
 	ParserExtension::Register(db_config, std::move(materialized_view_parser));
+	PlannerExtension mv_lifecycle;
+	mv_lifecycle.post_bind_function = BindMaterializedViewLifecycle;
+	PlannerExtension::Register(db_config, std::move(mv_lifecycle));
 	OptimizerExtension::Register(db_config, std::move(incremental_rewrite_rule));
 	OptimizerExtension::Register(db_config, std::move(refresh_insert_rule));
 
-	loader.RegisterFunction(PragmaFunction::PragmaCall("openivm_materialized_view_lifecycle",
-	                                                   MaterializedViewLifecycleQuery, {LogicalType::VARCHAR}));
-	loader.RegisterFunction(PragmaFunction::PragmaCall("openivm_materialized_view_drop", MaterializedViewDropQuery,
-	                                                   {LogicalType::VARCHAR}));
-	loader.RegisterFunction(TableFunction(
-	    "openivm_execute_drop_view",
-	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
-	    ExecuteDropView, BindDropView, InitDropView));
-	loader.RegisterFunction(TableFunction(
-	    "openivm_execute_drop_table",
-	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
-	    ExecuteDropView, BindDropTable, InitDropView));
+	loader.RegisterFunction(SourceWatermarkFunction());
+	loader.RegisterFunction(SourceColumnsFunction());
+	loader.RegisterFunction(CreateDeltaFromDataFunction());
+	loader.RegisterFunction(DropEntryFunction(CatalogType::VIEW_ENTRY));
+	loader.RegisterFunction(DropEntryFunction(CatalogType::TABLE_ENTRY));
+	loader.RegisterFunction(DropEntryFunction(CatalogType::SCHEMA_ENTRY));
 
-	TableFunction compute_delta_function("ComputeDelta",
-	                                     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                     ComputeDeltaFunction, ComputeDeltaBind, ComputeDeltaInit);
-
-	con.BeginTransaction();
-	auto &catalog = Catalog::GetSystemCatalog(*con.context);
-	compute_delta_function.name = "ComputeDelta";
-	compute_delta_function.named_parameters["view_catalog_name"];
-	compute_delta_function.named_parameters["view_schema_name"];
-	compute_delta_function.named_parameters["view_name"];
-	CreateTableFunctionInfo compute_delta_function_info(compute_delta_function);
-	catalog.CreateTableFunction(*con.context, &compute_delta_function_info);
+	loader.RegisterFunction(TableFunction("ComputeDelta",
+	                                      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                      ComputeDeltaFunction, ComputeDeltaBind));
 
 	// openivm_compile_with_facts(view_name VARCHAR, facts_json VARCHAR)
 	//   → (refresh_type INTEGER, refresh_type_name VARCHAR, stmt_order INTEGER,
@@ -438,14 +337,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// refresh program. The facts_json controls dialect (target_dialect),
 	// compile-only behaviour, and downstream-cascade hints; see
 	// compile_facts.hpp for the schema.
-	TableFunction openivm_compile_with_facts_function(
-	    "openivm_compile_with_facts", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	    openivm::OpenIvmCompileWithFactsExecute, openivm::OpenIvmCompileWithFactsBind,
-	    openivm::OpenIvmCompileWithFactsInit);
-	CreateTableFunctionInfo openivm_compile_with_facts_info(openivm_compile_with_facts_function);
-	catalog.CreateTableFunction(*con.context, &openivm_compile_with_facts_info);
-
-	con.Commit();
+	loader.RegisterFunction(TableFunction("openivm_compile_with_facts", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                      openivm::OpenIvmCompileWithFactsExecute, openivm::OpenIvmCompileWithFactsBind,
+	                                      openivm::OpenIvmCompileWithFactsInit));
 
 	auto refresh_options =
 	    PragmaFunction::PragmaCall("refresh_options", TransactionalRefreshQuery,
@@ -455,26 +349,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(refresh);
 	loader.RegisterFunction(PragmaFunction::PragmaCall("refresh_pipeline", RefreshPipelineQuery, {LogicalType::VARCHAR},
 	                                                   LogicalType::VARCHAR));
-	auto declare_rely_fk = PragmaFunction::PragmaCall(
+	loader.RegisterFunction(openivm::DeclareRelyFKFunction());
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
 	    "openivm_declare_rely_fk",
-	    [](ClientContext &, const FunctionParameters &parameters) -> string {
-		    string child_table = StringValue::Get(parameters.values[0]);
-		    auto child_columns = ParsePragmaColumnList(StringValue::Get(parameters.values[1]));
-		    string parent_table = StringValue::Get(parameters.values[2]);
-		    auto parent_columns = ParsePragmaColumnList(StringValue::Get(parameters.values[3]));
-		    if (child_columns.empty() || child_columns.size() != parent_columns.size()) {
-			    throw InvalidInputException("openivm_declare_rely_fk requires matching child/parent column lists");
+	    [](ClientContext &, const FunctionParameters &parameters) {
+		    vector<string> arguments;
+		    for (auto &value : parameters.values) {
+			    arguments.push_back(value.ToSQLString());
 		    }
-		    return "INSERT OR REPLACE INTO " + string(openivm::CONSTRAINTS_CACHE_TABLE) +
-		           " (table_name, constraint_kind, columns_json, referenced_table, "
-		           "referenced_columns_json, is_trusted) VALUES ('" +
-		           SqlUtils::EscapeValue(child_table) + "', 'RELY_FK', '" +
-		           SqlUtils::EscapeValue(SqlUtils::JsonArray(child_columns)) + "', '" +
-		           SqlUtils::EscapeValue(parent_table) + "', '" +
-		           SqlUtils::EscapeValue(SqlUtils::JsonArray(parent_columns)) + "', true);";
+		    return "SELECT * FROM openivm_register_rely_fk(" + StringUtil::Join(arguments, ",") + ")";
 	    },
-	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
-	loader.RegisterFunction(declare_rely_fk);
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}));
 	auto refresh_cost = PragmaFunction::PragmaCall("refresh_cost", RefreshCostQuery, {LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_cost);
 	auto refresh_history =
@@ -493,7 +378,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    view_name = ResolveViewCatalogFromContext(context, con, view_name).view_name;
 		    RefreshMetadata(con).GetViewType(view_name);
 		    Value directory;
-		    bool enabled = context.TryGetCurrentSetting("openivm_files_path", directory) && !directory.IsNull();
+		    bool enabled =
+		        context.TryGetCurrentSetting(Identifier("openivm_files_path"), directory) && !directory.IsNull();
 		    auto &fs = FileSystem::GetFileSystem(context);
 		    auto cwd = FileSystem::GetWorkingDirectory();
 		    vector<string> rows;
@@ -544,11 +430,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    string last_refresh = "NULL";
 		    string next_refresh = "NULL";
 		    if (!last_update_result->HasError() && last_update_result->RowCount() > 0 &&
-		        !last_update_result->GetValue(0, 0).IsNull()) {
-			    last_refresh = "'" + last_update_result->GetValue(0, 0).ToString() + "'";
+		        !last_update_result->Collection().GetValue(0, 0).IsNull()) {
+			    last_refresh = "'" + last_update_result->Collection().GetValue(0, 0).ToString() + "'";
 			    if (interval > 0) {
-				    next_refresh = "'" + last_update_result->GetValue(0, 0).ToString() + "'::TIMESTAMP + INTERVAL '" +
-				                   to_string(interval) + " seconds'";
+				    next_refresh = "'" + last_update_result->Collection().GetValue(0, 0).ToString() +
+				                   "'::TIMESTAMP + INTERVAL '" + to_string(interval) + " seconds'";
 			    }
 		    }
 
@@ -567,21 +453,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 			    }
 		    }
 
-		    // Query RefreshType directly, same pattern as GetRefreshInterval — returns
-		    // 'unknown' on failure rather than throwing. Order MUST mirror RefreshType enum
-		    // in src/include/core/openivm_constants.hpp.
-		    static const char *kTypeNames[] = {
-		        "aggregate_group",      "simple_aggregate",   "simple_projection", "full_refresh",
-		        "aggregate_having",     "window_partition",   "group_recompute",   "top_k",
-		        "distinct_incremental", "semi_anti_recompute"};
+		    // Report 'unknown' rather than failing when the type is missing or invalid.
 		    string strategy_str = "'unknown'";
-		    auto type_result = con.Query("SELECT type FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-		                                 SqlUtils::EscapeValue(view_name) + "'");
-		    if (!type_result->HasError() && type_result->RowCount() > 0 && !type_result->GetValue(0, 0).IsNull()) {
-			    auto idx = static_cast<size_t>(type_result->GetValue(0, 0).GetValue<int8_t>());
-			    if (idx < sizeof(kTypeNames) / sizeof(kTypeNames[0])) {
-				    strategy_str = "'" + string(kTypeNames[idx]) + "'";
-			    }
+		    try {
+			    strategy_str = "'" + StringUtil::Lower(RefreshTypeName(metadata.GetViewType(view_name))) + "'";
+		    } catch (std::exception &) {
 		    }
 
 		    return "SELECT " + parameters.values[0].ToSQLString() + " AS view_name, " + interval_str +
@@ -611,14 +487,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(refresh_start_daemon);
 
 	// Start the refresh daemon unless disabled (e.g. shadow/compile-only DBs).
-	bool daemon_disabled = false;
-	{
-		Value disable_val;
-		if (con.context->TryGetCurrentSetting("openivm_disable_daemon", disable_val) && !disable_val.IsNull()) {
-			daemon_disabled = disable_val.GetValue<bool>();
-		}
-	}
-	if (!daemon_disabled) {
+	if (!SqlUtils::GetBoolSetting(*con.context, "openivm_disable_daemon", false)) {
 		global_daemon = make_shared_ptr<RefreshDaemon>();
 		global_daemon->Start(instance);
 	}

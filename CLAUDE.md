@@ -105,7 +105,7 @@ Three compilation paths based on view type (`RefreshType`):
 | `SIMPLE_PROJECTION` | `CompileProjectionsFilters()` | Counting-based consolidation (GROUP BY + generate_series/rowid for bag semantics) |
 | `WINDOW_PARTITION` | `CompileWindowRecompute()` or DuckLake snapshot diff | Delete/reinsert only affected partitions |
 | `GROUP_RECOMPUTE` | `CompileGroupRecompute()` | Delete/reinsert only affected groups; used for inner DISTINCT under aggregate and other non-linear group cases |
-| `DISTINCT_INCREMENTAL` | `CompileDistinctIncremental()` | Aux-state path for single-source inner DISTINCT under one SUM when `openivm_distinct_aux_state=true`; falls back to group-recompute if metadata is missing |
+| `DISTINCT_INCREMENTAL` | `CompileDistinctIncremental()` | Aux-state path for single-source inner DISTINCT under one SUM when `openivm_distinct_aux_state=true`; refresh throws if aux metadata is missing (no silent fallback) |
 | `FULL_REFRESH` | `BuildRecomputeQuery()` | DELETE all rows from `openivm_data_<view>`, INSERT full query, then cleanup deltas |
 
 MIN/MAX and ARG_MIN/ARG_MAX usually force group-recompute unless insert-only fast paths are enabled and safe. AVG is decomposed to SUM+COUNT; STDDEV/VARIANCE are decomposed to SUM, COUNT, and sum-of-squares helper columns.
@@ -150,6 +150,10 @@ MIN/MAX and ARG_MIN/ARG_MAX usually force group-recompute unless insert-only fas
 | `openivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh exceeds interval |
 | `openivm_disable_daemon` | BOOLEAN | `false` | Disable the background refresh daemon |
 | `openivm_files_path` | VARCHAR | — | Path for compiled query reference files |
+| `openivm_metadata_catalog` | VARCHAR | `""` | Database-wide attached catalog (native DuckDB or `TYPE postgres`) for OpenIVM metadata; empty keeps it next to each native view catalog. See `docs/internals/metadata-placement.md` |
+| `openivm_metadata_schema` | VARCHAR | `""` | Schema for control metadata per native catalog; empty keeps the existing schema (`main` for new metadata). Internal MV/delta objects never follow it (`docs/internals/metadata-placement.md`) |
+| `openivm_internal_schema` | VARCHAR | `""` | Schema for internal maintenance tables within each data catalog; empty keeps them beside the MV/source. Stored per view (`openivm_views.internal_schema`) and per source (`openivm_delta_tables.delta_schema`) |
+| `openivm_metadata_lease_seconds` | BIGINT | `600` | Refresh lease for clients sharing a remote metadata catalog |
 | `openivm_cost_decay` | DOUBLE | `0.9` | Decay factor for learned cost model regression (0.0–1.0) |
 | `openivm_skip_empty_deltas` | BOOLEAN | `true` | Skip refresh or join terms when deltas are empty |
 | `openivm_ducklake_nterm` | BOOLEAN | `true` | N-term telescoping for DuckLake joins (vs 2^N-1) |

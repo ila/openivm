@@ -1,0 +1,61 @@
+# name: test/sql/metadata_schema_ducklake.test
+# description: DuckLake MVs keep control metadata in the native frontend's openivm_metadata_schema and their backing, delta and publication tables in the lake schema
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository';
+
+statement ok
+LOAD ducklake;
+
+statement ok
+SET openivm_metadata_schema = 'openivm';
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_metadata_schema_ducklake.db' AS dl (TYPE ducklake);
+
+statement ok
+CREATE SCHEMA dl.obs;
+
+statement ok
+CREATE TABLE dl.obs.readings (sensor INTEGER, val INTEGER);
+
+statement ok
+INSERT INTO dl.obs.readings VALUES (1, 10), (1, 20), (2, 5), (3, NULL);
+
+# First-MV discovery has only lake sources, but still reads native catalogs.
+# Shared metadata initialization must not leave the caller on that old snapshot.
+statement ok
+SET openivm_internal_schema = 'Bootstrap Internal';
+
+statement ok
+CREATE MATERIALIZED VIEW main.lake_bootstrap AS SELECT * FROM dl.obs.readings;
+
+query I
+SELECT count(*) FROM memory.openivm.openivm_views
+WHERE view_sql_name='lake_bootstrap' AND view_catalog='memory' AND internal_schema='Bootstrap Internal';
+----
+1
+
+statement ok
+INSERT INTO dl.obs.readings VALUES (4, 7),(4, 7),(5, 9);
+DELETE FROM dl.obs.readings WHERE sensor=5;
+UPDATE dl.obs.readings SET val=8 WHERE sensor=4;
+
+statement ok
+PRAGMA refresh('main.lake_bootstrap');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.lake_bootstrap EXCEPT ALL SELECT * FROM dl.obs.readings)
+UNION ALL (SELECT * FROM dl.obs.readings EXCEPT ALL SELECT * FROM main.lake_bootstrap));
+----
+0
+
+statement ok
+DROP VIEW main.lake_bootstrap;
+DELETE FROM dl.obs.readings WHERE sensor=4;
+SET openivm_internal_schema = '';

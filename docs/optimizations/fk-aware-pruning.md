@@ -132,6 +132,16 @@ The compiler first checks whether FK pruning would eliminate any inclusion-exclu
 terms. If so, it keeps the smaller FK-pruned inclusion-exclusion plan. Otherwise, it
 uses the N-term plan.
 
+Trusted FK declarations resolve table names against the caller's catalog and schema
+search path and store fully qualified identities. Two-part names follow DuckDB's
+schema-or-catalog resolution: `data.fact` can refer to an attached database's default
+schema. If a schema and an attached database share that name, use the full
+`catalog.schema.table` name to resolve the ambiguity. Quoted names follow the same rules.
+A declaration for `a.fact` cannot
+authorize pruning for `b.fact`, even if their columns have identical names. Existing
+declarations stored with unqualified names are not used for pruning; redeclare them
+with the pragma to bind their identities.
+
 ## When It Does Not Apply
 
 - No FK constraints declared between join tables
@@ -196,3 +206,21 @@ PRAGMA refresh('sales_by_product');  -- 2 terms pruned, 1 remaining
 - Ahmet Kara, Milos Nikolic, Dan Olteanu, Haozhe Zhang. "Insert-Only versus
   Insert-Delete in Dynamic Query Evaluation." Proc. ACM Manag. Data 2(3), 2024
   (SIGMOD). https://dl.acm.org/doi/10.1145/3695837
+
+## Declaration lifetime
+
+Native declarations bind both endpoints to durable table-incarnation tokens in
+`main.openivm_source_generations` of each source database. DROP, replacement, and column schema changes
+invalidate tokens locally, including while the control metadata catalog is
+detached. Rolling back the lifecycle change restores the token. Recreating a
+same-named table does not inherit its predecessor's assertions; declare them again.
+The tokens survive reopening the database. DuckLake endpoints use their durable
+DuckLake table IDs instead.
+
+A declaration whose sources and control metadata share one native catalog is
+transactional. Declarations spanning catalogs require autocommit and allocate
+local tokens before publishing the assertion through the existing staged DDL
+executor. A failed publication can leave an unused token, which grants no pruning
+rights without a matching assertion. Runtime declarations require native DuckDB or
+DuckLake identities; other target engines can supply FK facts explicitly to the
+compile-only interface.

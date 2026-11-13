@@ -1,0 +1,194 @@
+# name: test/sql/create_mv_quoted_name.test
+# description: CREATE MATERIALIZED VIEW rewrites only the statement header, never names, strings or query text
+# group: [sql]
+
+require openivm
+
+load __TEST_DIR__/create_mv_quoted_name_test.db
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+CREATE TABLE source(i INTEGER);
+
+statement ok
+INSERT INTO source VALUES (1),(2);
+
+# Issue #128: quoted name containing "materialized view"
+statement ok
+CREATE MATERIALIZED VIEW "my materialized view" AS SELECT * FROM source;
+
+query T
+SELECT view_name FROM duckdb_views() WHERE view_name LIKE 'my%';
+----
+my materialized view
+
+query T
+SELECT view_sql_name FROM openivm_views WHERE view_sql_name LIKE 'my%';
+----
+my materialized view
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name LIKE '%table if not exists%';
+----
+0
+
+statement ok
+INSERT INTO source VALUES (3),(4);
+
+statement ok
+PRAGMA refresh('"my materialized view"');
+
+query I
+SELECT count(*) FROM (SELECT * FROM "my materialized view" EXCEPT ALL SELECT * FROM source);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM source EXCEPT ALL SELECT * FROM "my materialized view");
+----
+0
+
+query I
+SELECT count(*) FROM "my materialized view";
+----
+4
+
+# Mixed-case keywords, whitespace-separated header
+statement ok
+CrEaTe   MaTeRiAlIzEd
+  ViEw "mixed materialized view" AS SELECT * FROM source;
+
+query T
+SELECT view_name FROM duckdb_views() WHERE view_name LIKE 'mixed%';
+----
+mixed materialized view
+
+# Escaped quote plus keyword text in the name
+statement ok
+CREATE MATERIALIZED VIEW "esc ""materialized view"" q" AS SELECT * FROM source;
+
+query T
+SELECT view_name FROM duckdb_views() WHERE view_name LIKE 'esc%';
+----
+esc "materialized view" q
+
+# Keyword text in string literals and dollar-quoted strings of the user query
+statement ok
+CREATE MATERIALIZED VIEW str_mv AS SELECT i, 'create materialized view' AS s1, $$create or replace materialized view$$ AS s2 FROM source;
+
+query I
+SELECT count(*) FROM str_mv WHERE s1='create materialized view' AND s2='create or replace materialized view';
+----
+4
+
+# Mixed-case CREATE OR REPLACE with "or replace" and "materialized view" inside the name
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW "x or replace materialized view y" AS SELECT i FROM source WHERE i<=2;
+
+query T
+SELECT view_name FROM duckdb_views() WHERE view_name LIKE 'x or%';
+----
+x or replace materialized view y
+
+statement ok
+Create Or Replace Materialized View "x or replace materialized view y" AS SELECT i FROM source WHERE i>2;
+
+query T
+SELECT view_name FROM duckdb_views() WHERE view_name LIKE 'x or%';
+----
+x or replace materialized view y
+
+statement ok
+INSERT INTO source VALUES (5);
+
+statement ok
+PRAGMA refresh('"x or replace materialized view y"');
+
+query I
+SELECT count(*) FROM (SELECT * FROM "x or replace materialized view y" EXCEPT ALL SELECT i FROM source WHERE i>2);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i FROM source WHERE i>2 EXCEPT ALL SELECT * FROM "x or replace materialized view y");
+----
+0
+
+# DROP removes the exact requested object
+statement ok
+DROP VIEW "my materialized view";
+
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name='my materialized view';
+----
+0
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_sql_name='my materialized view';
+----
+0
+
+# A quoted name or string literal containing "alter materialized view" is not an ALTER statement
+statement ok
+CREATE MATERIALIZED VIEW "alter materialized view x" AS SELECT i FROM source WHERE i<=2;
+
+query T
+SELECT view_name FROM duckdb_views() WHERE view_name LIKE 'alter%';
+----
+alter materialized view x
+
+statement ok
+INSERT INTO source VALUES (1);
+
+statement ok
+PRAGMA refresh('"alter materialized view x"');
+
+query I
+SELECT count(*) FROM (SELECT * FROM "alter materialized view x" EXCEPT ALL SELECT i FROM source WHERE i<=2);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i FROM source WHERE i<=2 EXCEPT ALL SELECT * FROM "alter materialized view x");
+----
+0
+
+statement ok
+DROP VIEW "alter materialized view x";
+
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name='alter materialized view x';
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW str_alter_mv AS SELECT i, 'alter materialized view' AS s FROM source;
+
+statement ok
+INSERT INTO source VALUES (7);
+
+statement ok
+PRAGMA refresh('str_alter_mv');
+
+query I
+SELECT count(*) FROM (SELECT * FROM str_alter_mv EXCEPT ALL SELECT i, 'alter materialized view' FROM source);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i, 'alter materialized view' FROM source EXCEPT ALL SELECT * FROM str_alter_mv);
+----
+0
+
+statement ok
+DROP VIEW str_alter_mv;
+
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name='str_alter_mv';
+----
+0

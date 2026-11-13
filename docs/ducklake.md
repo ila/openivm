@@ -44,7 +44,7 @@ schemas can contain views with the same name. Use a qualified name when refreshi
 or inspecting one of those views:
 
 ```sql
--- Control metadata stays in the native frontend database's main schema.
+-- By default, control metadata stays in the native frontend database's main schema.
 SELECT view_sql_name, view_catalog, view_schema, view_name AS internal_key
 FROM main.openivm_views;
 PRAGMA refresh('dl.observation.product_summary');
@@ -79,7 +79,7 @@ ORDER BY database_name, schema_name, table_name;
 ```
 
 For DuckLake MVs, OpenIVM's control tables (`openivm_views`,
-`openivm_delta_tables`, dependency and refresh-history tables) already live in
+`openivm_delta_tables`, dependency and refresh-history tables) live by default in
 `main` of the native DuckDB frontend database, not as Parquet tables in DuckLake.
 Start the CLI with a persistent frontend file to retain them between sessions:
 
@@ -90,9 +90,32 @@ Start the CLI with a persistent frontend file to retain them between sessions:
 Then attach the lake and create views in its catalog as in the quick start. After
 reopening the same frontend file, attach the same lake under the same catalog name
 before refreshing. Starting the CLI without a filename uses an in-memory frontend;
-its OpenIVM metadata will not survive closing the process. There is currently no
-setting to relocate OpenIVM control tables into an `openivm` schema. Do not move
-those tables manually.
+its OpenIVM metadata will not survive closing the process. Do not move the control
+tables manually.
+
+To keep the control tables elsewhere, select a metadata catalog and schema before
+creating views. The catalog can be another attached DuckDB file or a PostgreSQL
+database attached with the `postgres` extension:
+
+The [startup sequence below](#running-without-a-persistent-frontend-file) shows
+the settings and attachment order for PostgreSQL control metadata.
+
+Backing and delta tables still live in the lake. DuckLake catalogs cannot hold the
+location marker, so OpenIVM records it in the frontend database: a persistent frontend
+file finds the metadata again after reopening, while a process with an in-memory
+frontend sets these two settings at startup, before refreshing. Views cannot be created
+inside a PostgreSQL metadata catalog. DuckDB cannot commit the lake and the metadata catalog in one
+transaction, so refresh uses a crash-safe three-step protocol whose data step is one
+lake transaction (downstream views never see a partly refreshed backing table), and
+lifecycle statements
+and refreshes inside explicit transactions are rejected for these views. The PostgreSQL
+metadata integration test runs against a local PostgreSQL 16 in CI; managed providers
+are untested, and a client process running OpenIVM is still required. A source change
+another client commits while a refresh runs is never lost: the stored watermark is a
+snapshot with the source state the refresh read, and a refresh that saw a source change retries (see
+[concurrency](concurrency.md#ducklake-sources-changing-during-a-refresh)). See
+[metadata placement](internals/metadata-placement.md) for discovery, recovery and
+multi-client semantics.
 
 For native sources in another attached DuckDB database, refresh commits the MV
 and its watermark together, then cleans up external source deltas. Rollback
@@ -100,6 +123,56 @@ cancels that cleanup. Cleanup retains changes needed by other consumers, includi
 MVs whose metadata lives in another native catalog. If cleanup encounters a
 conflict, OpenIVM reports that the refresh committed and cleanup was deferred;
 the committed watermark prevents those retained changes from being applied twice.
+
+### Running without a persistent frontend file
+
+Launch the built CLI without a database filename:
+
+```bash
+./build/release/duckdb
+```
+
+The frontend is now in memory. Attach your existing lake as `dl`, then attach
+the persistent control database and select its metadata schema before creating
+or refreshing views. For example, with PostgreSQL control metadata:
+
+```sql
+INSTALL postgres;
+LOAD postgres;
+ATTACH 'dbname=openivm host=localhost' AS control (TYPE postgres);
+SET openivm_metadata_catalog = 'control';
+SET openivm_metadata_schema = 'openivm';
+SET openivm_internal_schema = 'openivm_internal';
+SET openivm_archive_compiled_sql = true;
+SET openivm_compiled_sql_retention = 1;
+```
+
+Replace the connection string with your control database's connection details.
+On first setup, create the lake's MVs after these settings. Internal tables are
+created in `openivm_internal` of the lake; user-facing MVs keep their requested
+schemas. This setting does not move internal tables of existing MVs.
+
+On subsequent startups, reattach the same lake and control database under the
+same aliases and repeat the settings. Then refresh the existing MV directly:
+
+```sql
+PRAGMA refresh('dl.observation.product_summary');
+
+SELECT view_catalog, view_schema, view_sql_name, operation, version,
+       statement_count, last_outcome
+FROM control.openivm.openivm_compiled_programs
+WHERE view_catalog = 'dl' AND view_schema = 'observation'
+  AND view_sql_name = 'product_summary'
+ORDER BY operation, version;
+```
+
+The metadata and SQL archive survive closing the CLI because they are in the
+control database. The in-memory frontend's discovery marker does not survive,
+which is why the attachment aliases and metadata settings must be restored.
+Leave `openivm_files_path` unset to avoid compiled SQL files. Run lifecycle and
+refresh statements in autocommit mode when control metadata is separate from
+the lake. Remote metadata still requires a client running OpenIVM; publishing
+the extension does not install it in a managed service's server processes.
 
 ### Empty delta tables
 
@@ -121,9 +194,12 @@ DuckLake MV delta objects would require a code change, not manual deletion.
 SQL files are written only when `openivm_files_path` is set before the relevant
 compilation. `PRAGMA openivm_files('product_summary')` shows their paths and whether
 they exist. See [Inspect the generated SQL](build/building.md#inspect-the-generated-sql)
-for directory setup and [saving compiled SQL in a table](build/building.md#inspect-or-save-compiled-sql-without-files).
-Saving compiler output as rows already works; automatically retaining the last
-executed program in OpenIVM's own metadata is not currently implemented.
+for directory setup. For automatic storage in metadata tables, set
+`openivm_archive_compiled_sql = true` before CREATE or refresh. The default retains
+the latest 10 distinct programs per view and operation; set
+`openivm_compiled_sql_retention = 1` to retain only the latest of each kind.
+No SQL artifact files are needed. See [archive controls](build/building.md#archived-compiled-sql)
+and [compile-only output](build/building.md#inspect-or-save-compiled-sql-without-files).
 
 ## How it works
 

@@ -1,6 +1,10 @@
 # Parser
 
-OpenIVM intercepts `CREATE MATERIALIZED VIEW`, `CREATE OR REPLACE MATERIALIZED VIEW`, and `ALTER MATERIALIZED VIEW` statements through a DuckDB parser override (`MaterializedViewParserExtension::OverrideFunction` in `src/core/parser_parse.cpp`). A recognized statement is replaced by the internal pragma `openivm_materialized_view_lifecycle`, which plans the view and returns the sequence of DDL operations that set up the materialized view, its delta tables, and its metadata. Native `DROP VIEW` and `DROP TABLE` statements are routed through the internal pragma `openivm_materialized_view_drop`, so dropping an MV or a tracked source table cleans up OpenIVM objects in the caller transaction.
+OpenIVM intercepts `CREATE MATERIALIZED VIEW`, `CREATE OR REPLACE MATERIALIZED VIEW`, and `ALTER MATERIALIZED VIEW` statements through a DuckDB parser override (`MaterializedViewParserExtension::OverrideFunction` in `src/core/parser_parse.cpp`). Each recognized statement becomes an extension AST; other statements retain their native ASTs and batch order. The native driver binds each lifecycle after preceding statements have executed. A post-bind planner hook renders its generated DDL into a deferred program whose steps bind and execute sequentially in the caller transaction. This preserves dependencies on earlier `CREATE TABLE`, `BEGIN`, and `DROP` statements; pragma preprocessing would run before those statements execute.
+
+The same planner hook routes native `DROP VIEW`, `DROP TABLE`, and `DROP SCHEMA ... CASCADE` through ownership cleanup. Schema cascades include MVs published in that schema and consumers of its sources or internal objects, including consumers registered in other metadata catalogs. Cleanup runs before the physical schema drop, retaining shared source deltas until their final consumer is removed. `DROP SCHEMA` without `CASCADE` keeps DuckDB's dependency checks. Cross-catalog cleanup uses the staged execution described below.
+
+For native schema CASCADE, the physical executor also discards pending local appends to the removed tables after the drop succeeds. The pinned DuckDB schema cascade bypasses the local-storage cleanup used by ordinary table DROP. Capturing the caller-visible table allocations before dropping the schema prevents commit from flushing into removed tables and permits schema/table names to be reused within the transaction; rollback restores the original catalog and data.
 
 Before planning, the statement text is lowercased outside single-quoted string literals, `--` comments are stripped, and `MATERIALIZED VIEW` is replaced with `TABLE IF NOT EXISTS` so DuckDB can parse the body. The query result is materialized into the data table `openivm_data_<internal_key>` (see [Metadata Columns](metadata-columns.md)). `CREATE OR REPLACE` replaces the old MV (view, data table, delta tables, metadata); changes still pending for downstream consumers are preserved in the replacement's delta table.
 
@@ -101,16 +105,18 @@ The IVM compatibility checker validates the entire plan tree, flagging unsupport
 The parser produces a sequence of DDL statements, but does not mutate the catalog
 during bind. Native-catalog lifecycle statements are rendered as a SQL program and
 execute in the caller transaction. A later lifecycle or refresh statement in that
-same transaction replays only the affected view's uncommitted metadata into
-constrained temporary shadow tables for compilation. DuckLake and other
+same transaction uses temporary metadata shadows for compilation. Lifecycle replay
+retains all committed ownership rows and applies transaction-local changes, so
+independent views sharing a source delta remain visible to cleanup. Only per-view
+bookkeeping is restricted to the affected dependency closure. DuckLake and other
 cross-catalog lifecycles use staged execution because DuckDB cannot commit writes to
 two attached catalogs in one transaction.
 
-1. **System tables**: `openivm_views`, `openivm_delta_tables`, `openivm_mv_dependencies`, `openivm_refresh_hooks`, `openivm_refresh_history`, and `openivm_refresh_profile`, created once in `main` of the native default database. In autocommit mode this runs in a short, serialized setup transaction; see [Concurrency](concurrency.md#locking).
+1. **System tables**: `openivm_views`, `openivm_delta_tables`, `openivm_mv_dependencies`, `openivm_refresh_hooks`, `openivm_refresh_history`, `openivm_refresh_profile`, and the compiled SQL archive (`openivm_compiled_programs`, `openivm_compiled_statements`). By default these live in the native MV catalog's `main` schema, or the native frontend's `main` for DuckLake views. [Metadata placement](metadata-placement.md) selects another catalog and schema. In autocommit mode local setup runs in a short, serialized transaction; see [Concurrency](concurrency.md#locking).
 2. **Metadata inserts**: Registers the internal key, SQL name, location, query string, type, and source table mappings.
 3. **MV table**: `CREATE TABLE openivm_data_<internal_key> AS <query>` to materialize the initial result.
 4. **Published table and view**: `openivm_visible_<internal_key>` holds the visible rows, `openivm_delta_openivm_visible_<internal_key>` their signed changes, and the SQL view `<view_name>` selects from the published table.
-5. **Delta tables**: One `openivm_delta_<table_name>` per native source table, in the source's catalog and schema, with `openivm_multiplicity` and `openivm_timestamp` columns. DuckLake sources get none.
+5. **Delta tables**: One delta per native source table, in the source's catalog, with `openivm_multiplicity` and `openivm_timestamp` columns. It stays beside the source unless `openivm_internal_schema` selects a separate schema; its persisted physical name distinguishes same-named sources. DuckLake sources get none. See [Metadata placement](metadata-placement.md) for the independent placement of backing, publication, auxiliary and delta objects.
 6. **Delta view table**: `openivm_delta_<internal_key>` for downstream chained MV support.
 7. **Index** (`AGGREGATE_GROUP` and `AGGREGATE_HAVING`, native MVs only): A unique index `openivm_data_<internal_key>openivm_index` on the GROUP BY columns, used by the MERGE INTO upsert strategy.
 

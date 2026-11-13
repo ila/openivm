@@ -4,10 +4,13 @@
 
 require openivm
 
+statement ok
+SET openivm_archive_compiled_sql = true;
+
 require parquet
 
 statement ok
-INSTALL ducklake;
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository';
 
 statement ok
 LOAD ducklake;
@@ -105,6 +108,25 @@ INSERT INTO dl.employees VALUES (1, 'Alice', 'eng'), (2, 'Bob', 'sales'), (3, 'C
 
 statement ok
 CREATE MATERIALIZED VIEW dl.mv_emp AS SELECT id, name FROM dl.employees;
+
+# DuckLake scans require statement rebind, but that alone must not force full refresh.
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'mv_emp';
+----
+2
+
+# A query-dependent macro still forces full refresh when the source itself also requires rebind.
+statement ok
+CREATE MACRO ducklake_nested_now() AS CURRENT_TIMESTAMP;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_emp_dynamic AS
+    SELECT id, ducklake_nested_now() AS observed_at FROM dl.employees;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'mv_emp_dynamic';
+----
+3
 
 statement ok
 SET openivm_profile_refresh = true;
@@ -948,6 +970,26 @@ SELECT count(*) FROM duckdb_views() WHERE database_name='dl' AND view_name LIKE 
 ----
 4
 
+# The archived CREATE holds the publication pinned to its committed snapshot and
+# the derived delta-table definitions that ran, not comments or executor operations.
+query IIII
+WITH s AS (
+  SELECT s.stmt_order, s.sql,
+         starts_with(s.sql, 'CREATE OR REPLACE VIEW ') AND contains(s.sql, 'openivm_visible_')
+             AND regexp_matches(s.sql, 'AT \(VERSION => \d+\)') AS is_publish
+  FROM openivm_compiled_programs p JOIN openivm_compiled_statements s USING (view_name, operation, version)
+  WHERE p.view_sql_name = 'snap_parent' AND p.operation = 'create'
+)
+SELECT count(*) FILTER (WHERE is_publish),
+       count(*) FILTER (WHERE starts_with(sql, 'create table if not exists ') AND contains(sql, 'openivm_delta_')
+           AND ends_with(sql, 'openivm_multiplicity INTEGER DEFAULT 1, openivm_timestamp TIMESTAMP DEFAULT make_timestamp(epoch_us(now())))')),
+       count(*) FILTER (WHERE starts_with(sql, '--') OR starts_with(sql, 'openivm_')),
+       min(stmt_order) FILTER (WHERE is_publish)
+           < min(stmt_order) FILTER (WHERE starts_with(sql, 'create table if not exists ') AND contains(sql, 'openivm_delta_openivm_visible_'))
+FROM s;
+----
+1	2	0	true
+
 statement ok
 SET openivm_snapshot_publication=false;
 
@@ -969,6 +1011,27 @@ SELECT (SELECT count(*) FROM (SELECT * FROM dl.snap_parent EXCEPT ALL SELECT * F
        (SELECT count(*) FROM (SELECT * FROM dl.snap_source EXCEPT ALL SELECT * FROM dl.snap_parent));
 ----
 0	0
+
+# The archived refresh includes the executed snapshot publication, pinned to a
+# committed snapshot, after the data statements and before the watermark update.
+query IIII
+WITH s AS (
+  SELECT s.stmt_order, s.sql,
+         starts_with(s.sql, 'CREATE OR REPLACE VIEW ') AND contains(s.sql, 'openivm_visible_')
+             AND regexp_matches(s.sql, 'AT \(VERSION => \d+\)') AS is_publish
+  FROM openivm_compiled_programs p JOIN openivm_compiled_statements s USING (view_name, operation, version)
+  WHERE p.view_sql_name = 'snap_parent' AND p.operation = 'refresh' AND p.last_outcome = 'committed'
+    AND p.version = (SELECT max(version) FROM openivm_compiled_programs WHERE view_sql_name = 'snap_parent' AND operation = 'refresh')
+)
+SELECT count(*) FILTER (WHERE is_publish),
+       max(stmt_order) FILTER (WHERE contains(sql, 'dl.main.openivm_data_') AND NOT is_publish)
+           < min(stmt_order) FILTER (WHERE is_publish),
+       min(stmt_order) FILTER (WHERE is_publish)
+           < min(stmt_order) FILTER (WHERE regexp_matches(sql, 'SET last_snapshot_id = \d+,')),
+       max(stmt_order) FILTER (WHERE sql ILIKE '%refresh_in_progress = false%') = max(stmt_order)
+FROM s;
+----
+1	true	true	true
 
 # Two parent publications before a delayed child refresh must preserve net bags.
 statement ok

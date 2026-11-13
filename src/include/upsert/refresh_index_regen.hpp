@@ -6,9 +6,9 @@
 
 namespace duckdb {
 
-using old_idx = idx_t;
-using new_idx = idx_t;
-using col_idx = idx_t;
+using old_idx = TableIndex;
+using new_idx = TableIndex;
+using col_idx = ProjectionIndex;
 
 struct RenumberWrapper {
 	unique_ptr<LogicalOperator> op;
@@ -17,10 +17,7 @@ struct RenumberWrapper {
 	bool contains_delim_operator;
 };
 
-RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder &binder);
 RenumberWrapper renumber_and_rebind_subtree(unique_ptr<LogicalOperator> plan, Binder &binder);
-ColumnBindingReplacer vec_to_replacer(const std::vector<ColumnBinding> &bindings,
-                                      const std::unordered_map<old_idx, new_idx> &table_mapping);
 
 } // namespace duckdb
 

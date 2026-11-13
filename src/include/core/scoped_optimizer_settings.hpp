@@ -16,8 +16,8 @@ inline string FinalPlanDisabledOptimizers(ClientContext &context, bool cross_sys
 		return openivm::TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;
 	}
 	Value setting;
-	if (context.TryGetCurrentSetting("openivm_enable_data_dependent_optimizers", setting) && !setting.IsNull() &&
-	    setting.GetValue<bool>()) {
+	if (context.TryGetCurrentSetting(Identifier("openivm_enable_data_dependent_optimizers"), setting) &&
+	    !setting.IsNull() && setting.GetValue<bool>()) {
 		return "";
 	}
 	return openivm::TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;

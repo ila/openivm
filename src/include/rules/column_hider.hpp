@@ -33,6 +33,10 @@ struct IncrementalTableNames {
 		return StringUtil::StartsWith(name, openivm::DATA_TABLE_PREFIX) ||
 		       StringUtil::StartsWith(name, openivm::VISIBLE_TABLE_PREFIX);
 	}
+	/// Tables owned by maintenance rather than user-source change capture.
+	static bool IsMaintenanceTable(const std::string &name) {
+		return StringUtil::StartsWith(name, openivm::DELTA_PREFIX) || IsDataTable(name);
+	}
 };
 
 } // namespace duckdb

@@ -1,12 +1,17 @@
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "rules/schema_evolution.hpp"
 
 #include "core/openivm_constants.hpp"
+#include "core/openivm_debug.hpp"
 #include "core/parser_plan_helpers.hpp"
+#include "core/parser_ddl.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/enums/database_modification_type.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
@@ -16,6 +21,12 @@
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/list.hpp"
+#include "duckdb/planner/bound_constraint.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/storage/table/update_state.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
 #include <unordered_set>
 
@@ -51,7 +62,7 @@ static vector<DependentView> GetDependentViews(Connection &con, const string &de
 	}
 	RefreshMetadata metadata(con);
 	for (idx_t i = 0; i < result->RowCount(); i++) {
-		auto name = result->GetValue(0, i).ToString();
+		auto name = result->Collection().GetValue(0, i).ToString();
 		auto location = metadata.GetStoredViewLocation(name);
 		views.push_back({std::move(name), std::move(location.catalog_name), std::move(location.schema_name)});
 	}
@@ -78,7 +89,7 @@ static void AddAlias(unordered_set<string> &aliases, const string &alias) {
 
 static void AddLocalTableAliases(TableRef &ref, const string &table_name, unordered_set<string> &all_aliases,
                                  unordered_set<string> &target_aliases) {
-	AddAlias(all_aliases, ref.alias);
+	AddAlias(all_aliases, ref.alias.GetIdentifierName());
 	if (ref.type == TableReferenceType::JOIN) {
 		auto &join = ref.Cast<JoinRef>();
 		AddLocalTableAliases(*join.left, table_name, all_aliases, target_aliases);
@@ -89,20 +100,22 @@ static void AddLocalTableAliases(TableRef &ref, const string &table_name, unorde
 		return;
 	}
 	auto &base = ref.Cast<BaseTableRef>();
-	AddAlias(all_aliases, base.table_name);
-	auto source_name = SqlUtils::QuoteIdentifier(base.table_name);
-	if (!base.schema_name.empty()) {
-		source_name = SqlUtils::QuoteIdentifier(base.schema_name) + "." + source_name;
+	AddAlias(all_aliases, base.Table().GetIdentifierName());
+	auto source_name = SqlUtils::QuoteIdentifier(base.Table().GetIdentifierName());
+	if (!base.GetQualifiedName().Schema().GetIdentifierName().empty()) {
+		source_name =
+		    SqlUtils::QuoteIdentifier(base.GetQualifiedName().Schema().GetIdentifierName()) + "." + source_name;
 	}
-	if (!base.catalog_name.empty()) {
-		source_name = SqlUtils::QuoteIdentifier(base.catalog_name) + "." + source_name;
+	if (!base.GetQualifiedName().Catalog().GetIdentifierName().empty()) {
+		source_name =
+		    SqlUtils::QuoteIdentifier(base.GetQualifiedName().Catalog().GetIdentifierName()) + "." + source_name;
 	}
 	if (!NamesMatch(source_name, table_name)) {
 		return;
 	}
-	AddAlias(target_aliases, base.table_name);
+	AddAlias(target_aliases, base.Table().GetIdentifierName());
 	if (!ref.alias.empty()) {
-		AddAlias(target_aliases, ref.alias);
+		AddAlias(target_aliases, ref.alias.GetIdentifierName());
 	}
 }
 
@@ -123,11 +136,11 @@ static unordered_set<string> ApplyLocalAliases(const unordered_set<string> &inhe
 
 static bool ColumnRefTargetsTable(const ColumnRefExpression &ref, const unordered_set<string> &aliases,
                                   bool allow_unqualified) {
-	if (ref.column_names.size() == 1) {
+	if (ref.ColumnNames().size() == 1) {
 		return allow_unqualified;
 	}
-	for (idx_t i = 0; i + 1 < ref.column_names.size(); i++) {
-		if (aliases.count(StringUtil::Lower(ref.column_names[i]))) {
+	for (idx_t i = 0; i + 1 < ref.ColumnNames().size(); i++) {
+		if (aliases.count(StringUtil::Lower(ref.ColumnNames()[i].GetIdentifierName()))) {
 			return true;
 		}
 	}
@@ -145,14 +158,16 @@ static bool RewriteExpressionScoped(unique_ptr<ParsedExpression> &expr, const st
 	}
 	bool changed = false;
 	ParsedExpressionIterator::VisitExpressionMutable<SubqueryExpression>(*expr, [&](SubqueryExpression &subquery) {
-		if (subquery.subquery && subquery.subquery->node) {
-			changed |= RewriteQueryNodeScoped(*subquery.subquery->node, table_name, old_name, new_name, target_aliases);
+		if (subquery.Subquery() && subquery.Subquery()->node) {
+			changed |=
+			    RewriteQueryNodeScoped(*subquery.Subquery()->node, table_name, old_name, new_name, target_aliases);
 		}
 	});
 	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(*expr, [&](ColumnRefExpression &ref) {
-		if (!ref.column_names.empty() && StringUtil::CIEquals(ref.column_names.back(), old_name) &&
+		if (!ref.ColumnNames().empty() &&
+		    StringUtil::CIEquals(ref.ColumnNames().back().GetIdentifierName(), old_name) &&
 		    ColumnRefTargetsTable(ref, target_aliases, allow_unqualified)) {
-			ref.column_names.back() = new_name;
+			ref.ColumnNamesMutable().back() = Identifier(new_name);
 			changed = true;
 		}
 	});
@@ -253,7 +268,7 @@ static bool RewriteQueryNodeScoped(QueryNode &node, const string &table_name, co
 	bool changed = false;
 	for (auto &kv : node.cte_map.map) {
 		changed |=
-		    RewriteQueryNodeScoped(*kv.second->query->node, table_name, old_name, new_name, inherited_target_aliases);
+		    RewriteQueryNodeScoped(*kv.second->query_node, table_name, old_name, new_name, inherited_target_aliases);
 	}
 	switch (node.type) {
 	case QueryNodeType::SELECT_NODE: {
@@ -303,18 +318,18 @@ static void PreserveTopLevelOutputAliases(SelectStatement &stmt, const vector<st
 		return;
 	}
 	for (idx_t i = 0; i < output_columns.size(); i++) {
-		select.select_list[i]->alias = output_columns[i];
+		select.select_list[i]->SetAlias(Identifier(output_columns[i]));
 	}
 }
 
-static bool RewriteStoredViewQuery(Connection &con, RefreshMetadata &metadata, const string &view_name,
-                                   const string &table_name, const string &old_name, const string &new_name,
-                                   bool persist) {
+static bool RewriteStoredViewQuery(ClientContext &context, Connection &con, RefreshMetadata &metadata,
+                                   const string &view_name, const string &table_name, const string &old_name,
+                                   const string &new_name, bool persist) {
 	string sql = metadata.GetViewQuery(view_name);
 	if (sql.empty()) {
 		return false;
 	}
-	Parser parser;
+	auto parser = Parser::GetBuiltinParser();
 	parser.ParseQuery(sql);
 	if (parser.statements.empty() || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
 		throw CatalogException("Cannot rewrite materialized view '" + view_name +
@@ -328,8 +343,15 @@ static bool RewriteStoredViewQuery(Connection &con, RefreshMetadata &metadata, c
 	if (!persist) {
 		return true;
 	}
-	PreserveTopLevelOutputAliases(stmt,
-	                              metadata.GetTableColumns("", "", IncrementalTableNames::DataTableName(view_name)));
+	auto internal_location = metadata.GetInternalLocation(view_name);
+	auto &data = Catalog::GetEntry<TableCatalogEntry>(
+	    context, QualifiedName(Identifier(internal_location.catalog_name), Identifier(internal_location.schema_name),
+	                           Identifier(IncrementalTableNames::DataTableName(view_name))));
+	vector<string> output_columns;
+	for (auto &column : data.GetColumns().Physical()) {
+		output_columns.push_back(column.Name().GetIdentifierName());
+	}
+	PreserveTopLevelOutputAliases(stmt, output_columns);
 	string rewritten = stmt.ToString();
 	UpdateViewMetadataValue(con, view_name, "sql_string", rewritten);
 	return true;
@@ -390,6 +412,7 @@ static bool RewriteFilteredGroupCountMetaFields(RefreshMetadata::FilteredGroupCo
 	auto qualifiers = SingleQualifier(meta.source);
 	changed |= SqlUtils::RewriteColumnReferences(meta.source_group_expr, old_name, new_name, qualifiers, true);
 	changed |= SqlUtils::RewriteColumnReferences(meta.source_sum_expr, old_name, new_name, qualifiers, true);
+	changed |= SqlUtils::RewriteColumnReferences(meta.filter, old_name, new_name, qualifiers, true);
 	return changed;
 }
 
@@ -450,7 +473,7 @@ static bool RewriteWindowLineageFields(vector<RefreshMetadata::WindowPartitionLi
 			op.source_col = new_name;
 			changed = true;
 		}
-		if (op.kind == "lookup" && AuxSourceMatches(op.lookup, table_name)) {
+		if (op.kind == WindowLineageKind::LOOKUP && AuxSourceMatches(op.lookup, table_name)) {
 			if (StringUtil::CIEquals(op.lookup_col, old_name)) {
 				op.lookup_col = new_name;
 				changed = true;
@@ -575,12 +598,14 @@ static bool AuxMetadataReferencesColumn(RefreshMetadata &metadata, const string 
 	return false;
 }
 
-string FirstMVReferencingColumn(Connection &con, const string &delta_name, const string &source_catalog,
-                                const string &source_schema, const string &table_name, const string &col_name) {
+string FirstMVReferencingColumn(ClientContext &context, Connection &con, const string &delta_name,
+                                const string &source_catalog, const string &source_schema, const string &table_name,
+                                const string &col_name) {
 	RefreshMetadata metadata(con);
 	auto qualified_source = SqlUtils::FullName(source_catalog, source_schema, table_name);
 	for (auto &view : GetDependentViews(con, delta_name, source_catalog, source_schema)) {
-		if (RewriteStoredViewQuery(con, metadata, view.name, qualified_source, col_name, col_name, /*persist=*/false) ||
+		if (RewriteStoredViewQuery(context, con, metadata, view.name, qualified_source, col_name, col_name,
+		                           /*persist=*/false) ||
 		    AuxMetadataReferencesColumn(metadata, view.name, qualified_source, col_name)) {
 			// Report the name the user created, not the internal storage key.
 			auto sql_name = metadata.GetViewSQLName(view.name);
@@ -590,9 +615,104 @@ string FirstMVReferencingColumn(Connection &con, const string &delta_name, const
 	return "";
 }
 
-void RewriteDependentViewMetadataForRename(Connection &con, const string &delta_name, const string &source_catalog,
-                                           const string &source_schema, const string &table_name,
-                                           const string &old_name, const string &new_name) {
+// These metadata fields are unindexed, nullable strings. Update them through
+// the caller's storage transaction, including rows/tables created earlier in BEGIN.
+// Running SQL on a helper would neither see those rows nor roll back with ALTER.
+static void UpdateCallerViewMetadata(ClientContext &context, const MetadataLocation &location, const string &view_name,
+                                     const vector<string> &names, const vector<Value> &values) {
+	auto &entry = Catalog::GetEntry<TableCatalogEntry>(
+	    context,
+	    QualifiedName(Identifier(location.catalog), Identifier(location.schema), Identifier(openivm::VIEWS_TABLE)));
+	MetaTransaction::Get(context).ModifyDatabase(entry.catalog.GetAttached(), DatabaseModificationType::UPDATE_DATA);
+	vector<PhysicalIndex> columns;
+	vector<LogicalType> types;
+	for (auto &name : names) {
+		auto &column = entry.GetColumn(Identifier(name));
+		D_ASSERT(column.Type() == LogicalType::VARCHAR && name != "view_name");
+		columns.push_back(column.Physical());
+		types.push_back(column.Type());
+	}
+	auto &storage = entry.GetStorage();
+	auto &transaction = DuckTransaction::Get(context, entry.catalog);
+	TableScanState scan;
+	storage.InitializeScan(
+	    context, transaction, scan,
+	    {StorageIndex(entry.GetColumn("view_name").StorageOid()), StorageIndex(COLUMN_IDENTIFIER_ROW_ID)});
+	DataChunk rows;
+	rows.Initialize(Allocator::Get(context), {LogicalType::VARCHAR, LogicalType::ROW_TYPE});
+	while (true) {
+		rows.Reset();
+		storage.Scan(transaction, rows, scan);
+		if (rows.size() == 0) {
+			throw CatalogException("Cannot update caller-visible metadata for materialized view '%s'", view_name);
+		}
+		for (idx_t row = 0; row < rows.size(); row++) {
+			if (rows.GetValue(0, row).ToString() != view_name) {
+				continue;
+			}
+			Vector row_ids(LogicalType::ROW_TYPE);
+			row_ids.SetValue(0, rows.GetValue(1, row));
+			DataChunk updates;
+			updates.Initialize(Allocator::Get(context), types);
+			updates.SetCardinalityUnsafe(1);
+			for (idx_t col = 0; col < values.size(); col++) {
+				updates.data[col].SetValue(0, values[col]);
+			}
+			vector<unique_ptr<BoundConstraint>> constraints;
+			auto state = storage.InitializeUpdate(entry, context, constraints);
+			storage.Update(*state, context, entry.Cast<DuckTableEntry>(), row_ids, columns, updates);
+			return;
+		}
+	}
+}
+
+static void PersistRenamedViewMetadata(ClientContext &context, Connection &con, const string &source_catalog,
+                                       QueryResult &before, QueryResult &after) {
+	D_ASSERT(before.RowCount() == after.RowCount());
+	auto location = RefreshMetadata::CurrentLocation(con);
+	auto target = RefreshMetadata::MetadataTable(con, openivm::VIEWS_TABLE);
+	idx_t key_column = 0;
+	while (before.GetNames()[key_column] != "view_name") {
+		key_column++;
+	}
+	for (idx_t row = 0; row < before.RowCount(); row++) {
+		vector<string> names;
+		vector<Value> values;
+		vector<string> assignments;
+		auto key = before.Collection().GetValue(key_column, row);
+		D_ASSERT(Value::NotDistinctFrom(key, after.Collection().GetValue(key_column, row)));
+		for (idx_t col = 0; col < before.ColumnCount(); col++) {
+			auto value = after.Collection().GetValue(col, row);
+			if (!Value::NotDistinctFrom(before.Collection().GetValue(col, row), value)) {
+				names.push_back(before.GetNames()[col].GetIdentifierName());
+				values.push_back(value);
+				assignments.push_back(SqlUtils::QuoteIdentifier(before.GetNames()[col]) + " = " + value.ToSQLString());
+			}
+		}
+		if (names.empty()) {
+			continue;
+		}
+		auto sql = "UPDATE " + target + " SET " + StringUtil::Join(assignments, ", ") +
+		           " WHERE view_name = " + key.ToSQLString();
+		if (StringUtil::CIEquals(location.catalog, source_catalog)) {
+			UpdateCallerViewMetadata(context, location, key.ToString(), names, values);
+		} else {
+			// A different native catalog cannot join the caller's ALTER transaction.
+			// Its durable preimage is retained by TransactionalHelperUndoState.
+			auto result = con.Query(sql);
+			if (result->HasError()) {
+				throw CatalogException("Cannot persist renamed materialized view metadata: %s", result->GetError());
+			}
+		}
+		TransactionalMVMetadataState::Get(context).RegisterSQL(sql, key.ToString());
+		OPENIVM_DEBUG_PRINT("[SCHEMA EVOLUTION] Rewrote metadata for '%s' in %s.%s\n", key.ToString().c_str(),
+		                    location.catalog.c_str(), location.schema.c_str());
+	}
+}
+
+void RewriteDependentViewMetadataForRename(ClientContext &context, Connection &con, const string &delta_name,
+                                           const string &source_catalog, const string &source_schema,
+                                           const string &table_name, const string &old_name, const string &new_name) {
 	RefreshMetadata metadata(con);
 	auto qualified_source = SqlUtils::FullName(source_catalog, source_schema, table_name);
 	auto views = GetDependentViews(con, delta_name, source_catalog, source_schema);
@@ -600,14 +720,24 @@ void RewriteDependentViewMetadataForRename(Connection &con, const string &delta_
 	try {
 		con.BeginTransaction();
 		tx_open = true;
+		auto before = con.Query("SELECT * FROM openivm_views ORDER BY view_name");
+		if (before->HasError()) {
+			throw CatalogException("Cannot snapshot materialized view rename metadata: %s", before->GetError());
+		}
 		for (auto &view : views) {
-			RewriteStoredViewQuery(con, metadata, view.name, qualified_source, old_name, new_name, /*persist=*/true);
+			RewriteStoredViewQuery(context, con, metadata, view.name, qualified_source, old_name, new_name,
+			                       /*persist=*/true);
 			RewriteDistinctAuxMeta(con, metadata, view.name, qualified_source, old_name, new_name);
 			RewriteFilteredGroupCountMeta(con, metadata, view.name, qualified_source, old_name, new_name);
 			RewriteSemiAntiAuxMeta(con, metadata, view.name, qualified_source, old_name, new_name);
 			RewriteLineageMeta(con, metadata, view.name, qualified_source, old_name, new_name);
 			RewriteWindowGroupColumnSources(con, metadata, view.name, old_name, new_name);
 		}
+		auto after = con.Query("SELECT * FROM openivm_views ORDER BY view_name");
+		if (after->HasError()) {
+			throw CatalogException("Cannot read materialized view rename metadata: %s", after->GetError());
+		}
+		PersistRenamedViewMetadata(context, con, source_catalog, *before, *after);
 		con.Commit();
 		tx_open = false;
 	} catch (std::exception &) {

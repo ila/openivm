@@ -85,3 +85,60 @@ SELECT (SELECT count(*) FROM ((SELECT * FROM mv_mm) EXCEPT ALL (SELECT * FROM mv
        (SELECT count(*) FROM ((SELECT * FROM mv_mm_before) EXCEPT ALL (SELECT * FROM mv_mm))) = 0 AS unchanged;
 ----
 true
+
+# ==========================================
+# Test 4: statement splitting follows SQL quoting. A backslash inside a string literal is an
+# ordinary character, so a literal ending in a backslash must not swallow the statements after it.
+# The two views differ only in that literal and must compile to the same number of statements.
+# ==========================================
+
+statement ok
+CREATE TABLE bs_src (tag VARCHAR, g INT, v INT);
+
+statement ok
+INSERT INTO bs_src VALUES ('a', 1, 10), ('x\', 1, 20), ('x/', 2, 30), ('b', 2, 40);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_bs_backslash AS
+    SELECT g, SUM(v) AS total, COUNT(*) AS cnt FROM bs_src WHERE tag <> 'x\' GROUP BY g;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_bs_slash AS
+    SELECT g, SUM(v) AS total, COUNT(*) AS cnt FROM bs_src WHERE tag <> 'x/' GROUP BY g;
+
+query I
+SELECT (SELECT count(*) FROM openivm_compile_with_facts('mv_bs_backslash', '{"target_dialect":"duckdb","compile_only":true}'))
+     = (SELECT count(*) FROM openivm_compile_with_facts('mv_bs_slash', '{"target_dialect":"duckdb","compile_only":true}'))
+  AND (SELECT count(*) FROM openivm_compile_with_facts('mv_bs_slash', '{"target_dialect":"duckdb","compile_only":true}')) > 1;
+----
+true
+
+statement ok
+INSERT INTO bs_src VALUES ('x\', 1, 5), ('c', 1, 7);
+
+statement ok
+DELETE FROM bs_src WHERE tag = 'a';
+
+statement ok
+UPDATE bs_src SET v = v + 1 WHERE tag = 'b';
+
+statement ok
+PRAGMA refresh('mv_bs_backslash');
+
+query I
+SELECT count(*) FROM (
+    SELECT g, total, cnt FROM mv_bs_backslash
+    EXCEPT ALL
+    SELECT g, SUM(v), COUNT(*) FROM bs_src WHERE tag <> 'x\' GROUP BY g
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT g, SUM(v), COUNT(*) FROM bs_src WHERE tag <> 'x\' GROUP BY g
+    EXCEPT ALL
+    SELECT g, total, cnt FROM mv_bs_backslash
+);
+----
+0

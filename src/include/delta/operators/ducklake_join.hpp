@@ -1,13 +1,11 @@
 #ifndef DUCKLAKE_JOIN_HPP
 #define DUCKLAKE_JOIN_HPP
 
-#include "delta/delta_operator.hpp"
+#include "delta/operators/join.hpp"
 #include "duckdb.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
 namespace duckdb {
-
-struct JoinLeafInfo;
 
 /// Build N join delta terms using DuckLake time-travel (AT VERSION).
 ///
@@ -20,7 +18,9 @@ struct JoinLeafInfo;
 /// and is provably equivalent to inclusion-exclusion.
 vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput input, ClientContext &context,
                                                            Binder &binder, const vector<JoinLeafInfo> &leaves,
-                                                           bool has_left_join, bool flattened_leaves);
+                                                           bool has_left_join, bool flattened_leaves,
+                                                           const vector<vector<DeltaJoinKeyProbe>> &key_probes,
+                                                           DeltaSourceCache &source_cache);
 
 } // namespace duckdb
 

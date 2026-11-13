@@ -30,22 +30,30 @@
 namespace duckdb {
 
 /// Get the row count of a table by name, returns 0 if table doesn't exist.
-static double GetTableRowCount(Connection &con, const string &table_name) {
-	auto result = con.Query("SELECT COUNT(*) FROM " + SqlUtils::QuoteIdentifier(table_name) + ";");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+static double GetTableRowCount(Connection &con, const string &table_sql) {
+	auto result = con.Query("SELECT COUNT(*) FROM " + table_sql + ";");
+	if (result->HasError() || result->RowCount() == 0 || result->Collection().GetValue(0, 0).IsNull()) {
 		return 0;
 	}
-	return result->GetValue(0, 0).GetValue<double>();
+	return result->Collection().GetValue(0, 0).GetValue<double>();
 }
 
-static const DeltaActivityResult::Source *FindDeltaActivitySource(const DeltaActivityResult *activity,
-                                                                  const string &delta_table_name,
-                                                                  const string &source_table_name) {
-	if (!activity) {
-		return nullptr;
-	}
+static const DeltaActivityResult::Source *
+FindDeltaActivitySource(const DeltaActivityResult &activity, const string &delta_table_name,
+                        const string &source_table_name, const string &catalog_name, const string &schema_name) {
 	string source_from_delta = BaseTableNameFromDeltaKey(delta_table_name);
-	for (auto &source : activity->sources) {
+	for (auto &source : activity.sources) {
+		if (!source.ducklake) {
+			// A native source is identified by its metadata key.
+			if (StringUtil::CIEquals(source.delta_table_name, delta_table_name)) {
+				return &source;
+			}
+			continue;
+		}
+		if (!StringUtil::CIEquals(source.catalog_name, catalog_name) ||
+		    !StringUtil::CIEquals(source.schema_name, schema_name)) {
+			continue;
+		}
 		if (StringUtil::CIEquals(source.delta_table_name, delta_table_name) ||
 		    StringUtil::CIEquals(source.source_table_name, source_table_name) ||
 		    (!source_from_delta.empty() && StringUtil::CIEquals(source.source_table_name, source_from_delta))) {
@@ -55,29 +63,24 @@ static const DeltaActivityResult::Source *FindDeltaActivitySource(const DeltaAct
 	return nullptr;
 }
 
-/// Get the number of pending delta rows for a given base delta table and view.
-static double GetDeltaRowCount(Connection &con, const string &delta_table_name, const string &view_name,
-                               const DeltaActivityResult *activity) {
-	auto source = FindDeltaActivitySource(activity, delta_table_name, BaseTableNameFromDeltaKey(delta_table_name));
-	if (source && source->pending_rows >= 0) {
-		return static_cast<double>(source->pending_rows);
-	}
-	if (source && source->ok && !source->has_changes) {
+/// Pending delta rows of a source. Native activity always counts its rows; a DuckLake source whose
+/// snapshot manifest reported changes is counted over the same snapshot range the refresh consumes.
+static double GetDeltaRowCount(Connection &con, const DeltaActivityResult::Source *source) {
+	if (!source || (source->ok && !source->has_changes) || (source->ducklake && source->current_snapshot_id < 0)) {
 		return 0;
 	}
-	auto ts_string = RefreshMetadata(con).GetLastUpdate(view_name, delta_table_name);
-	if (ts_string.empty()) {
-		return 0;
+	if (source->pending_rows >= 0 || !source->ducklake) {
+		return static_cast<double>(std::max<int64_t>(source->pending_rows, 0));
 	}
-	auto count_result = con.Query("SELECT COUNT(*) FROM " + SqlUtils::QuoteIdentifier(delta_table_name) + " WHERE " +
-	                              string(openivm::TIMESTAMP_COL) + " >= '" + ts_string + "';");
-	if (count_result->HasError() || count_result->RowCount() == 0 || count_result->GetValue(0, 0).IsNull()) {
-		return 0;
-	}
-	return count_result->GetValue(0, 0).GetValue<double>();
+	RefreshMetadata metadata(con);
+	auto stats =
+	    GetDuckLakeDeltaChangeStats(metadata, {source->catalog_name, source->schema_name, source->source_table_name},
+	                                source->last_snapshot_id, source->current_snapshot_id);
+	return static_cast<double>(stats.total);
 }
 
 struct TableStats {
+	optional_ptr<TableCatalogEntry> table;
 	string table_name;
 	string delta_table_name;
 	double base_card;    // |T| (may reflect pushed-down filter selectivity)
@@ -191,41 +194,33 @@ struct JoinTermEstimate {
 	idx_t term_count = 0;
 };
 
-static bool ActiveSourceIsInsertOnlyPK(Connection &con, const PlanStats &stats, idx_t active_idx) {
+// Whether an insert-only active source is the primary-key side of a foreign key from another join input.
+static bool ActiveSourceIsInsertOnlyPK(const PlanStats &stats, idx_t active_idx) {
 	if (active_idx >= stats.table_stats.size() || stats.table_stats[active_idx].has_deletes) {
 		return false;
 	}
-	string active_table = stats.table_stats[active_idx].table_name;
-	string in_list;
+	auto &active = *stats.table_stats[active_idx].table;
 	for (idx_t i = 0; i < stats.table_stats.size(); i++) {
 		if (i == active_idx) {
 			continue;
 		}
-		if (!in_list.empty()) {
-			in_list += ", ";
-		}
-		in_list += "'" + SqlUtils::EscapeValue(stats.table_stats[i].table_name) + "'";
-	}
-	if (in_list.empty()) {
-		return false;
-	}
-	auto result = con.Query("SELECT constraint_text FROM duckdb_constraints() WHERE constraint_type = 'FOREIGN KEY' "
-	                        "AND table_name IN (" +
-	                        in_list + ")");
-	if (result->HasError()) {
-		return false;
-	}
-	string ref_pattern = "REFERENCES " + active_table;
-	for (idx_t row = 0; row < result->RowCount(); row++) {
-		if (!result->GetValue(0, row).IsNull() &&
-		    result->GetValue(0, row).ToString().find(ref_pattern) != string::npos) {
-			return true;
+		for (auto &constraint : stats.table_stats[i].table->GetConstraints()) {
+			if (constraint->type != ConstraintType::FOREIGN_KEY) {
+				continue;
+			}
+			auto &fk = constraint->Cast<ForeignKeyConstraint>().info;
+			if (fk.type == ForeignKeyType::FK_TYPE_FOREIGN_KEY_TABLE &&
+			    StringUtil::CIEquals(fk.table.GetIdentifierName(), active.name.GetIdentifierName()) &&
+			    (fk.schema.empty() ||
+			     StringUtil::CIEquals(fk.schema.GetIdentifierName(), active.schema.name.GetIdentifierName()))) {
+				return true;
+			}
 		}
 	}
 	return false;
 }
 
-static JoinTermEstimate EstimateJoinTerms(Connection &con, const PlanStats &stats, bool nterm_enabled, bool fk_enabled,
+static JoinTermEstimate EstimateJoinTerms(const PlanStats &stats, bool nterm_enabled, bool fk_enabled,
                                           bool skip_empty_enabled) {
 	JoinTermEstimate result;
 	idx_t active_idx = DConstants::INVALID_INDEX;
@@ -241,7 +236,7 @@ static JoinTermEstimate EstimateJoinTerms(Connection &con, const PlanStats &stat
 	idx_t priced_sources = skip_empty_enabled ? result.active_sources : stats.table_stats.size();
 	result.priced_sources = priced_sources;
 	if (fk_enabled && skip_empty_enabled && !stats.all_ducklake && result.active_sources == 1 &&
-	    ActiveSourceIsInsertOnlyPK(con, stats, active_idx)) {
+	    ActiveSourceIsInsertOnlyPK(stats, active_idx)) {
 		return result;
 	}
 	if (nterm_enabled && stats.all_ducklake) {
@@ -252,46 +247,9 @@ static JoinTermEstimate EstimateJoinTerms(Connection &con, const PlanStats &stat
 	return result;
 }
 
-/// Get delta cardinality for a DuckLake table by counting changes between snapshots.
-static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_name, const string &schema_name,
-                                       const string &table_name, const string &view_name,
-                                       const DeltaActivityResult *activity) {
-	auto source = FindDeltaActivitySource(activity, table_name, table_name);
-	if (source && source->pending_rows >= 0) {
-		return static_cast<double>(source->pending_rows);
-	}
-	if (source && source->ok && !source->has_changes) {
-		return 0;
-	}
-	RefreshMetadata metadata(con);
-	auto last_snap = metadata.GetLastSnapshotId(view_name, table_name);
-	auto cur_snap = metadata.GetCurrentDuckLakeSnapshot(catalog_name);
-	if (cur_snap < 0) {
-		return 0;
-	}
-	if (last_snap == cur_snap) {
-		return 0;
-	}
-
-	double count = 0;
-	auto insertions = SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", catalog_name, schema_name,
-	                                                  table_name, last_snap, cur_snap);
-	auto deletions = SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", catalog_name, schema_name, table_name,
-	                                                 last_snap, cur_snap);
-	auto ins_result = con.Query("SELECT COUNT(*) FROM " + insertions);
-	if (!ins_result->HasError() && ins_result->RowCount() > 0) {
-		count += ins_result->GetValue(0, 0).GetValue<double>();
-	}
-	auto del_result = con.Query("SELECT COUNT(*) FROM " + deletions);
-	if (!del_result->HasError() && del_result->RowCount() > 0) {
-		count += del_result->GetValue(0, 0).GetValue<double>();
-	}
-	return count;
-}
-
 /// Walk the plan tree once, collecting table stats, join info, and aggregate presence.
 static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, LogicalOperator &op,
-                                      const string &view_name, const DeltaActivityResult *delta_activity,
+                                      const string &view_name, const DeltaActivityResult &delta_activity,
                                       PlanStats &stats) {
 	AddOperatorCostClass(op, stats);
 	switch (op.type) {
@@ -299,7 +257,8 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 		auto &get = op.Cast<LogicalGet>();
 		if (get.GetTable().get() != nullptr) {
 			TableStats ts;
-			ts.table_name = get.GetTable()->name;
+			ts.table = get.GetTable();
+			ts.table_name = get.GetTable()->name.GetIdentifierName();
 			ts.base_card = static_cast<double>(get.EstimateCardinality(context));
 			if (ts.base_card == 0) {
 				ts.base_card = 1;
@@ -308,24 +267,28 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 			// Actual (unfiltered) table row count — for filter selectivity estimation.
 			// base_card from EstimateCardinality may reflect pushed-down filters, so
 			// actual_card / base_card gives us the filter selectivity ratio.
-			ts.actual_card = GetTableRowCount(con, ts.table_name);
+			auto catalog_name = get.GetTable()->ParentCatalog().GetName().GetIdentifierName();
+			auto schema_name = get.GetTable()->schema.name.GetIdentifierName();
+			ts.actual_card = GetTableRowCount(con, SqlUtils::FullName(catalog_name, schema_name, ts.table_name));
 			if (ts.actual_card == 0) {
 				ts.actual_card = 1;
 			}
 
-			// DuckLake vs standard delta cardinality
-			if (get.function.name == "ducklake_scan" && get.function.function_info) {
-				string cat_name = get.GetTable()->ParentCatalog().GetName();
-				string schema_name = get.GetTable()->schema.name;
-				ts.delta_table_name = ts.table_name; // DuckLake stores bare name
-				ts.delta_card =
-				    GetDuckLakeDeltaRowCount(con, cat_name, schema_name, ts.table_name, view_name, delta_activity);
-			} else {
-				stats.all_ducklake = false;
-				ts.delta_table_name = SqlUtils::DeltaName(ts.table_name);
-				ts.delta_card = GetDeltaRowCount(con, ts.delta_table_name, view_name, delta_activity);
+			bool ducklake_source =
+			    get.function.GetName().GetIdentifierName() == "ducklake_scan" && get.function.function_info;
+			ts.delta_table_name = ducklake_source ? ts.table_name : SqlUtils::DeltaName(ts.table_name);
+			// Repeated source names have qualified metadata keys. Resolve the key by
+			// physical identity before looking up its watermark or cached activity.
+			auto key = con.Query("SELECT table_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
+			                     " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND " +
+			                     RefreshMetadata::SourcePredicate(ts.delta_table_name, catalog_name, schema_name));
+			if (!key->HasError() && key->RowCount() == 1) {
+				ts.delta_table_name = key->Collection().GetValue(0, 0).ToString();
 			}
-			auto source = FindDeltaActivitySource(delta_activity, ts.delta_table_name, ts.table_name);
+			stats.all_ducklake = stats.all_ducklake && ducklake_source;
+			auto source =
+			    FindDeltaActivitySource(delta_activity, ts.delta_table_name, ts.table_name, catalog_name, schema_name);
+			ts.delta_card = GetDeltaRowCount(con, source);
 			ts.has_deletes = source && source->has_deletes;
 
 			stats.table_stats.push_back(ts);
@@ -520,10 +483,11 @@ static RegressionWeights FitRegression(const vector<RefreshMetadata::RefreshHist
 
 // ============================================================================
 
-RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator &plan, const string &view_name,
-                                        const DeltaActivityResult *delta_activity) {
-	// Single connection for all cardinality queries
+static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator &plan, const string &view_name,
+                                               const DeltaActivityResult &delta_activity) {
+	// Single connection for all cardinality queries, reading the caller's metadata schema
 	Connection con(*context.db);
+	RefreshMetadata::UseSameLocation(context, con);
 
 	// Read operational flags — cost model reflects what actually happens at refresh time.
 	bool nterm_enabled = SqlUtils::GetBoolSetting(context, "openivm_ducklake_nterm", true);
@@ -564,7 +528,10 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		has_active_delta = has_active_delta || ts.delta_card > 0;
 	}
 
-	double mv_card = GetTableRowCount(con, IncrementalTableNames::DataTableName(view_name));
+	auto internal_location = RefreshMetadata(con).GetInternalLocation(view_name);
+	double mv_card =
+	    GetTableRowCount(con, SqlUtils::FullName(internal_location.catalog_name, internal_location.schema_name,
+	                                             IncrementalTableNames::DataTableName(view_name)));
 	if (mv_card == 0) {
 		mv_card = 1;
 	}
@@ -575,7 +542,7 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	// 3. Estimate IVM cost from the query's operator classes. Linear plans scan
 	// pending deltas; product plans pay for active join terms; stateful operators
 	// add an upsert/recompute component tied to the affected output domain.
-	auto join_terms = EstimateJoinTerms(con, plan_stats, nterm_enabled, fk_enabled, skip_empty_enabled);
+	auto join_terms = EstimateJoinTerms(plan_stats, nterm_enabled, fk_enabled, skip_empty_enabled);
 	double incremental_compute;
 	double estimated_delta_result;
 
@@ -767,7 +734,7 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 
 		double decay = 0.9;
 		Value decay_val;
-		if (context.TryGetCurrentSetting("openivm_cost_decay", decay_val) && !decay_val.IsNull()) {
+		if (context.TryGetCurrentSetting(Identifier("openivm_cost_decay"), decay_val) && !decay_val.IsNull()) {
 			decay = decay_val.GetValue<double>();
 			if (decay < 0.0 || decay > 1.0) {
 				decay = 0.9;
@@ -786,7 +753,7 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 			                      strategy_reg.w_intercept);
 			calibrated = true;
 			OPENIVM_DEBUG_PRINT("[COST MODEL] %s regression: w_compute=%.4f, w_upsert=%.4f, intercept=%.1f\n",
-			                    strategy_label, strategy_reg.w_compute, strategy_reg.w_upsert,
+			                    strategy_label.c_str(), strategy_reg.w_compute, strategy_reg.w_upsert,
 			                    strategy_reg.w_intercept);
 		}
 
@@ -812,16 +779,16 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	                    "%.0f\n",
 	                    (unsigned long)join_terms.active_sources, (unsigned long)join_terms.term_count, mv_card,
 	                    estimated_delta_result);
-	OPENIVM_DEBUG_PRINT("[COST MODEL] %s cost: %.0f (compute: %.0f, upsert: %.0f)\n", strategy_label, strategy_total,
-	                    strategy_compute, strategy_upsert);
+	OPENIVM_DEBUG_PRINT("[COST MODEL] %s cost: %.0f (compute: %.0f, upsert: %.0f)\n", strategy_label.c_str(),
+	                    strategy_total, strategy_compute, strategy_upsert);
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Recompute cost: %.0f (compute: %.0f, replace: %.0f)\n", recompute_total,
 	                    recompute_compute, recompute_replace);
 	if (calibrated) {
-		OPENIVM_DEBUG_PRINT("[COST MODEL] Calibrated: %s=%.0fms, Recompute=%.0fms\n", strategy_label,
+		OPENIVM_DEBUG_PRINT("[COST MODEL] Calibrated: %s=%.0fms, Recompute=%.0fms\n", strategy_label.c_str(),
 		                    strategy_predicted_ms, recompute_predicted_ms);
 	}
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Decision: %s\n",
-	                    recompute_predicted_ms < strategy_predicted_ms ? "FULL_RECOMPUTE" : strategy_label);
+	                    recompute_predicted_ms < strategy_predicted_ms ? "FULL_RECOMPUTE" : strategy_label.c_str());
 
 	RefreshCostEstimate estimate;
 	estimate.incremental_compute = strategy_compute;
@@ -837,50 +804,42 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	return estimate;
 }
 
+RefreshCostEstimate EstimateViewRefreshCost(ClientContext &context, const string &view_query_sql,
+                                            const string &view_name, const DeltaActivityResult &delta_activity) {
+	auto parser = Parser::GetBuiltinParser();
+	parser.ParseQuery(view_query_sql);
+	if (parser.statements.empty()) {
+		throw ParserException("View '" + view_name + "' has an empty IVM metadata query");
+	}
+	Planner planner(context);
+	openivm::TimeTravelPins::Peel(context, *parser.statements[0]);
+	planner.CreatePlan(std::move(parser.statements[0]));
+	Optimizer optimizer(*planner.binder, context);
+	auto plan = optimizer.Optimize(std::move(planner.plan));
+	return EstimateRefreshCost(context, *plan, view_name, delta_activity);
+}
+
 string RefreshCostQuery(ClientContext &context, const FunctionParameters &parameters) {
 	auto view_name = StringValue::Get(parameters.values[0]);
 
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection con(db);
-	view_name = ResolveViewCatalogFromContext(context, con, view_name).view_name;
-
-	// Propagate user session settings to the cost estimation connection.
-	// The new connection has defaults, so settings like openivm_adaptive_refresh
-	// must be copied from the calling context for calibration to activate.
-	for (auto &setting_name : {"openivm_adaptive_refresh", "openivm_cost_decay", "openivm_ducklake_nterm",
-	                           "openivm_fk_pruning", "openivm_skip_empty_deltas", "openivm_having_merge",
-	                           "openivm_left_join_merge", "openivm_full_outer_merge", "openivm_distinct_aux_state"}) {
-		Value v;
-		if (context.TryGetCurrentSetting(setting_name, v) && !v.IsNull()) {
-			con.Query("SET " + string(setting_name) + " = " + v.ToString());
-		}
-	}
-
-	con.BeginTransaction();
+	auto resolved = ResolveViewCatalogFromContext(context, con, view_name);
+	view_name = resolved.view_name;
+	// The fresh connection starts from defaults; calibration and pruning follow the caller's session.
+	PropagateRefreshPlanningSettings(context, *con.context);
 
 	RefreshMetadata metadata(con);
 	auto view_query = metadata.GetViewQuery(view_name);
 	if (view_query.empty()) {
-		con.Rollback();
 		throw ParserException("View '" + view_name + "' not found in IVM metadata");
 	}
-
-	auto &con_ctx = *con.context;
-
-	Parser p;
-	p.ParseQuery(view_query);
-	if (p.statements.empty()) {
-		con.Rollback();
-		throw ParserException("View '" + view_name + "' has an empty IVM metadata query");
-	}
-	Planner planner(con_ctx);
-	openivm::TimeTravelPins::Peel(con_ctx, *p.statements[0]);
-	planner.CreatePlan(std::move(p.statements[0]));
-	Optimizer optimizer(*planner.binder, con_ctx);
-	auto plan = optimizer.Optimize(std::move(planner.plan));
-
-	auto estimate = EstimateRefreshCost(con_ctx, *plan, view_name);
-	con.Rollback();
+	auto delta_activity =
+	    BuildDeltaActivityResult(metadata, con, view_name, metadata.GetDeltaTables(view_name),
+	                             resolved.view_catalog_name, resolved.view_schema_name, string(), string());
+	RefreshCostEstimate estimate;
+	con.context->RunFunctionInTransaction(
+	    [&]() { estimate = EstimateViewRefreshCost(*con.context, view_query, view_name, delta_activity); });
 
 	// `decision`: which strategy actually runs at refresh time.
 	//   - For fixed-strategy views (group_recompute, window_partition), this is the
@@ -905,9 +864,8 @@ string RefreshCostHistoryQuery(ClientContext &context, const FunctionParameters 
 	       " AS view_name, refresh_timestamp, method, incremental_compute_est, incremental_upsert_est,"
 	       " recompute_compute_est, recompute_replace_est, actual_duration_ms"
 	       " FROM " +
-	       SqlUtils::FullName(ClientData::Get(*con.context).catalog_search_path->GetDefault().catalog, DEFAULT_SCHEMA,
-	                          openivm::HISTORY_TABLE) +
-	       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' ORDER BY refresh_timestamp DESC LIMIT 20";
+	       RefreshMetadata::MetadataTable(con, openivm::HISTORY_TABLE) + " WHERE view_name = '" +
+	       SqlUtils::EscapeValue(view_name) + "' ORDER BY refresh_timestamp DESC LIMIT 20";
 }
 
 vector<StrategyCostEstimate> EstimatePerQuery(ClientContext &context, const string &view_name,
@@ -915,7 +873,7 @@ vector<StrategyCostEstimate> EstimatePerQuery(ClientContext &context, const stri
 	(void)view_name;
 	(void)query_plan;
 	Value flag;
-	if (!context.TryGetCurrentSetting("openivm_enable_view_matching", flag) || flag.IsNull() ||
+	if (!context.TryGetCurrentSetting(Identifier("openivm_enable_view_matching"), flag) || flag.IsNull() ||
 	    !BooleanValue::Get(flag)) {
 		return {};
 	}

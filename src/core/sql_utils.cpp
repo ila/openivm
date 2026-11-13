@@ -2,14 +2,245 @@
 
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
+#include "duckdb/catalog/catalog_search_path.hpp"
+#include "duckdb/common/local_file_system.hpp"
+#include "duckdb/main/client_data.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/query_node/cte_node.hpp"
+#include "duckdb/parser/query_node/recursive_cte_node.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/parser/tableref/pivotref.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "lpts_sql_scanner.hpp"
 
 #include <cctype>
 #include <cstring>
-#include <fstream>
 #include <regex>
 #include <sstream>
 
 namespace duckdb {
+
+void SqlUtils::CopySessionSetting(ClientContext &from, ClientContext &to, const string &name) {
+	auto &db_config = DBConfig::GetConfig(to);
+	ExtensionOption option;
+	if (!db_config.TryGetExtensionOption(Identifier(name), option) || !option.setting_index.IsValid()) {
+		return;
+	}
+	Value value;
+	if (from.TryGetCurrentSetting(Identifier(name), value) && !value.IsNull()) {
+		to.config.user_settings.SetUserSetting(option.setting_index.GetIndex(), value);
+	} else {
+		to.config.user_settings.ClearSetting(option.setting_index.GetIndex());
+	}
+}
+
+// A `BaseTableRef` whose unqualified name matches a CTE visible at that point is a reference to
+// the CTE, not a scan of a same-named relation, so it must never be treated as an unpinned scan.
+struct SourceRefVisitor {
+	const std::function<void(unique_ptr<TableRef> &)> &callback;
+	case_insensitive_set_t cte_names;
+};
+
+static void SourceVisitQueryNode(QueryNode &node, const SourceRefVisitor &visitor);
+
+static void SourceVisitExpression(ParsedExpression &expression, const SourceRefVisitor &visitor) {
+	if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		auto &subquery = expression.Cast<SubqueryExpression>();
+		if (subquery.Subquery() && subquery.Subquery()->node) {
+			SourceVisitQueryNode(*subquery.Subquery()->node, visitor);
+		}
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    expression, [&](ParsedExpression &child) { SourceVisitExpression(child, visitor); });
+}
+
+static void SourceVisitTableRef(unique_ptr<TableRef> &ref, const SourceRefVisitor &visitor) {
+	switch (ref->type) {
+	case TableReferenceType::BASE_TABLE: {
+		auto &base_table = ref->Cast<BaseTableRef>();
+		bool unqualified = base_table.GetQualifiedName().Catalog().GetIdentifierName().empty() &&
+		                   base_table.GetQualifiedName().Schema().GetIdentifierName().empty();
+		if (unqualified && visitor.cte_names.find(base_table.Table().GetIdentifierName()) != visitor.cte_names.end()) {
+			break;
+		}
+		visitor.callback(ref);
+		break;
+	}
+	case TableReferenceType::JOIN: {
+		auto &join = ref->Cast<JoinRef>();
+		if (join.left) {
+			SourceVisitTableRef(join.left, visitor);
+		}
+		if (join.right) {
+			SourceVisitTableRef(join.right, visitor);
+		}
+		if (join.condition) {
+			SourceVisitExpression(*join.condition, visitor);
+		}
+		break;
+	}
+	case TableReferenceType::SUBQUERY: {
+		auto &subquery = ref->Cast<SubqueryRef>();
+		if (subquery.subquery && subquery.subquery->node) {
+			SourceVisitQueryNode(*subquery.subquery->node, visitor);
+		}
+		break;
+	}
+	case TableReferenceType::PIVOT: {
+		auto &pivot = ref->Cast<PivotRef>();
+		if (pivot.source) {
+			SourceVisitTableRef(pivot.source, visitor);
+		}
+		for (auto &aggregate : pivot.aggregates) {
+			SourceVisitExpression(*aggregate, visitor);
+		}
+		break;
+	}
+	case TableReferenceType::EXPRESSION_LIST:
+	case TableReferenceType::TABLE_FUNCTION: {
+		ParsedExpressionIterator::EnumerateTableRefChildren(*ref, [&](unique_ptr<ParsedExpression> &expression) {
+			if (expression) {
+				SourceVisitExpression(*expression, visitor);
+			}
+		});
+		if (ref->type == TableReferenceType::TABLE_FUNCTION) {
+			auto &function = ref->Cast<TableFunctionRef>();
+			if (function.subquery && function.subquery->node) {
+				SourceVisitQueryNode(*function.subquery->node, visitor);
+			}
+		}
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+static void SourceVisitQueryNode(QueryNode &node, const SourceRefVisitor &visitor) {
+	// Each CTE body sees preceding siblings, but not its own name.
+	SourceRefVisitor scoped {visitor.callback, visitor.cte_names};
+	for (auto &cte : node.cte_map.map) {
+		if (cte.second->query_node && cte.second->query_node) {
+			SourceVisitQueryNode(*cte.second->query_node, scoped);
+		}
+		scoped.cte_names.insert(cte.first.GetIdentifierName());
+	}
+	switch (node.type) {
+	case QueryNodeType::SELECT_NODE: {
+		auto &select = node.Cast<SelectNode>();
+		if (select.from_table) {
+			SourceVisitTableRef(select.from_table, scoped);
+		}
+		auto visit = [&](unique_ptr<ParsedExpression> &expression) {
+			if (expression) {
+				SourceVisitExpression(*expression, scoped);
+			}
+		};
+		for (auto &expression : select.select_list) {
+			visit(expression);
+		}
+		for (auto &expression : select.groups.group_expressions) {
+			visit(expression);
+		}
+		visit(select.where_clause);
+		visit(select.having);
+		visit(select.qualify);
+		break;
+	}
+	case QueryNodeType::SET_OPERATION_NODE: {
+		auto &set_operation = node.Cast<SetOperationNode>();
+		for (auto &child : set_operation.children) {
+			if (child) {
+				SourceVisitQueryNode(*child, scoped);
+			}
+		}
+		break;
+	}
+	case QueryNodeType::RECURSIVE_CTE_NODE: {
+		auto &recursive_cte = node.Cast<RecursiveCTENode>();
+		SourceRefVisitor recursive_scope {visitor.callback, scoped.cte_names};
+		recursive_scope.cte_names.insert(recursive_cte.ctename.GetIdentifierName());
+		if (recursive_cte.left) {
+			SourceVisitQueryNode(*recursive_cte.left, recursive_scope);
+		}
+		if (recursive_cte.right) {
+			SourceVisitQueryNode(*recursive_cte.right, recursive_scope);
+		}
+		break;
+	}
+	case QueryNodeType::CTE_NODE: {
+		auto &cte = node.Cast<CTENode>();
+		if (cte.query) {
+			SourceVisitQueryNode(*cte.query, scoped);
+		}
+		if (cte.child) {
+			SourceRefVisitor child_scope {visitor.callback, scoped.cte_names};
+			child_scope.cte_names.insert(cte.ctename.GetIdentifierName());
+			SourceVisitQueryNode(*cte.child, child_scope);
+		}
+		break;
+	}
+	default:
+		break;
+	}
+	ParsedExpressionIterator::EnumerateQueryNodeModifiers(node, [&](unique_ptr<ParsedExpression> &expression) {
+		if (expression) {
+			SourceVisitExpression(*expression, scoped);
+		}
+	});
+}
+
+static void SourceVisitStatement(SQLStatement &statement, const SourceRefVisitor &visitor) {
+	switch (statement.type) {
+	case StatementType::SELECT_STATEMENT: {
+		auto &select = statement.Cast<SelectStatement>();
+		if (select.node) {
+			SourceVisitQueryNode(*select.node, visitor);
+		}
+		break;
+	}
+	case StatementType::CREATE_STATEMENT: {
+		auto &create = statement.Cast<CreateStatement>();
+		if (create.info && create.info->type == CatalogType::TABLE_ENTRY) {
+			auto &table_info = create.info->Cast<CreateTableInfo>();
+			if (table_info.query && table_info.query->node) {
+				SourceVisitQueryNode(*table_info.query->node, visitor);
+			}
+		}
+		break;
+	}
+	case StatementType::INSERT_STATEMENT: {
+		auto &insert = statement.Cast<InsertStatement>();
+		if (insert.node->select_statement && insert.node->select_statement->node) {
+			SourceVisitQueryNode(*insert.node->select_statement->node, visitor);
+		}
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+void SqlUtils::RewriteSourceReferences(SQLStatement &statement,
+                                       const std::function<void(unique_ptr<TableRef> &)> &callback) {
+	SourceVisitStatement(statement, SourceRefVisitor {callback, {}});
+}
+
+void SqlUtils::VisitSourceReferences(SQLStatement &statement, const std::function<void(BaseTableRef &)> &callback) {
+	RewriteSourceReferences(statement, [&](unique_ptr<TableRef> &ref) { callback(ref->Cast<BaseTableRef>()); });
+}
 
 static constexpr const char *CAST_EXPRESSION_PREFIX = "openivm_expr:";
 static constexpr const char *CAST_COLUMN_PLACEHOLDER = "{openivm_column}";
@@ -18,23 +249,7 @@ static bool IsIdentifierChar(char c) {
 	return static_cast<unsigned char>(c) >= 128 || std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
 }
 
-template <class INDEX>
-static void SkipWhitespace(const string &sql, INDEX &pos) {
-	while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) {
-		pos++;
-	}
-}
-
-static bool StartsWithKeyword(const string &sql, size_t pos, const string &keyword) {
-	if (pos + keyword.size() > sql.size()) {
-		return false;
-	}
-	if (!StringUtil::CIEquals(sql.substr(pos, keyword.size()), keyword)) {
-		return false;
-	}
-	return pos + keyword.size() == sql.size() || !IsIdentifierChar(sql[pos + keyword.size()]);
-}
-
+// Trim whitespace without stripping non-ASCII identifier bytes on signed-char builds.
 string SqlUtils::TrimSQLFragment(const string &input) {
 	idx_t start = 0;
 	while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
@@ -45,6 +260,16 @@ string SqlUtils::TrimSQLFragment(const string &input) {
 		end--;
 	}
 	return input.substr(start, end - start);
+}
+
+string SqlUtils::IdentifierEqualsSQL(const string &left, const string &right) {
+	// SQL lower() folds Unicode, whereas StringUtil::CIEquals and catalog lookup
+	// fold only A-Z. Preserve every other code point, including quoted identifiers.
+	auto fold = [](const string &expression) {
+		return "translate(" + expression + ", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')";
+	};
+	// An application collation must not widen physical identifier equality either.
+	return "(" + fold(left) + " COLLATE \"binary\" = " + fold(right) + " COLLATE \"binary\")";
 }
 
 string SqlUtils::BuildCastSpec(const string &target_type, bool try_cast) {
@@ -79,100 +304,6 @@ string SqlUtils::ComposeCastSpecs(const string &outer_cast_spec, const string &i
 	}
 	string inner_expression = ApplyCastSpec(CAST_COLUMN_PLACEHOLDER, inner_cast_spec);
 	return string(CAST_EXPRESSION_PREFIX) + ApplyCastSpec(inner_expression, outer_cast_spec);
-}
-
-static bool ReadCreateTargetName(const string &sql, const string &object_keyword, string &out) {
-	string lower = StringUtil::Lower(sql);
-	size_t pos = lower.find("create");
-	if (pos == string::npos) {
-		return false;
-	}
-	pos += strlen("create");
-	SkipWhitespace(sql, pos);
-	if (StartsWithKeyword(lower, pos, "or")) {
-		pos += strlen("or");
-		SkipWhitespace(sql, pos);
-		if (!StartsWithKeyword(lower, pos, "replace")) {
-			return false;
-		}
-		pos += strlen("replace");
-		SkipWhitespace(sql, pos);
-	}
-	if (object_keyword == "table") {
-		if (!StartsWithKeyword(lower, pos, "table")) {
-			return false;
-		}
-		pos += strlen("table");
-	} else {
-		if (StartsWithKeyword(lower, pos, "materialized")) {
-			pos += strlen("materialized");
-			SkipWhitespace(sql, pos);
-		}
-		if (!StartsWithKeyword(lower, pos, "view")) {
-			return false;
-		}
-		pos += strlen("view");
-	}
-	SkipWhitespace(sql, pos);
-	if (StartsWithKeyword(lower, pos, "if")) {
-		pos += strlen("if");
-		SkipWhitespace(sql, pos);
-		if (!StartsWithKeyword(lower, pos, "not")) {
-			return false;
-		}
-		pos += strlen("not");
-		SkipWhitespace(sql, pos);
-		if (!StartsWithKeyword(lower, pos, "exists")) {
-			return false;
-		}
-		pos += strlen("exists");
-		SkipWhitespace(sql, pos);
-	}
-
-	vector<string> parts;
-	while (pos < sql.size()) {
-		SkipWhitespace(sql, pos);
-		string part;
-		if (pos < sql.size() && sql[pos] == '"') {
-			pos++;
-			while (pos < sql.size()) {
-				if (sql[pos] == '"') {
-					if (pos + 1 < sql.size() && sql[pos + 1] == '"') {
-						part += '"';
-						pos += 2;
-						continue;
-					}
-					pos++;
-					break;
-				}
-				part += sql[pos++];
-			}
-		} else {
-			while (pos < sql.size() && (IsIdentifierChar(sql[pos]) || sql[pos] == '-')) {
-				part += sql[pos++];
-			}
-		}
-		if (part.empty()) {
-			break;
-		}
-		parts.push_back(part);
-		SkipWhitespace(sql, pos);
-		if (pos >= sql.size() || sql[pos] != '.') {
-			break;
-		}
-		pos++;
-	}
-	if (parts.empty()) {
-		return false;
-	}
-	out.clear();
-	for (idx_t i = 0; i < parts.size(); i++) {
-		if (i > 0) {
-			out += ".";
-		}
-		out += SqlUtils::QuoteIdentifier(parts[i]);
-	}
-	return true;
 }
 
 struct IdentifierSegmentSpan {
@@ -228,13 +359,13 @@ vector<string> SqlUtils::ParseQualifiedIdentifier(const string &name) {
 	vector<string> parts;
 	idx_t pos = 0;
 	while (true) {
-		SkipWhitespace(name, pos);
+		pos = SkipWhitespace(name, pos);
 		string part;
 		if (!ReadIdentifierSegment(name, pos, part)) {
 			throw ParserException("Invalid qualified identifier '%s'", name);
 		}
 		parts.push_back(std::move(part));
-		SkipWhitespace(name, pos);
+		pos = SkipWhitespace(name, pos);
 		if (pos == name.size()) {
 			return parts;
 		}
@@ -242,25 +373,6 @@ vector<string> SqlUtils::ParseQualifiedIdentifier(const string &name) {
 			throw ParserException("Invalid qualified identifier '%s'", name);
 		}
 	}
-}
-
-static bool ReadQualifiedIdentifier(const string &sql, idx_t start, idx_t &end, string &identifier) {
-	idx_t pos = start;
-	string segment;
-	if (!ReadIdentifierSegment(sql, pos, segment)) {
-		return false;
-	}
-	identifier = segment;
-	while (pos < sql.size() && sql[pos] == '.') {
-		idx_t dot_pos = pos++;
-		if (!ReadIdentifierSegment(sql, pos, segment)) {
-			pos = dot_pos;
-			break;
-		}
-		identifier += "." + segment;
-	}
-	end = pos;
-	return true;
 }
 
 static bool ReadQualifiedIdentifierSpans(const string &sql, idx_t start, idx_t &end,
@@ -284,6 +396,17 @@ static bool ReadQualifiedIdentifierSpans(const string &sql, idx_t start, idx_t &
 	return true;
 }
 
+vector<string> SqlUtils::ReadQualifiedIdentifier(const string &sql, idx_t start, idx_t &end) {
+	vector<IdentifierSegmentSpan> spans;
+	vector<string> parts;
+	if (ReadQualifiedIdentifierSpans(sql, start, end, spans)) {
+		for (auto &span : spans) {
+			parts.push_back(std::move(span.value));
+		}
+	}
+	return parts;
+}
+
 static bool QualifierMatches(const vector<IdentifierSegmentSpan> &segments, const unordered_set<string> &qualifiers) {
 	if (segments.size() <= 1) {
 		return false;
@@ -296,199 +419,46 @@ static bool QualifierMatches(const vector<IdentifierSegmentSpan> &segments, cons
 	return false;
 }
 
-static idx_t CopySingleQuotedLiteral(const string &sql, idx_t start, string &out) {
-	idx_t i = start + 1;
-	while (i < sql.size()) {
-		if (sql[i] == '\'' && i + 1 < sql.size() && sql[i + 1] == '\'') {
-			i += 2;
-			continue;
-		}
-		if (sql[i++] == '\'') {
-			break;
-		}
-	}
-	out += sql.substr(start, i - start);
-	return i;
-}
-
-static idx_t CopyLineComment(const string &sql, idx_t start, string &out) {
-	idx_t i = start + 2;
-	while (i < sql.size() && sql[i] != '\n') {
-		i++;
-	}
-	if (i < sql.size()) {
-		i++;
-	}
-	out += sql.substr(start, i - start);
-	return i;
-}
-
-static idx_t CopyBlockComment(const string &sql, idx_t start, string &out) {
-	idx_t i = start + 2;
-	while (i + 1 < sql.size()) {
-		if (sql[i] == '*' && sql[i + 1] == '/') {
-			i += 2;
-			out += sql.substr(start, i - start);
-			return i;
-		}
-		i++;
-	}
-	out += sql.substr(start);
-	return sql.size();
-}
-
 void SqlUtils::WriteFile(const string &filename, bool append, const string &compiled_query) {
-	std::ofstream file;
-	if (append) {
-		file.open(filename, std::ios_base::app);
-	} else {
-		file.open(filename);
-	}
-	if (!file.is_open()) {
-		throw IOException(
-		    "OpenIVM could not open compiled SQL file '%s'. Create the directory set by "
-		    "openivm_files_path and check write permissions; relative paths use the process working directory.",
-		    filename);
-	}
-	file << compiled_query << '\n';
-	file.close();
-	if (file.fail()) {
-		throw IOException("OpenIVM could not finish writing compiled SQL file '%s'. Check free space and permissions.",
-		                  filename);
-	}
-}
-
-string SqlUtils::ExtractTableName(const string &sql) {
-	string name;
-	if (ReadCreateTargetName(sql, "table", name)) {
-		return name;
-	}
-	// Matches: CREATE TABLE [IF NOT EXISTS] name|"quoted name" (AS ...|(...))
-	std::regex table_name_regex(
-	    R"re(create\s+table\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)(?:\s*\([^)]*\)|\s+as\s+(.*)))re");
-	std::smatch match;
-	if (std::regex_search(sql, match, table_name_regex)) {
-		auto name = match[1].str();
-		if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
-			name = StringUtil::Replace(name.substr(1, name.size() - 2), "\"\"", "\"");
+	LocalFileSystem fs;
+	auto flags =
+	    FileFlags::FILE_FLAGS_WRITE | (append ? FileFlags::FILE_FLAGS_FILE_CREATE | FileFlags::FILE_FLAGS_APPEND
+	                                          : FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+	try {
+		auto file = fs.OpenFile(filename, flags);
+		auto output = compiled_query + "\n";
+		auto output_bytes = NumericCast<int64_t>(output.size());
+		if (fs.Write(*file, output.data(), output_bytes) != output_bytes) {
+			throw IOException("short write");
 		}
-		return name;
+	} catch (const IOException &error) {
+		throw IOException("OpenIVM could not write compiled SQL file '%s': %s. Create the directory set by "
+		                  "openivm_files_path and check free space and permissions; relative paths use the process "
+		                  "working directory.",
+		                  filename, error.what());
 	}
-	return "";
 }
 
 string SqlUtils::EscapeSingleQuotes(const string &input) {
-	std::stringstream escaped_stream;
-	for (char c : input) {
-		if (c == '\'') {
-			escaped_stream << "''";
-		} else {
-			escaped_stream << c;
-		}
-	}
-	return escaped_stream.str();
-}
-
-void SqlUtils::ReplaceMaterializedView(string &query) {
-	query = std::regex_replace(query, std::regex("\\bmaterialized\\s+view\\b"), "table if not exists");
-	query = regex_replace(query, std::regex("\\s*;$"), "");
-}
-
-string SqlUtils::ExtractViewQuery(string &query) {
-	string lower = StringUtil::Lower(query);
-	size_t pos = lower.find("create");
-	if (pos != string::npos) {
-		pos += strlen("create");
-		SkipWhitespace(query, pos);
-		if (StartsWithKeyword(lower, pos, "or")) {
-			pos += strlen("or");
-			SkipWhitespace(query, pos);
-			if (StartsWithKeyword(lower, pos, "replace")) {
-				pos += strlen("replace");
-				SkipWhitespace(query, pos);
-			}
-		}
-		bool found_object = false;
-		if (StartsWithKeyword(lower, pos, "table")) {
-			pos += strlen("table");
-			found_object = true;
-		} else if (StartsWithKeyword(lower, pos, "materialized")) {
-			pos += strlen("materialized");
-			SkipWhitespace(query, pos);
-			if (StartsWithKeyword(lower, pos, "view")) {
-				pos += strlen("view");
-				found_object = true;
-			}
-		}
-		if (found_object) {
-			SkipWhitespace(query, pos);
-			if (StartsWithKeyword(lower, pos, "if")) {
-				pos += strlen("if");
-				SkipWhitespace(query, pos);
-				if (StartsWithKeyword(lower, pos, "not")) {
-					pos += strlen("not");
-					SkipWhitespace(query, pos);
-				}
-				if (StartsWithKeyword(lower, pos, "exists")) {
-					pos += strlen("exists");
-					SkipWhitespace(query, pos);
-				}
-			}
-			while (pos < query.size()) {
-				SkipWhitespace(query, pos);
-				if (pos < query.size() && query[pos] == '"') {
-					pos++;
-					while (pos < query.size()) {
-						if (query[pos] == '"') {
-							pos++;
-							if (pos < query.size() && query[pos] == '"') {
-								pos++;
-								continue;
-							}
-							break;
-						}
-						pos++;
-					}
-				} else {
-					while (pos < query.size() && (IsIdentifierChar(query[pos]) || query[pos] == '-')) {
-						pos++;
-					}
-				}
-				SkipWhitespace(query, pos);
-				if (pos >= query.size() || query[pos] != '.') {
-					break;
-				}
-				pos++;
-			}
-			SkipWhitespace(query, pos);
-			if (StartsWithKeyword(lower, pos, "as")) {
-				pos += strlen("as");
-				return query.substr(pos);
-			}
-		}
-	}
-	// Match only up through "AS " — then return everything after as a raw substr so
-	// multi-line CTE bodies (which contain '\n') are not truncated by regex '.' semantics.
-	std::regex rgx_create_view(
-	    R"re(create\s+(table|materialized view)\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)\s+as\s+)re");
-	std::smatch match;
-	if (std::regex_search(query, match, rgx_create_view)) {
-		return query.substr(static_cast<size_t>(match.position()) + static_cast<size_t>(match.length()));
-	}
-	return "";
+	return StringUtil::Replace(input, "'", "''");
 }
 
 string SqlUtils::SQLToLowercase(const string &sql) {
 	std::stringstream lowercase_stream;
-	bool in_string = false;
+	// Quoted identifiers carry physical catalog/schema identities. Folding them
+	// can select a different metadata catalog even though DuckDB binds the name.
+	char quote = '\0';
 	for (char c : sql) {
-		if (c == '\'') {
-			in_string = !in_string;
-		}
-		if (!in_string) {
-			lowercase_stream << (char)tolower(c);
-		} else {
+		if (quote) {
 			lowercase_stream << c;
+			if (c == quote) {
+				quote = '\0';
+			}
+		} else if (c == '\'' || c == '"') {
+			quote = c;
+			lowercase_stream << c;
+		} else {
+			lowercase_stream << StringUtil::CharacterToLower(c);
 		}
 	}
 	return lowercase_stream.str();
@@ -498,102 +468,21 @@ void SqlUtils::RemoveRedundantWhitespaces(string &query) {
 	query = std::regex_replace(query, std::regex("\\s+"), " ");
 }
 
-void SqlUtils::StripLineComments(string &query) {
-	string out;
-	out.reserve(query.size());
-	bool in_string = false;
-	for (size_t i = 0; i < query.size(); ++i) {
-		char c = query[i];
-		if (c == '\'' && !in_string) {
-			in_string = true;
-			out += c;
-		} else if (c == '\'' && in_string) {
-			in_string = false;
-			out += c;
-		} else if (!in_string && c == '-' && i + 1 < query.size() && query[i + 1] == '-') {
-			// Skip to end of line, preserve the newline so downstream \s+ collapse still works
-			while (i < query.size() && query[i] != '\n') {
-				++i;
-			}
-			if (i < query.size()) {
-				out += '\n';
-			}
-		} else {
-			out += c;
-		}
-	}
-	query = std::move(out);
-}
-
 vector<string> SqlUtils::SplitSQLStatements(const string &sql) {
 	vector<string> statements;
 	idx_t start = 0;
-	bool in_single_quote = false;
-	bool in_double_quote = false;
-	bool in_line_comment = false;
-	bool in_block_comment = false;
-
-	for (idx_t i = 0; i < sql.size(); i++) {
-		auto c = sql[i];
-		auto next = i + 1 < sql.size() ? sql[i + 1] : '\0';
-
-		if (in_line_comment) {
-			if (c == '\n') {
-				in_line_comment = false;
-			}
+	// Match DuckDB's own statement splitting, including dollar-quoted strings
+	// and nested comments, rather than maintaining a second SQL lexer.
+	for (auto &token : Parser::Tokenize(sql)) {
+		if (token.type != SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR || sql[token.start] != ';') {
 			continue;
 		}
-		if (in_block_comment) {
-			if (c == '*' && next == '/') {
-				in_block_comment = false;
-				i++;
-			}
-			continue;
+		auto statement = TrimSQLFragment(sql.substr(start, token.start - start));
+		if (!statement.empty()) {
+			statements.push_back(std::move(statement));
 		}
-		if (in_single_quote) {
-			if (c == '\'' && next == '\'') {
-				i++;
-			} else if (c == '\'') {
-				in_single_quote = false;
-			}
-			continue;
-		}
-		if (in_double_quote) {
-			if (c == '"' && next == '"') {
-				i++;
-			} else if (c == '"') {
-				in_double_quote = false;
-			}
-			continue;
-		}
-
-		if (c == '-' && next == '-') {
-			in_line_comment = true;
-			i++;
-			continue;
-		}
-		if (c == '/' && next == '*') {
-			in_block_comment = true;
-			i++;
-			continue;
-		}
-		if (c == '\'') {
-			in_single_quote = true;
-			continue;
-		}
-		if (c == '"') {
-			in_double_quote = true;
-			continue;
-		}
-		if (c == ';') {
-			auto statement = TrimSQLFragment(sql.substr(start, i - start));
-			if (!statement.empty()) {
-				statements.push_back(std::move(statement));
-			}
-			start = i + 1;
-		}
+		start = token.start + 1;
 	}
-
 	auto statement = TrimSQLFragment(sql.substr(start));
 	if (!statement.empty()) {
 		statements.push_back(std::move(statement));
@@ -656,47 +545,66 @@ string SqlUtils::LastIdentifierPart(string name) {
 	return name;
 }
 
-string SqlUtils::FullName(const string &catalog, const string &schema, const string &table) {
-	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteIdentifier(table);
-}
-
-string SqlUtils::FullDeltaName(const string &catalog, const string &schema, const string &table) {
-	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
-	string base = table;
-	if (base.size() > data_prefix.size() && base.rfind(data_prefix, 0) == 0) {
-		base = base.substr(data_prefix.size());
-	}
-	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteIdentifier(DeltaName(base));
-}
-
 string SqlUtils::QualifiedPrefix(const string &catalog, const string &schema) {
 	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + ".";
 }
 
-string SqlUtils::QuoteQualifiedPrefix(const string &prefix) {
-	if (prefix.empty()) {
-		return "";
+vector<string> SqlUtils::ParseColumnList(const string &raw) {
+	vector<string> columns;
+	string input = raw;
+	StringUtil::Trim(input);
+	if (input.empty()) {
+		return columns;
 	}
-	vector<string> parts;
-	string current;
-	for (auto c : prefix) {
-		if (c == '.') {
-			if (!current.empty()) {
-				parts.push_back(current);
-				current.clear();
+	if (input.front() == '[') {
+		size_t pos = 1;
+		while (pos < input.size()) {
+			while (pos < input.size() && (std::isspace(static_cast<unsigned char>(input[pos])) || input[pos] == ',')) {
+				pos++;
 			}
-			continue;
+			if (pos >= input.size() || input[pos] == ']') {
+				break;
+			}
+			if (input[pos] != '"') {
+				return {};
+			}
+			pos++;
+			string value;
+			while (pos < input.size()) {
+				char c = input[pos++];
+				if (c == '\\' && pos < input.size()) {
+					char esc = input[pos++];
+					value += (esc == 'n') ? '\n' : esc;
+					continue;
+				}
+				if (c == '"') {
+					columns.push_back(value);
+					break;
+				}
+				value += c;
+			}
 		}
-		current += c;
+		return columns;
 	}
-	if (!current.empty()) {
-		parts.push_back(current);
+
+	size_t start = 0;
+	while (start <= input.size()) {
+		size_t end = input.find(',', start);
+		string value = input.substr(start, end == string::npos ? string::npos : end - start);
+		StringUtil::Trim(value);
+		if ((value.size() >= 2 && value.front() == '"' && value.back() == '"') ||
+		    (value.size() >= 2 && value.front() == '\'' && value.back() == '\'')) {
+			value = value.substr(1, value.size() - 2);
+		}
+		if (!value.empty()) {
+			columns.push_back(value);
+		}
+		if (end == string::npos) {
+			break;
+		}
+		start = end + 1;
 	}
-	string quoted;
-	for (auto &part : parts) {
-		quoted += QuoteIdentifier(part) + ".";
-	}
-	return quoted;
+	return columns;
 }
 
 string SqlUtils::JsonQuote(const string &value) {
@@ -715,16 +623,14 @@ string SqlUtils::JsonQuote(const string &value) {
 	return result;
 }
 
+// Map each column through fn and join the results with sep.
+template <class FUNC>
+static string JoinEach(const vector<string> &columns, const string &sep, FUNC fn) {
+	return StringUtil::Join(columns, columns.size(), sep, fn);
+}
+
 string SqlUtils::JsonArray(const vector<string> &values) {
-	string result = "[";
-	for (idx_t i = 0; i < values.size(); i++) {
-		if (i > 0) {
-			result += ",";
-		}
-		result += JsonQuote(values[i]);
-	}
-	result += "]";
-	return result;
+	return "[" + JoinEach(values, ",", JsonQuote) + "]";
 }
 
 string SqlUtils::DuckLakeTableFunction(const string &function_name, const string &catalog, const string &schema,
@@ -733,53 +639,64 @@ string SqlUtils::DuckLakeTableFunction(const string &function_name, const string
 	       "', " + to_string(last_snapshot_id) + ", " + to_string(current_snapshot_id) + ")";
 }
 
+SessionLocation SqlUtils::SessionDefaultLocation(ClientContext &context) {
+	auto &entry = ClientData::Get(context).catalog_search_path->GetDefault();
+	return {entry.GetCatalog().empty() ? DatabaseManager::GetDefaultDatabase(context).GetIdentifierName()
+	                                   : entry.GetCatalog().GetIdentifierName(),
+	        entry.GetSchema().empty() ? string(DEFAULT_SCHEMA) : entry.GetSchema().GetIdentifierName()};
+}
+
+string SqlUtils::DeleteViewRowsSQL(const string &table, const string &view_name, const string &column) {
+	return "DELETE FROM " + table + " WHERE " + column + " = '" + EscapeValue(view_name) + "'";
+}
+
 bool SqlUtils::IsDelta(const string &name) {
 	static const string prefix(openivm::DELTA_PREFIX);
 	return name.size() >= prefix.size() && name.rfind(prefix, 0) == 0;
 }
 
-string SqlUtils::JoinQuotedColumns(const vector<string> &columns) {
-	string result;
-	for (idx_t i = 0; i < columns.size(); i++) {
-		if (i > 0) {
-			result += ", ";
+vector<string> SqlUtils::WithoutMultiplicity(const vector<string> &columns) {
+	vector<string> result;
+	for (auto &column : columns) {
+		if (column != openivm::MULTIPLICITY_COL) {
+			result.push_back(column);
 		}
-		result += QuoteIdentifier(columns[i]);
 	}
 	return result;
+}
+
+string SqlUtils::JoinQuotedColumns(const vector<string> &columns) {
+	return JoinEach(columns, ", ", [](const string &column) { return QuoteIdentifier(column); });
 }
 
 string SqlUtils::JoinQualifiedQuotedColumns(const vector<string> &columns, const string &alias) {
-	string result;
-	for (idx_t i = 0; i < columns.size(); i++) {
-		if (i > 0) {
-			result += ", ";
-		}
-		result += alias + "." + QuoteIdentifier(columns[i]);
-	}
-	return result;
+	return JoinEach(columns, ", ", [&](const string &c) { return alias + "." + QuoteIdentifier(c); });
+}
+
+string SqlUtils::JoinQualifiedAliasedColumns(const vector<string> &columns, const string &alias) {
+	return JoinEach(columns, ", ", [&](const string &c) {
+		auto column = QuoteIdentifier(c);
+		return alias + "." + column + " AS " + column;
+	});
 }
 
 string SqlUtils::BuildAllNullPredicate(const vector<string> &columns) {
-	string result;
-	for (idx_t i = 0; i < columns.size(); i++) {
-		if (i > 0) {
-			result += " AND ";
-		}
-		result += QuoteIdentifier(columns[i]) + " IS NULL";
-	}
-	return result;
+	return JoinEach(columns, " AND ", [](const string &c) { return QuoteIdentifier(c) + " IS NULL"; });
 }
 
 string SqlUtils::BuildAnyNullPredicate(const vector<string> &columns, const string &prefix) {
-	string result;
-	for (idx_t i = 0; i < columns.size(); i++) {
-		if (i > 0) {
-			result += " OR ";
-		}
-		result += prefix + QuoteIdentifier(columns[i]) + " IS NULL";
+	return JoinEach(columns, " OR ", [&](const string &c) { return prefix + QuoteIdentifier(c) + " IS NULL"; });
+}
+
+string SqlUtils::BuildRowRepetitionSQL(const string &count, const string &alias, SqlDialect dialect) {
+	auto quoted_alias = DialectQuoteIdent(alias, dialect);
+	auto bound = "CAST(" + count + " AS BIGINT)";
+	if (dialect == SqlDialect::SPARK) {
+		// sequence(1, 0) descends instead of returning an empty array.
+		return " LATERAL VIEW explode(CASE WHEN " + bound + " > 0 THEN sequence(CAST(1 AS BIGINT), " + bound +
+		       ") ELSE array() END) " + quoted_alias + " AS `range`";
 	}
-	return result;
+	return " CROSS JOIN range(" + bound + ") " + quoted_alias;
 }
 
 string SqlUtils::BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias) {
@@ -788,15 +705,10 @@ string SqlUtils::BuildNullSafeMatch(const vector<string> &columns, const string 
 
 string SqlUtils::BuildNullSafeKeyPredicate(const vector<string> &columns, const string &left_prefix,
                                            const string &right_prefix) {
-	string result;
-	for (idx_t i = 0; i < columns.size(); i++) {
-		if (i > 0) {
-			result += " AND ";
-		}
-		auto column = QuoteIdentifier(columns[i]);
-		result += left_prefix + column + " IS NOT DISTINCT FROM " + right_prefix + column;
-	}
-	return result;
+	return JoinEach(columns, " AND ", [&](const string &c) {
+		auto column = QuoteIdentifier(c);
+		return left_prefix + column + " IS NOT DISTINCT FROM " + right_prefix + column;
+	});
 }
 
 string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql,
@@ -821,15 +733,7 @@ string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &v
 }
 
 string SqlUtils::ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement) {
-	if (needle.empty()) {
-		return haystack;
-	}
-	size_t pos = 0;
-	while ((pos = haystack.find(needle, pos)) != string::npos) {
-		haystack.replace(pos, needle.size(), replacement);
-		pos += replacement.size();
-	}
-	return haystack;
+	return needle.empty() ? haystack : StringUtil::Replace(std::move(haystack), needle, replacement);
 }
 
 vector<string> SqlUtils::ReplaceEachPlainOccurrence(const string &haystack, const string &needle,
@@ -848,33 +752,17 @@ vector<string> SqlUtils::ReplaceEachPlainOccurrence(const string &haystack, cons
 	return variants;
 }
 
-bool SqlUtils::IdentifierMatchesTable(const string &identifier, const string &table_name) {
-	if (StringUtil::CIEquals(identifier, table_name)) {
-		return true;
-	}
-	if (identifier.size() <= table_name.size()) {
-		return false;
-	}
-	auto suffix = identifier.substr(identifier.size() - table_name.size());
-	return identifier[identifier.size() - table_name.size() - 1] == '.' && StringUtil::CIEquals(suffix, table_name);
-}
-
 bool SqlUtils::RewriteColumnReferences(string &sql, const string &old_name, const string &new_name,
                                        const unordered_set<string> &qualifiers, bool allow_unqualified) {
 	string rewritten;
 	rewritten.reserve(sql.size());
 	bool changed = false;
 	for (idx_t i = 0; i < sql.size();) {
-		if (sql[i] == '\'') {
-			i = CopySingleQuotedLiteral(sql, i, rewritten);
-			continue;
-		}
-		if (sql[i] == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
-			i = CopyLineComment(sql, i, rewritten);
-			continue;
-		}
-		if (sql[i] == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
-			i = CopyBlockComment(sql, i, rewritten);
+		// Literals and comments are copied; quoted identifiers are column references.
+		idx_t skipped_end;
+		if (sql[i] != '"' && TryReadSkippableSqlSpan(sql, i, skipped_end)) {
+			rewritten.append(sql, i, skipped_end - i);
+			i = skipped_end;
 			continue;
 		}
 		if (sql[i] != '"' && !(std::isalpha(static_cast<unsigned char>(sql[i])) || sql[i] == '_')) {
@@ -946,11 +834,25 @@ static idx_t ExtendPastTimeTravelClause(const string &sql, idx_t end) {
 }
 
 static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sql, const string &table_name,
-                                                                bool include_time_travel_clause) {
+                                                                bool include_time_travel_clause,
+                                                                bool match_all = false) {
 	vector<TableReferenceMatch> matches;
-	if (table_name.empty()) {
+	if (table_name.empty() && !match_all) {
 		return matches;
 	}
+	// Keep component boundaries: a quoted dot is part of a name, not qualification.
+	auto target_parts = match_all ? vector<string>() : SqlUtils::ParseQualifiedIdentifier(table_name);
+	auto matches_table = [&](const vector<IdentifierSegmentSpan> &parts) {
+		if (parts.size() < target_parts.size()) {
+			return false;
+		}
+		for (idx_t part = 0; part < target_parts.size(); part++) {
+			if (!StringUtil::CIEquals(parts[parts.size() - target_parts.size() + part].value, target_parts[part])) {
+				return false;
+			}
+		}
+		return true;
+	};
 	bool in_single_quote = false;
 	bool expect_table = false;
 	for (idx_t i = 0; i < sql.size();) {
@@ -967,16 +869,16 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 		if (!in_single_quote && IsIdentifierTokenStart(c)) {
 			idx_t start = i;
 			idx_t end = i;
-			string qualified_identifier;
-			if (ReadQualifiedIdentifier(sql, start, end, qualified_identifier)) {
-				if (expect_table && SqlUtils::IdentifierMatchesTable(qualified_identifier, table_name)) {
+			vector<IdentifierSegmentSpan> parts;
+			if (ReadQualifiedIdentifierSpans(sql, start, end, parts)) {
+				if (expect_table && matches_table(parts)) {
 					matches.push_back({start, include_time_travel_clause ? ExtendPastTimeTravelClause(sql, end) : end});
 					i = matches.back().end;
 					expect_table = false;
 					continue;
 				}
 				i = end;
-				expect_table = IsTableReferenceKeyword(qualified_identifier);
+				expect_table = parts.size() == 1 && sql[start] != '"' && IsTableReferenceKeyword(parts[0].value);
 				continue;
 			}
 		}
@@ -988,13 +890,27 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 	return matches;
 }
 
-string SqlUtils::FindTableReference(const string &sql, const string &table_name) {
-	auto matches = CollectTableReferenceMatches(sql, table_name, false);
-	if (matches.empty()) {
-		return "";
+string SqlUtils::RewriteTableReferences(const string &sql,
+                                        const std::function<string(const vector<string> &)> &rewrite) {
+	string result;
+	idx_t previous = 0;
+	for (auto &match : CollectTableReferenceMatches(sql, "", false, true)) {
+		auto replacement = rewrite(ParseQualifiedIdentifier(sql.substr(match.start, match.end - match.start)));
+		if (!replacement.empty()) {
+			result.append(sql, previous, match.start - previous);
+			result += replacement;
+			previous = match.end;
+		}
 	}
-	auto &match = matches[0];
-	return sql.substr(match.start, match.end - match.start);
+	if (previous == 0) {
+		return sql;
+	}
+	result.append(sql, previous, sql.size() - previous);
+	return result;
+}
+
+string SqlUtils::FindTableReference(const string &sql, const string &table_name) {
+	return FindTableReferenceOccurrence(sql, table_name, 0);
 }
 
 string SqlUtils::FindTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence) {
@@ -1006,42 +922,26 @@ string SqlUtils::FindTableReferenceOccurrence(const string &sql, const string &t
 	return sql.substr(match.start, match.end - match.start);
 }
 
-idx_t SqlUtils::CountTableReferences(const string &sql, const string &table_name) {
-	return CollectTableReferenceMatches(sql, table_name, false).size();
-}
-
-string SqlUtils::ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement) {
-	auto matches = CollectTableReferenceMatches(sql, table_name, true);
-	if (matches.empty()) {
-		return sql;
-	}
+static string ReplaceMatches(const string &sql, const vector<TableReferenceMatch> &matches, const string &replacement) {
 	string result;
-	result.reserve(sql.size());
 	idx_t last = 0;
 	for (auto &match : matches) {
-		result += sql.substr(last, match.start - last);
+		result.append(sql, last, match.start - last);
 		result += replacement;
 		last = match.end;
 	}
-	result += sql.substr(last);
-	return result;
+	return result.append(sql, last, string::npos);
+}
+
+string SqlUtils::ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement) {
+	return ReplaceMatches(sql, CollectTableReferenceMatches(sql, table_name, true), replacement);
 }
 
 string SqlUtils::ReplaceTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence,
                                                  const string &replacement, bool &replaced) {
-	replaced = false;
 	auto matches = CollectTableReferenceMatches(sql, table_name, true);
-	if (occurrence >= matches.size()) {
-		return sql;
-	}
-	auto &match = matches[occurrence];
-	string result;
-	result.reserve(sql.size());
-	result += sql.substr(0, match.start);
-	result += replacement;
-	result += sql.substr(match.end);
-	replaced = true;
-	return result;
+	replaced = occurrence < matches.size();
+	return replaced ? ReplaceMatches(sql, {matches[occurrence]}, replacement) : sql;
 }
 
 vector<string> SqlUtils::ReplaceEachTableReference(const string &sql, const string &table_name,
@@ -1089,7 +989,6 @@ int64_t SqlUtils::ExtractRefreshInterval(string &query) {
 	string interval_str = match[1].str();
 	// Strip the REFRESH EVERY clause from the query
 	query = std::regex_replace(query, refresh_re, "");
-	SqlUtils::RemoveRedundantWhitespaces(query);
 	return ParseRefreshInterval(interval_str);
 }
 

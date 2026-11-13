@@ -3,6 +3,8 @@
 
 #include "duckdb.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/common/sql_identifier.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "lpts_pipeline.hpp"
 
 #include <string>
@@ -13,45 +15,75 @@ namespace duckdb {
 // Utility functions for SQL string manipulation.
 // Originally from the compiler extension; inlined here to remove the external dependency.
 
+class BaseTableRef;
+
+struct SessionLocation {
+	string catalog;
+	string schema;
+};
+
 class SqlUtils {
 public:
+	static EntryLookupInfo QualifyLookup(const EntryLookupInfo &lookup, const Identifier &catalog,
+	                                     const Identifier &schema) {
+		return EntryLookupInfo(lookup, QualifiedName(catalog, schema, lookup.GetEntryIdentifier()));
+	}
+	// Visit real relation references, excluding CTE names in their lexical scope.
+	static void VisitSourceReferences(SQLStatement &statement, const std::function<void(BaseTableRef &)> &callback);
+	static void RewriteSourceReferences(SQLStatement &statement,
+	                                    const std::function<void(unique_ptr<TableRef> &)> &callback);
 	static void WriteFile(const string &filename, bool append, const string &compiled_query);
-	static string ExtractTableName(const string &sql);
 	static string EscapeSingleQuotes(const string &input);
-	static void ReplaceMaterializedView(string &query);
-	static string ExtractViewQuery(string &query);
 	static string SQLToLowercase(const string &sql);
 	static void RemoveRedundantWhitespaces(string &query);
-	/// Strip SQL line comments (-- to end of line) while respecting single-quoted string literals.
-	static void StripLineComments(string &query);
-	/// Trim whitespace without stripping non-ASCII identifier bytes on signed-char builds.
-	static string TrimSQLFragment(const string &input);
 	static vector<string> SplitSQLStatements(const string &sql);
 	static string SQLStatementPreview(const string &statement);
 	static string DeltaName(const string &name);
 	static string LastIdentifierPart(string name);
 	static vector<string> ParseQualifiedIdentifier(const string &name);
-	static string FullName(const string &catalog, const string &schema, const string &table);
-	static string FullDeltaName(const string &catalog, const string &schema, const string &table);
+	// Read one identifier at start without scanning the statement body.
+	static vector<string> ReadQualifiedIdentifier(const string &sql, idx_t start, idx_t &end);
+	// Empty replacement keeps a reference unchanged; visit all references in one scan.
+	static string RewriteTableReferences(const string &sql,
+	                                     const std::function<string(const vector<string> &)> &rewrite);
+	template <class CATALOG, class SCHEMA, class TABLE>
+	static string FullName(const CATALOG &catalog, const SCHEMA &schema, const TABLE &table) {
+		return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteIdentifier(table);
+	}
+	/// Compare SQL expressions holding catalog identifiers using DuckDB's ASCII-only case folding.
+	static string IdentifierEqualsSQL(const string &left, const string &right);
 	static string QualifiedPrefix(const string &catalog, const string &schema);
-	static string QuoteQualifiedPrefix(const string &prefix);
 	static string JsonQuote(const string &value);
+	static string TrimSQLFragment(const string &input);
+	static vector<string> ParseColumnList(const string &raw);
 	static string JsonArray(const vector<string> &values);
 	static string DuckLakeTableFunction(const string &function_name, const string &catalog, const string &schema,
 	                                    const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id);
 	static bool GetBoolSetting(ClientContext &context, const string &setting_name, bool default_value) {
 		Value setting_value;
-		if (context.TryGetCurrentSetting(setting_name, setting_value) && !setting_value.IsNull()) {
+		if (context.TryGetCurrentSetting(Identifier(setting_name), setting_value) && !setting_value.IsNull()) {
 			return setting_value.GetValue<bool>();
 		}
 		return default_value;
 	}
+	// Copy a registered extension setting to a helper connection without changing the database default.
+	static void CopySessionSetting(ClientContext &from, ClientContext &to, const string &name);
+	/// The caller's default catalog and schema; an unset session catalog is the default database.
+	static SessionLocation SessionDefaultLocation(ClientContext &context);
+	/// `DELETE FROM <table> WHERE <column> = '<view_name>'` for per-view metadata rows.
+	static string DeleteViewRowsSQL(const string &table, const string &view_name, const string &column = "view_name");
 	static bool IsDelta(const string &name);
+	/// The columns other than the multiplicity column, in their original order.
+	static vector<string> WithoutMultiplicity(const vector<string> &columns);
 	static string JoinQuotedColumns(const vector<string> &columns);
 	static string JoinQualifiedQuotedColumns(const vector<string> &columns, const string &alias);
+	/// `alias.col AS col, ...`: qualified columns that keep their unqualified output names.
+	static string JoinQualifiedAliasedColumns(const vector<string> &columns, const string &alias);
 	static string BuildAllNullPredicate(const vector<string> &columns);
 	static string BuildAnyNullPredicate(const vector<string> &columns, const string &prefix = "");
 	static string BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias);
+	// Repeat each input row count times, preserving an empty result for nonpositive counts.
+	static string BuildRowRepetitionSQL(const string &count, const string &alias, SqlDialect dialect);
 	static string BuildNullSafeKeyPredicate(const vector<string> &columns, const string &left_prefix,
 	                                        const string &right_prefix);
 	/// Cast specs retain the legacy single-target-type representation while encoding nested/TRY_CAST expressions.
@@ -65,17 +97,17 @@ public:
 	static string ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement);
 	static vector<string> ReplaceEachPlainOccurrence(const string &haystack, const string &needle,
 	                                                 const string &replacement);
+	// Table-reference helpers accept SQL identifier spellings. Use QuoteIdentifier for
+	// raw table names from the catalog so embedded dots and quotes retain their meaning.
 	static string ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement);
 	static string ReplaceTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence,
 	                                              const string &replacement, bool &replaced);
 	static vector<string> ReplaceEachTableReference(const string &sql, const string &table_name,
 	                                                const string &replacement);
-	static bool IdentifierMatchesTable(const string &identifier, const string &table_name);
 	static bool RewriteColumnReferences(string &sql, const string &old_name, const string &new_name,
 	                                    const unordered_set<string> &qualifiers, bool allow_unqualified);
 	static string FindTableReference(const string &sql, const string &table_name);
 	static string FindTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence);
-	static idx_t CountTableReferences(const string &sql, const string &table_name);
 
 	/// Parse a REFRESH EVERY interval string (e.g. "5 minutes", "2 hours") into seconds.
 	/// Returns -1 if no interval clause found. Throws on invalid format or < 60 seconds.
@@ -86,8 +118,9 @@ public:
 	static int64_t ExtractRefreshInterval(string &query);
 
 	/// Quote an identifier for safe use in generated SQL (handles reserved words and special chars).
-	static string QuoteIdentifier(const string &name) {
-		return KeywordHelper::WriteOptionallyQuoted(name);
+	template <class T>
+	static string QuoteIdentifier(const T &name) {
+		return SQLIdentifier::ToString(name);
 	}
 
 	/// Escape a string value for use inside single-quoted SQL literals.

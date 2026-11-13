@@ -2,10 +2,10 @@
 
 #include "core/ivm_delta_model.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/plan_rewrite.hpp"
 #include "core/vector_utils.hpp"
 #include "rules/column_hider.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 
@@ -39,18 +39,8 @@ static void DeduplicateGroupColumns(vector<string> &group_columns) {
 	}
 }
 
-static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr) {
-	while (expr && expr->expression_class == ExpressionClass::BOUND_CAST) {
-		auto &cast = expr->Cast<BoundCastExpression>();
-		expr = cast.child.get();
-	}
-	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
-		return nullptr;
-	}
-	return &expr->Cast<BoundColumnRefExpression>();
-}
-
-static bool ResolvesToAggregateValueBinding(idx_t table_index, idx_t column_index, const CreateMVPlanFacts &facts) {
+static bool ResolvesToAggregateValueBinding(TableIndex table_index, ProjectionIndex column_index,
+                                            const CreateMVPlanFacts &facts) {
 	for (auto *aggregate : facts.aggregates) {
 		if (aggregate && aggregate->group_index == facts.analysis.group_index &&
 		    ResolvesToOutputBinding(table_index, column_index, aggregate->aggregate_index,
@@ -85,7 +75,7 @@ static bool VisibleOutputResolvesToAggregateValue(const CreateMVPlanFacts &facts
 		return false;
 	}
 	auto *bcr = GetColumnRefThroughCasts(facts.first_projection->expressions[output_idx].get());
-	return bcr && ResolvesToAggregateValueBinding(bcr->binding.table_index, bcr->binding.column_index, facts);
+	return bcr && ResolvesToAggregateValueBinding(bcr->Binding().table_index, bcr->Binding().column_index, facts);
 }
 
 static bool CanInspectVisibleOutputBinding(const CreateMVPlanFacts &facts, const vector<ColumnBinding> &bindings,
@@ -174,32 +164,35 @@ static void AddJoinKeyGroupColumns(const CreateMVPlanFacts &facts, const vector<
 		return;
 	}
 
-	unordered_map<idx_t, unordered_set<idx_t>> join_key_cols;
+	unordered_map<TableIndex, unordered_set<ProjectionIndex>> join_key_cols;
 	for (auto &cond : cjoin->conditions) {
-		AddJoinKeyColumn(cond.left, join_key_cols);
-		AddJoinKeyColumn(cond.right, join_key_cols);
+		if (!cond.IsComparison()) {
+			continue;
+		}
+		AddJoinKeyColumn(cond.LeftReference(), join_key_cols);
+		AddJoinKeyColumn(cond.RightReference(), join_key_cols);
 	}
 
 	auto &top_proj = *top_proj_ptr;
 	for (idx_t expr_i = 0; expr_i < top_proj.expressions.size(); expr_i++) {
 		auto &expr = top_proj.expressions[expr_i];
-		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 			continue;
 		}
 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
-		auto it = join_key_cols.find(bcr.binding.table_index);
-		if (it == join_key_cols.end() || !it->second.count(bcr.binding.column_index)) {
+		auto it = join_key_cols.find(bcr.Binding().table_index);
+		if (it == join_key_cols.end() || !it->second.count(bcr.Binding().column_index)) {
 			continue;
 		}
 
 		string col_name;
-		if (!expr->alias.empty()) {
-			col_name = expr->alias;
+		if (!expr->GetAlias().GetIdentifierName().empty()) {
+			col_name = expr->GetAlias().GetIdentifierName();
 		} else if (expr_i < output_names.size() && !output_names[expr_i].empty() &&
 		           !IncrementalTableNames::IsInternalColumn(output_names[expr_i])) {
 			col_name = output_names[expr_i];
 		} else {
-			col_name = bcr.GetName();
+			col_name = bcr.GetName().GetIdentifierName();
 		}
 		if (IncrementalTableNames::IsInternalColumn(col_name)) {
 			continue;
@@ -219,114 +212,19 @@ static void AddJoinKeyGroupColumns(const CreateMVPlanFacts &facts, const vector<
 	}
 }
 
-static void BuildUnsupportedReasons(DeltaViewModel &model, const CreateMVPlanFacts &facts,
+static bool HasUnsupportedConstruct(const DeltaViewModel &model, const CreateMVPlanFacts &facts,
                                     const DeltaViewModelInput &input) {
 	const auto &analysis = facts.analysis;
-	if (facts.has_unsupported_set_operation) {
-		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_SET_OPERATION);
-	}
-	if (facts.has_pivot) {
-		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_PIVOT);
-	}
-	if (analysis.found_volatile_expression) {
-		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_FUNCTION);
-	}
-	if (analysis.found_non_foldable_unnest) {
-		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_UNNEST);
-	}
-	if (analysis.found_unsupported_aggregate) {
-		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_AGGREGATE);
-	}
-	if (analysis.found_unsupported_filtered_aggregate) {
-		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_FILTERED_AGGREGATE);
-	}
-	if (analysis.found_unsupported_join_type) {
-		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_JOIN_TYPE);
-	}
-	if (analysis.found_unsupported_order_by) {
-		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_ORDER_BY);
-	}
-	if (analysis.found_unsupported_operator) {
-		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_OPERATOR);
-	}
-	if (analysis.found_grouping_sets && model.group_columns.empty()) {
-		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::GROUPING_SETS_NO_KEYS);
-	}
-	if (analysis.found_filtered_list && model.group_columns.empty()) {
-		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::FILTERED_LIST_NO_KEYS);
-	}
-	if (analysis.found_semi_anti_join && analysis.found_aggregation && model.group_columns.empty()) {
-		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::SEMI_ANTI_WITH_AGGREGATE);
-	}
-	if (analysis.found_semi_anti_join && !analysis.found_aggregation && !input.semi_anti_aux_candidate) {
-		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::SEMI_ANTI_MISSING_AUX);
-	}
-	if (!analysis.incremental_compatible && model.unsupported_reasons.empty()) {
-		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_OPERATOR);
-	}
-}
-
-static void BuildModelFeatures(DeltaViewModel &model, const PlanAnalysis &analysis, const DeltaViewModelInput &input) {
-	const bool has_nonredundant_distinct =
-	    analysis.found_distinct && (!input.has_top_level_redundant_distinct || input.facts->has_descendant_distinct);
-	if (!model.unsupported_reasons.empty()) {
-		AddUnique(model.features, DeltaModelFeature::FULL_ONLY);
-	}
-	if (analysis.found_projection || (!analysis.found_aggregation && !analysis.found_join && !analysis.found_window)) {
-		AddUnique(model.features, DeltaModelFeature::LINEAR);
-	}
-	if (analysis.found_join && !analysis.found_left_join && !analysis.found_full_outer &&
-	    !analysis.found_semi_anti_join && !analysis.found_asof_join && !analysis.found_positional_join) {
-		AddUnique(model.features, DeltaModelFeature::BILINEAR);
-	}
-	if (analysis.found_asof_join) {
-		AddUnique(model.features, DeltaModelFeature::ASOF_STATEFUL);
-	}
-	if (analysis.found_sample) {
-		AddUnique(model.features, DeltaModelFeature::SAMPLE_GLOBAL_RECOMPUTE);
-	}
-	if (analysis.found_positional_join) {
-		AddUnique(model.features, DeltaModelFeature::POSITIONAL_GLOBAL_RECOMPUTE);
-	}
-	if (analysis.found_left_join || analysis.found_full_outer) {
-		AddUnique(model.features, DeltaModelFeature::OUTER_JOIN_STATEFUL);
-	}
-	if (analysis.found_aggregation) {
-		if (analysis.found_minmax || analysis.found_count_distinct || analysis.found_list ||
-		    analysis.found_filtered_list) {
-			AddUnique(model.features, DeltaModelFeature::AGGREGATE_NON_LINEAR);
-		} else {
-			AddUnique(model.features, DeltaModelFeature::AGGREGATE_LINEAR);
-		}
-	}
-	if (analysis.found_having) {
-		AddUnique(model.features, DeltaModelFeature::AGGREGATE_HAVING);
-	}
-	if (analysis.found_count_distinct) {
-		AddUnique(model.features, DeltaModelFeature::COUNT_DISTINCT_STATEFUL);
-	}
-	if (analysis.found_filtered_list) {
-		AddUnique(model.features, DeltaModelFeature::FILTERED_LIST_STATEFUL);
-	}
-	if (analysis.found_grouping_sets) {
-		AddUnique(model.features, DeltaModelFeature::GROUPING_SETS_STATEFUL);
-	}
-	if (analysis.found_window && !model.window_partition_columns.empty()) {
-		AddUnique(model.features, DeltaModelFeature::WINDOW_AFFECTED_PARTITION);
-	}
-	if (!model.HasFeature(DeltaModelFeature::FULL_ONLY)) {
-		if (input.distinct_aux_candidate && has_nonredundant_distinct) {
-			AddUnique(model.features, DeltaModelFeature::DISTINCT_STATEFUL);
-		}
-		if (input.semi_anti_aux_candidate) {
-			AddUnique(model.features, DeltaModelFeature::SEMI_ANTI_STATEFUL);
-		}
-	}
-}
-
-static bool IsAggregateRefreshType(RefreshType type) {
-	return type == RefreshType::SIMPLE_AGGREGATE || type == RefreshType::AGGREGATE_GROUP ||
-	       type == RefreshType::AGGREGATE_HAVING;
+	const bool no_group_keys = model.group_columns.empty();
+	return facts.has_unsupported_set_operation || facts.has_pivot || analysis.found_volatile_expression ||
+	       analysis.found_non_foldable_unnest || analysis.found_unsupported_aggregate ||
+	       analysis.found_unsupported_filtered_aggregate || analysis.found_unsupported_join_type ||
+	       analysis.found_unsupported_order_by || analysis.found_unsupported_operator ||
+	       (analysis.found_grouping_sets && no_group_keys) ||
+	       (analysis.found_retained_aggregate_filter && no_group_keys && !analysis.found_minmax) ||
+	       (analysis.found_semi_anti_join && analysis.found_aggregation && no_group_keys) ||
+	       (analysis.found_semi_anti_join && !analysis.found_aggregation && !input.semi_anti_aux_candidate) ||
+	       !analysis.incremental_compatible;
 }
 
 static bool HasStrategyReason(const DeltaViewModel &model, DeltaStrategyReason reason) {
@@ -334,43 +232,18 @@ static bool HasStrategyReason(const DeltaViewModel &model, DeltaStrategyReason r
 	       model.strategy_reasons.end();
 }
 
-static void BuildUpdateSemantics(DeltaViewModel &model, const PlanAnalysis &analysis) {
-	if (model.type != RefreshType::FULL_REFRESH) {
-		AddUnique(model.update_semantics, DeltaUpdateSemantics::DELETE_SENSITIVE);
-		AddUnique(model.update_semantics, DeltaUpdateSemantics::UPDATE_SENSITIVE);
-	}
-	if (model.type == RefreshType::SIMPLE_PROJECTION) {
-		AddUnique(model.update_semantics, DeltaUpdateSemantics::APPEND_ONLY_SAFE);
-		AddUnique(model.update_semantics, DeltaUpdateSemantics::PROJECTION_DELETE_SKIP_SAFE);
-	}
-	if (IsAggregateRefreshType(model.type) && !analysis.found_count_distinct && !analysis.found_list &&
-	    !analysis.found_filtered_list) {
-		AddUnique(model.update_semantics, DeltaUpdateSemantics::APPEND_ONLY_SAFE);
-		AddUnique(model.update_semantics, DeltaUpdateSemantics::AGGREGATE_DELETE_SKIP_SAFE);
-	}
-	if (analysis.found_minmax && !analysis.found_count_distinct && !analysis.found_list) {
-		AddUnique(model.update_semantics, DeltaUpdateSemantics::MINMAX_INSERT_ONLY_SAFE);
-	}
-}
-
-static bool IsTransparentDistinctWrapper(LogicalOperatorType type) {
-	return type == LogicalOperatorType::LOGICAL_CREATE_TABLE || type == LogicalOperatorType::LOGICAL_FILTER ||
-	       type == LogicalOperatorType::LOGICAL_ORDER_BY || type == LogicalOperatorType::LOGICAL_LIMIT ||
-	       type == LogicalOperatorType::LOGICAL_TOP_N;
+// Output path through projections and the wrappers that keep a DISTINCT/aggregate at the top of the view.
+static OutputSpine DistinctSpine(const CreateMVPlanFacts &facts) {
+	return FindOutputSpine(facts.root, [](const LogicalOperator &op) {
+		return op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE || op.type == LogicalOperatorType::LOGICAL_FILTER ||
+		       op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
+		       op.type == LogicalOperatorType::LOGICAL_TOP_N;
+	});
 }
 
 static bool HasOuterProjectionOverDistinct(const CreateMVPlanFacts &facts) {
-	auto *node = facts.root;
-	bool found_projection = false;
-	while (node && node->children.size() == 1) {
-		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-			found_projection = true;
-		} else if (!IsTransparentDistinctWrapper(node->type)) {
-			break;
-		}
-		node = node->children[0].get();
-	}
-	return found_projection && node && node->type == LogicalOperatorType::LOGICAL_DISTINCT;
+	auto spine = DistinctSpine(facts);
+	return !spine.projections.empty() && spine.bottom && spine.bottom->type == LogicalOperatorType::LOGICAL_DISTINCT;
 }
 
 static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &facts, const vector<string> &output_names,
@@ -401,7 +274,7 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Inner DISTINCT below an outer projection -- using "
 			                    "GROUP_RECOMPUTE\n");
 		}
-	} else if (group_count > 0 && group_index != DConstants::INVALID_INDEX) {
+	} else if (group_count > 0 && group_index.IsValid()) {
 		model.group_columns = DeriveGroupColumnNames(facts, group_index, group_count, output_names);
 	}
 
@@ -514,9 +387,8 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 	}
 }
 
-static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysis, const DeltaViewModelInput &input) {
-	const bool has_nonredundant_distinct =
-	    analysis.found_distinct && (!input.has_top_level_redundant_distinct || input.facts->has_descendant_distinct);
+static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysis, const DeltaViewModelInput &input,
+                              bool has_nonredundant_distinct, bool distinct_stateful, bool semi_anti_stateful) {
 	auto has_argminmax =
 	    std::any_of(analysis.aggregate_types.begin(), analysis.aggregate_types.end(),
 	                [](const string &agg_type) { return agg_type == "arg_min" || agg_type == "arg_max"; });
@@ -542,12 +414,13 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	} else if (analysis.found_semi_anti_join && analysis.found_aggregation) {
 		model.type = model.group_columns.empty() ? RefreshType::FULL_REFRESH : RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_semi_anti_join && !analysis.found_aggregation) {
-		model.type = model.HasFeature(DeltaModelFeature::SEMI_ANTI_STATEFUL) ? RefreshType::SEMI_ANTI_RECOMPUTE
-		                                                                     : RefreshType::FULL_REFRESH;
-	} else if (analysis.found_filtered_list && !model.group_columns.empty()) {
+		model.type = semi_anti_stateful ? RefreshType::SEMI_ANTI_RECOMPUTE : RefreshType::FULL_REFRESH;
+	} else if (analysis.found_retained_aggregate_filter && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
-	} else if (analysis.found_filtered_list) {
-		model.type = RefreshType::FULL_REFRESH;
+	} else if (analysis.found_retained_aggregate_filter) {
+		// Scalar MIN/MAX and ARG_MIN/ARG_MAX already have a native recompute path
+		// in CompileSimpleAggregates; retaining FILTER does not change that path.
+		model.type = analysis.found_minmax ? RefreshType::SIMPLE_AGGREGATE : RefreshType::FULL_REFRESH;
 	} else if (input.has_computed_sum_aggregate_projection) {
 		model.type = model.group_columns.empty() ? RefreshType::FULL_REFRESH : RefreshType::GROUP_RECOMPUTE;
 	} else if (input.stored_query_retains_aggregate_filter && analysis.found_aggregation &&
@@ -567,12 +440,15 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		model.type =
 		    input.count_distinct_aux_candidate ? RefreshType::COUNT_DISTINCT_INCREMENTAL : RefreshType::GROUP_RECOMPUTE;
 	} else if (has_nonredundant_distinct && !model.distinct_at_top && analysis.found_aggregation) {
-		model.type = model.HasFeature(DeltaModelFeature::DISTINCT_STATEFUL) ? RefreshType::DISTINCT_INCREMENTAL
-		                                                                    : RefreshType::GROUP_RECOMPUTE;
+		model.type = distinct_stateful ? RefreshType::DISTINCT_INCREMENTAL : RefreshType::GROUP_RECOMPUTE;
 	} else if (model.union_distinct_over_agg && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_union_distinct && !analysis.found_aggregation && !model.group_columns.empty()) {
-		model.type = RefreshType::GROUP_RECOMPUTE;
+		// A descendant UNION DISTINCT does not aggregate the outer projection.
+		// FULL JOIN projections need both hidden key scopes to recover old and
+		// new NULL-padding keys; source-group recompute loses those transitions.
+		model.type = analysis.found_full_outer && !model.distinct_at_top ? RefreshType::SIMPLE_PROJECTION
+		                                                                 : RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_distinct && model.distinct_at_top && !model.group_columns.empty()) {
 		model.type = RefreshType::AGGREGATE_GROUP;
 	} else if (!model.strategy_reasons.empty() && !model.group_columns.empty()) {
@@ -646,209 +522,25 @@ static void AttachAuxRequirements(DeltaViewModel &model, const DeltaViewModelInp
 
 } // namespace
 
-const char *DeltaStrategyReasonName(DeltaStrategyReason reason) {
-	switch (reason) {
-	case DeltaStrategyReason::UNION_OVER_AGGREGATE:
-		return "UNION_OVER_AGGREGATE";
-	case DeltaStrategyReason::UNION_DISTINCT_GROUP_RECOMPUTE:
-		return "UNION_DISTINCT_GROUP_RECOMPUTE";
-	case DeltaStrategyReason::JOIN_KEY_GROUP_FALLBACK:
-		return "JOIN_KEY_GROUP_FALLBACK";
-	case DeltaStrategyReason::DELIM_AGGREGATE_GROUP_FALLBACK:
-		return "DELIM_AGGREGATE_GROUP_FALLBACK";
-	case DeltaStrategyReason::SCALAR_DELIM_PROJECTION_GROUP_FALLBACK:
-		return "SCALAR_DELIM_PROJECTION_GROUP_FALLBACK";
-	case DeltaStrategyReason::JOIN_AGGREGATE_PROJECTION_FALLBACK:
-		return "JOIN_AGGREGATE_PROJECTION_FALLBACK";
-	case DeltaStrategyReason::NESTED_AGGREGATE_GROUP_FALLBACK:
-		return "NESTED_AGGREGATE_GROUP_FALLBACK";
-	case DeltaStrategyReason::REPEATED_CTE_AGGREGATE_GROUP_FALLBACK:
-		return "REPEATED_CTE_AGGREGATE_GROUP_FALLBACK";
-	case DeltaStrategyReason::SEMI_ANTI_AGGREGATE_GROUP_FALLBACK:
-		return "SEMI_ANTI_AGGREGATE_GROUP_FALLBACK";
-	case DeltaStrategyReason::OUTER_JOIN_AGGREGATE_RECOMPUTE:
-		return "OUTER_JOIN_AGGREGATE_RECOMPUTE";
-	case DeltaStrategyReason::OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE:
-		return "OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE";
-	case DeltaStrategyReason::INNER_DISTINCT_PROJECTION_RECOMPUTE:
-		return "INNER_DISTINCT_PROJECTION_RECOMPUTE";
-	default:
-		return "UNKNOWN";
-	}
-}
+#define OPENIVM_ENUM_NAME_CASE(enum_type, name)                                                                        \
+	case enum_type::name:                                                                                              \
+		return #name;
 
-const char *DeltaModelFeatureName(DeltaModelFeature feature) {
-	switch (feature) {
-	case DeltaModelFeature::LINEAR:
-		return "LINEAR";
-	case DeltaModelFeature::BILINEAR:
-		return "BILINEAR";
-	case DeltaModelFeature::OUTER_JOIN_STATEFUL:
-		return "OUTER_JOIN_STATEFUL";
-	case DeltaModelFeature::AGGREGATE_LINEAR:
-		return "AGGREGATE_LINEAR";
-	case DeltaModelFeature::AGGREGATE_NON_LINEAR:
-		return "AGGREGATE_NON_LINEAR";
-	case DeltaModelFeature::AGGREGATE_HAVING:
-		return "AGGREGATE_HAVING";
-	case DeltaModelFeature::COUNT_DISTINCT_STATEFUL:
-		return "COUNT_DISTINCT_STATEFUL";
-	case DeltaModelFeature::FILTERED_LIST_STATEFUL:
-		return "FILTERED_LIST_STATEFUL";
-	case DeltaModelFeature::GROUPING_SETS_STATEFUL:
-		return "GROUPING_SETS_STATEFUL";
-	case DeltaModelFeature::DISTINCT_STATEFUL:
-		return "DISTINCT_STATEFUL";
-	case DeltaModelFeature::WINDOW_AFFECTED_PARTITION:
-		return "WINDOW_AFFECTED_PARTITION";
-	case DeltaModelFeature::SEMI_ANTI_STATEFUL:
-		return "SEMI_ANTI_STATEFUL";
-	case DeltaModelFeature::ASOF_STATEFUL:
-		return "ASOF_STATEFUL";
-	case DeltaModelFeature::SAMPLE_GLOBAL_RECOMPUTE:
-		return "SAMPLE_GLOBAL_RECOMPUTE";
-	case DeltaModelFeature::POSITIONAL_GLOBAL_RECOMPUTE:
-		return "POSITIONAL_GLOBAL_RECOMPUTE";
-	case DeltaModelFeature::FULL_ONLY:
-		return "FULL_ONLY";
-	default:
-		return "UNKNOWN";
-	}
+const char *DeltaStrategyReasonName(DeltaStrategyReason reason) {
+#define OPENIVM_STRATEGY_REASON_CASE(name) OPENIVM_ENUM_NAME_CASE(DeltaStrategyReason, name)
+	switch (reason) { OPENIVM_DELTA_STRATEGY_REASONS(OPENIVM_STRATEGY_REASON_CASE) }
+#undef OPENIVM_STRATEGY_REASON_CASE
+	return "UNKNOWN";
 }
 
 const char *DeltaModelNodeKindName(DeltaModelNodeKind kind) {
-	switch (kind) {
-	case DeltaModelNodeKind::SCAN:
-		return "SCAN";
-	case DeltaModelNodeKind::FILTER:
-		return "FILTER";
-	case DeltaModelNodeKind::PROJECT:
-		return "PROJECT";
-	case DeltaModelNodeKind::JOIN:
-		return "JOIN";
-	case DeltaModelNodeKind::AGGREGATE:
-		return "AGGREGATE";
-	case DeltaModelNodeKind::WINDOW:
-		return "WINDOW";
-	case DeltaModelNodeKind::DISTINCT:
-		return "DISTINCT";
-	case DeltaModelNodeKind::SEMI_ANTI:
-		return "SEMI_ANTI";
-	case DeltaModelNodeKind::UNION:
-		return "UNION";
-	case DeltaModelNodeKind::TOP_K:
-		return "TOP_K";
-	case DeltaModelNodeKind::UNNEST:
-		return "UNNEST";
-	case DeltaModelNodeKind::ASOF_JOIN:
-		return "ASOF_JOIN";
-	case DeltaModelNodeKind::POSITIONAL_JOIN:
-		return "POSITIONAL_JOIN";
-	case DeltaModelNodeKind::SAMPLE:
-		return "SAMPLE";
-	case DeltaModelNodeKind::CTE:
-		return "CTE";
-	case DeltaModelNodeKind::CONSTANT:
-		return "CONSTANT";
-	default:
-		return "OTHER";
-	}
+#define OPENIVM_NODE_KIND_CASE(name) OPENIVM_ENUM_NAME_CASE(DeltaModelNodeKind, name)
+	switch (kind) { OPENIVM_DELTA_MODEL_NODE_KINDS(OPENIVM_NODE_KIND_CASE) }
+#undef OPENIVM_NODE_KIND_CASE
+	return "OTHER";
 }
 
-const char *DeltaRuleKindName(DeltaRuleKind kind) {
-	switch (kind) {
-	case DeltaRuleKind::LINEAR:
-		return "LINEAR";
-	case DeltaRuleKind::PRODUCT:
-		return "PRODUCT";
-	case DeltaRuleKind::STATEFUL:
-		return "STATEFUL";
-	case DeltaRuleKind::NON_LINEAR:
-		return "NON_LINEAR";
-	case DeltaRuleKind::FULL_ONLY:
-		return "FULL_ONLY";
-	default:
-		return "UNKNOWN";
-	}
-}
-
-const char *DeltaUnsupportedReasonName(DeltaUnsupportedReason reason) {
-	switch (reason) {
-	case DeltaUnsupportedReason::UNSUPPORTED_SET_OPERATION:
-		return "UNSUPPORTED_SET_OPERATION";
-	case DeltaUnsupportedReason::UNSUPPORTED_PIVOT:
-		return "UNSUPPORTED_PIVOT";
-	case DeltaUnsupportedReason::UNSUPPORTED_FUNCTION:
-		return "UNSUPPORTED_FUNCTION";
-	case DeltaUnsupportedReason::UNSUPPORTED_UNNEST:
-		return "UNSUPPORTED_UNNEST";
-	case DeltaUnsupportedReason::UNSUPPORTED_AGGREGATE:
-		return "UNSUPPORTED_AGGREGATE";
-	case DeltaUnsupportedReason::UNSUPPORTED_FILTERED_AGGREGATE:
-		return "UNSUPPORTED_FILTERED_AGGREGATE";
-	case DeltaUnsupportedReason::UNSUPPORTED_JOIN_TYPE:
-		return "UNSUPPORTED_JOIN_TYPE";
-	case DeltaUnsupportedReason::UNSUPPORTED_ORDER_BY:
-		return "UNSUPPORTED_ORDER_BY";
-	case DeltaUnsupportedReason::UNSUPPORTED_OPERATOR:
-		return "UNSUPPORTED_OPERATOR";
-	case DeltaUnsupportedReason::GROUPING_SETS_NO_KEYS:
-		return "GROUPING_SETS_NO_KEYS";
-	case DeltaUnsupportedReason::FILTERED_LIST_NO_KEYS:
-		return "FILTERED_LIST_NO_KEYS";
-	case DeltaUnsupportedReason::SEMI_ANTI_WITH_AGGREGATE:
-		return "SEMI_ANTI_WITH_AGGREGATE";
-	case DeltaUnsupportedReason::SEMI_ANTI_MISSING_AUX:
-		return "SEMI_ANTI_MISSING_AUX";
-	case DeltaUnsupportedReason::UNRECOGNIZED_PATTERN:
-		return "UNRECOGNIZED_PATTERN";
-	default:
-		return "UNKNOWN";
-	}
-}
-
-const char *DeltaUpdateSemanticsName(DeltaUpdateSemantics semantics) {
-	switch (semantics) {
-	case DeltaUpdateSemantics::APPEND_ONLY_SAFE:
-		return "APPEND_ONLY_SAFE";
-	case DeltaUpdateSemantics::DELETE_SENSITIVE:
-		return "DELETE_SENSITIVE";
-	case DeltaUpdateSemantics::UPDATE_SENSITIVE:
-		return "UPDATE_SENSITIVE";
-	case DeltaUpdateSemantics::MINMAX_INSERT_ONLY_SAFE:
-		return "MINMAX_INSERT_ONLY_SAFE";
-	case DeltaUpdateSemantics::PROJECTION_DELETE_SKIP_SAFE:
-		return "PROJECTION_DELETE_SKIP_SAFE";
-	case DeltaUpdateSemantics::AGGREGATE_DELETE_SKIP_SAFE:
-		return "AGGREGATE_DELETE_SKIP_SAFE";
-	default:
-		return "UNKNOWN";
-	}
-}
-
-const char *DeltaAffectedDomainKindName(DeltaAffectedDomainKind kind) {
-	switch (kind) {
-	case DeltaAffectedDomainKind::GROUP:
-		return "GROUP";
-	case DeltaAffectedDomainKind::WINDOW_PARTITION:
-		return "WINDOW_PARTITION";
-	case DeltaAffectedDomainKind::PROJECTION_KEY:
-		return "PROJECTION_KEY";
-	case DeltaAffectedDomainKind::SEMI_ANTI_PREDICATE:
-		return "SEMI_ANTI_PREDICATE";
-	default:
-		return "UNKNOWN";
-	}
-}
-
-bool DeltaViewModel::HasFeature(DeltaModelFeature feature) const {
-	for (auto existing : features) {
-		if (existing == feature) {
-			return true;
-		}
-	}
-	return false;
-}
+#undef OPENIVM_ENUM_NAME_CASE
 
 idx_t DeltaViewModel::LineageEntryCount() const {
 	idx_t count = 0;
@@ -861,6 +553,9 @@ idx_t DeltaViewModel::LineageEntryCount() const {
 	if (has_left_join_key_source) {
 		count++;
 	}
+	if (!full_outer_scopes.empty()) {
+		count++;
+	}
 	return count;
 }
 
@@ -869,12 +564,10 @@ bool IsDistinctAtTop(const CreateMVPlanFacts &facts, const vector<string> &outpu
 		return false;
 	}
 
-	auto *node = facts.root;
-	while (node && node->children.size() == 1) {
-		if (!IsTransparentDistinctWrapper(node->type)) {
-			break;
-		}
-		node = node->children[0].get();
+	auto spine = DistinctSpine(facts);
+	auto *node = spine.bottom;
+	if (!spine.projections.empty()) {
+		return false;
 	}
 	if (node && node->type == LogicalOperatorType::LOGICAL_DISTINCT) {
 		return true;
@@ -905,10 +598,6 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 		model.window_order_columns = analysis.window_order_columns;
 		ResolveWindowPartitionOutputNames(facts, model.window_order_columns, output_names);
 	}
-	if (!input.keep_window_join_partitions) {
-		model.window_partition_columns.clear();
-		model.window_order_columns.clear();
-	}
 
 	model.has_minmax_metadata = analysis.found_minmax || analysis.found_count_distinct || analysis.found_list;
 	model.distinct_at_top = IsDistinctAtTop(facts, output_names);
@@ -935,19 +624,16 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 		model.full_outer_join_cols = ExtractFullOuterJoinMetadata(facts);
 	}
 
-	BuildUnsupportedReasons(model, facts, input);
-	BuildModelFeatures(model, analysis, input);
-	SelectRefreshType(model, analysis, input);
+	const bool has_unsupported_construct = HasUnsupportedConstruct(model, facts, input);
+	const bool has_nonredundant_distinct =
+	    analysis.found_distinct && (!input.has_top_level_redundant_distinct || facts.has_descendant_distinct);
+	const bool distinct_stateful =
+	    !has_unsupported_construct && input.distinct_aux_candidate && has_nonredundant_distinct;
+	const bool semi_anti_stateful = !has_unsupported_construct && input.semi_anti_aux_candidate;
+	SelectRefreshType(model, analysis, input, has_nonredundant_distinct, distinct_stateful, semi_anti_stateful);
 	SelectGroupRecomputeAffectedMode(model, input);
-	if (model.warn_unrecognized_pattern) {
-		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNRECOGNIZED_PATTERN);
-		AddUnique(model.features, DeltaModelFeature::FULL_ONLY);
-	}
 	AttachAuxRequirements(model, input);
-	BuildUpdateSemantics(model, analysis);
-	BuildDeltaModelNodes(model, facts, output_names);
-	BuildDeltaModelBaseAffectedDomains(model, facts);
-	ValidateDeltaViewModelInvariants(model);
+	BuildDeltaModelNodes(model, facts, has_unsupported_construct || model.warn_unrecognized_pattern);
 	return model;
 }
 

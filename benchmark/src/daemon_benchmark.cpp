@@ -16,6 +16,7 @@
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/printer.hpp"
+#include "daemon_metadata.hpp"
 #include "tpcc_helpers.hpp"
 
 #include <atomic>
@@ -613,7 +614,7 @@ static void CheckerThread(SubtestCtx &ctx, int interval_ms) {
 				ctx.LogEvent("check_fail", v.name, r ? r->GetError() : "(null)");
 				continue;
 			}
-			int64_t mismatches = r->GetValue(0, 0).GetValue<int64_t>();
+			int64_t mismatches = r->Collection().GetValue(0, 0).GetValue<int64_t>();
 			if (mismatches != 0) {
 				// Not a hard failure yet — staleness is expected between refreshes.
 				// Record the staleness interval since last refresh on this MV.
@@ -666,9 +667,9 @@ static void DeltaSanityThread(SubtestCtx &ctx, int interval_ms) {
 		    "WHERE catalog_type = 'duckdb' OR catalog_type IS NULL");
 		if (!meta || meta->HasError()) continue;
 		for (idx_t i = 0; i < meta->RowCount(); i++) {
-			string view_name = meta->GetValue(0, i).ToString();
-			string base_table = meta->GetValue(1, i).ToString();
-			string last_update = meta->GetValue(2, i).IsNull() ? "" : meta->GetValue(2, i).ToString();
+			string view_name = meta->Collection().GetValue(0, i).ToString();
+			string base_table = meta->Collection().GetValue(1, i).ToString();
+			string last_update = meta->Collection().GetValue(2, i).IsNull() ? "" : meta->Collection().GetValue(2, i).ToString();
 			string delta_table = "openivm_delta_" + base_table;
 			// Count delta rows newer than last_update
 			string key = view_name + "|" + delta_table;
@@ -676,17 +677,17 @@ static void DeltaSanityThread(SubtestCtx &ctx, int interval_ms) {
 			                  last_update + "'::TIMESTAMP";
 			auto newer_r = con.Query(newer_q);
 			if (!newer_r || newer_r->HasError()) continue;
-			int64_t newer_count = newer_r->GetValue(0, 0).GetValue<int64_t>();
+			int64_t newer_count = newer_r->Collection().GetValue(0, 0).GetValue<int64_t>();
 			// Did DML happen for this table? Check total delta row count
 			auto total_r = con.Query("SELECT COUNT(*) FROM " + delta_table);
 			if (!total_r || total_r->HasError()) continue;
-			int64_t total_count = total_r->GetValue(0, 0).GetValue<int64_t>();
+			int64_t total_count = total_r->Collection().GetValue(0, 0).GetValue<int64_t>();
 			// Invariant 1: if total > 0 and last_update is < MAX(ts in delta), newer_count > 0
 			auto maxts_r = con.Query("SELECT MAX(openivm_timestamp) FROM " + delta_table);
-			if (!maxts_r || maxts_r->HasError() || maxts_r->RowCount() == 0 || maxts_r->GetValue(0, 0).IsNull()) {
+			if (!maxts_r || maxts_r->HasError() || maxts_r->RowCount() == 0 || maxts_r->Collection().GetValue(0, 0).IsNull()) {
 				missing_streak[key] = 0;
 			} else {
-				string max_ts = maxts_r->GetValue(0, 0).ToString();
+				string max_ts = maxts_r->Collection().GetValue(0, 0).ToString();
 				if (total_count > 0 && max_ts > last_update && newer_count == 0) {
 					missing_streak[key]++;
 					if (missing_streak[key] == 3) {
@@ -704,12 +705,12 @@ static void DeltaSanityThread(SubtestCtx &ctx, int interval_ms) {
 			// views using this delta should have been cleaned up.
 			auto minlu_r =
 			    con.Query("SELECT MIN(last_update) FROM openivm_delta_tables WHERE table_name = '" + base_table + "'");
-			if (minlu_r && !minlu_r->HasError() && minlu_r->RowCount() > 0 && !minlu_r->GetValue(0, 0).IsNull()) {
-				string min_lu = minlu_r->GetValue(0, 0).ToString();
+			if (minlu_r && !minlu_r->HasError() && minlu_r->RowCount() > 0 && !minlu_r->Collection().GetValue(0, 0).IsNull()) {
+				string min_lu = minlu_r->Collection().GetValue(0, 0).ToString();
 				auto stale_r = con.Query("SELECT COUNT(*) FROM " + delta_table +
 				                          " WHERE openivm_timestamp < '" + min_lu + "'::TIMESTAMP");
 				if (stale_r && !stale_r->HasError()) {
-					int64_t stale_count = stale_r->GetValue(0, 0).GetValue<int64_t>();
+					int64_t stale_count = stale_r->Collection().GetValue(0, 0).GetValue<int64_t>();
 					if (stale_count > 0) {
 						stale_streak[delta_table]++;
 						if (stale_streak[delta_table] == 3) {
@@ -738,8 +739,8 @@ static void MonitorThread(SubtestCtx &ctx, int interval_ms) {
 	    "SELECT view_name, MAX(last_update) FROM openivm_delta_tables GROUP BY view_name");
 	if (r0 && !r0->HasError()) {
 		for (idx_t i = 0; i < r0->RowCount(); i++) {
-			prev_update[r0->GetValue(0, i).ToString()] =
-			    r0->GetValue(1, i).IsNull() ? "" : r0->GetValue(1, i).ToString();
+			prev_update[r0->Collection().GetValue(0, i).ToString()] =
+			    r0->Collection().GetValue(1, i).IsNull() ? "" : r0->Collection().GetValue(1, i).ToString();
 		}
 	}
 	while (!ctx.stop.load()) {
@@ -747,8 +748,8 @@ static void MonitorThread(SubtestCtx &ctx, int interval_ms) {
 		    "SELECT view_name, MAX(last_update) FROM openivm_delta_tables GROUP BY view_name");
 		if (r && !r->HasError()) {
 			for (idx_t i = 0; i < r->RowCount(); i++) {
-				string vn = r->GetValue(0, i).ToString();
-				string ts = r->GetValue(1, i).IsNull() ? "" : r->GetValue(1, i).ToString();
+				string vn = r->Collection().GetValue(0, i).ToString();
+				string ts = r->Collection().GetValue(1, i).IsNull() ? "" : r->Collection().GetValue(1, i).ToString();
 				auto &prev = prev_update[vn];
 				if (!ts.empty() && ts != prev) {
 					prev = ts;
@@ -760,8 +761,8 @@ static void MonitorThread(SubtestCtx &ctx, int interval_ms) {
 					                    "WHERE view_name = '" + vn +
 					                    "' ORDER BY refresh_timestamp DESC LIMIT 1");
 					double dur = 0;
-					if (hr && !hr->HasError() && hr->RowCount() > 0 && !hr->GetValue(0, 0).IsNull()) {
-						dur = hr->GetValue(0, 0).GetValue<int64_t>();
+					if (hr && !hr->HasError() && hr->RowCount() > 0 && !hr->Collection().GetValue(0, 0).IsNull()) {
+						dur = hr->Collection().GetValue(0, 0).GetValue<int64_t>();
 						ctx.summary.refresh_latencies_ms.push_back(dur);
 					}
 					Event ev;
@@ -863,18 +864,18 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 		    "'openivm_delta_mv_%'");
 		if (leftover && !leftover->HasError()) {
 			for (idx_t i = 0; i < leftover->RowCount(); i++) {
-				string cat = leftover->GetValue(0, i).ToString();
-				string schema = leftover->GetValue(1, i).ToString();
-				string tn = leftover->GetValue(2, i).ToString();
+				string cat = leftover->Collection().GetValue(0, i).ToString();
+				string schema = leftover->Collection().GetValue(1, i).ToString();
+				string tn = leftover->Collection().GetValue(2, i).ToString();
 				string full = cat + "." + schema + "." + tn;
 				con.Query("DROP VIEW IF EXISTS " + full);
 				con.Query("DROP TABLE IF EXISTS " + full);
 			}
 		}
-		con.Query("DELETE FROM openivm_views WHERE view_name LIKE 'mv_%'");
-		con.Query("DELETE FROM openivm_delta_tables WHERE view_name LIKE 'mv_%'");
-		con.Query("DELETE FROM openivm_refresh_history WHERE view_name LIKE 'mv_%'");
-		con.Query("DELETE FROM openivm_refresh_hooks WHERE view_name LIKE 'mv_%'");
+		// Metadata rows are keyed by the internal view key; select them via the SQL name.
+		for (auto &stmt : openivm_bench::StaleBenchmarkMetadataCleanupSQL()) {
+			con.Query(stmt);
+		}
 
 		// DuckLake attach for S9/S10/S11
 		if (subtest == "S9" || subtest == "S10" || subtest == "S11") {
@@ -890,14 +891,14 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 				auto have = con.Query("SELECT COUNT(*) FROM information_schema.tables WHERE "
 				                      "table_catalog='dl' AND LOWER(table_name)='warehouse'");
 				bool needs_init = !have || have->HasError() || have->RowCount() == 0 ||
-				                  have->GetValue(0, 0).GetValue<int64_t>() == 0;
+				                  have->Collection().GetValue(0, 0).GetValue<int64_t>() == 0;
 				if (needs_init) {
 					con.Query("USE dl.main");
 					CreateTPCCSchema(con);
 					auto probe = con.Query("SELECT current_database()");
 					string native_cat = "memory";
 					if (probe && !probe->HasError() && probe->RowCount() > 0) {
-						native_cat = probe->GetValue(0, 0).ToString();
+						native_cat = probe->Collection().GetValue(0, 0).ToString();
 					}
 					// Actually we need native cat AFTER the USE dl.main; grab fresh
 					// current_database is now 'dl' — fall back to the db_path basename
@@ -1074,26 +1075,24 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 				                                (r ? r->GetError() : "null"));
 				ctx.summary.correctness_failures++;
 			} else {
-				int64_t mis = r->GetValue(0, 0).GetValue<int64_t>();
+				int64_t mis = r->Collection().GetValue(0, 0).GetValue<int64_t>();
 				if (mis != 0) {
 					ctx.summary.correctness_failures++;
 					// Diagnostic: what's in each delta table for this view's sources, and what's
 					// last_update. Helps diagnose whether rows are "stuck" in delta (not applied)
 					// vs the refresh applied something wrong.
 					string diag;
-					auto dt_r = fin_con.Query(
-					    "SELECT table_name, last_update FROM openivm_delta_tables WHERE view_name = '" +
-					    v.name + "'");
+					auto dt_r = fin_con.Query(openivm_bench::DeltaMetadataDiagnosticSQL(v.name, v.catalog_schema));
 					if (dt_r && !dt_r->HasError()) {
 						for (idx_t di = 0; di < dt_r->RowCount(); di++) {
-							string tn = dt_r->GetValue(0, di).ToString();
-							string lu = dt_r->GetValue(1, di).IsNull() ? "NULL" : dt_r->GetValue(1, di).ToString();
+							string tn = dt_r->Collection().GetValue(0, di).ToString();
+							string lu = dt_r->Collection().GetValue(1, di).IsNull() ? "NULL" : dt_r->Collection().GetValue(1, di).ToString();
 							auto cnt_r = fin_con.Query("SELECT COUNT(*) FROM delta_" + tn);
-							int64_t c = (cnt_r && !cnt_r->HasError()) ? cnt_r->GetValue(0, 0).GetValue<int64_t>() : -1;
+							int64_t c = (cnt_r && !cnt_r->HasError()) ? cnt_r->Collection().GetValue(0, 0).GetValue<int64_t>() : -1;
 							auto newer_r = fin_con.Query(
 							    "SELECT COUNT(*) FROM delta_" + tn +
 							    " WHERE openivm_timestamp >= '" + lu + "'::TIMESTAMP");
-							int64_t nc = (newer_r && !newer_r->HasError()) ? newer_r->GetValue(0, 0).GetValue<int64_t>() : -1;
+							int64_t nc = (newer_r && !newer_r->HasError()) ? newer_r->Collection().GetValue(0, 0).GetValue<int64_t>() : -1;
 							if (!diag.empty()) diag += ", ";
 							diag += tn + "(rows=" + std::to_string(c) + " >=last=" + std::to_string(nc) +
 							         " last_update=" + lu + ")";
@@ -1114,7 +1113,7 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 							if (i > 0) detail += "; ";
 							for (idx_t c = 0; c < mv_r->ColumnCount(); c++) {
 								if (c > 0) detail += ",";
-								detail += mv_r->GetValue(c, i).IsNull() ? "NULL" : mv_r->GetValue(c, i).ToString();
+								detail += mv_r->Collection().GetValue(c, i).IsNull() ? "NULL" : mv_r->Collection().GetValue(c, i).ToString();
 							}
 						}
 						detail += "]";
@@ -1125,7 +1124,7 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 							if (i > 0) detail += "; ";
 							for (idx_t c = 0; c < base_r->ColumnCount(); c++) {
 								if (c > 0) detail += ",";
-								detail += base_r->GetValue(c, i).IsNull() ? "NULL" : base_r->GetValue(c, i).ToString();
+								detail += base_r->Collection().GetValue(c, i).IsNull() ? "NULL" : base_r->Collection().GetValue(c, i).ToString();
 							}
 						}
 						detail += "]";

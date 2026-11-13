@@ -1,0 +1,71 @@
+# name: test/sql/concurrent_checkpoint_gate.test
+# description: Tracked DML takes the OpenIVM mutation gate before DuckDB locks its table, so a gate holder whose commit checkpoints cannot deadlock with it
+# group: [sql]
+
+require openivm
+
+load __TEST_DIR__/openivm_concurrent_checkpoint_gate.db
+
+# With a 1KB threshold nearly every commit triggers an automatic checkpoint, concurrent
+# with the other clients. A checkpoint waits for the table locks that DELETE and UPDATE take when their
+# pipeline starts; a statement that only then waited for the gate held by the
+# checkpointing client would hang both.
+statement ok
+SET checkpoint_threshold = '1KB';
+
+statement ok
+CREATE TABLE gate_src (id INTEGER, grp VARCHAR, v INTEGER);
+
+statement ok
+INSERT INTO gate_src SELECT i, 'g' || (i % 4)::VARCHAR, i FROM range(0, 200) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW gate_totals AS
+SELECT grp, SUM(v) AS total, COUNT(*) AS cnt FROM gate_src GROUP BY grp;
+
+concurrentloop threadid 0 4
+
+# A cached plan: EXECUTE runs it without planning the UPDATE again.
+statement ok
+PREPARE gate_bump AS UPDATE gate_src SET v = v + 1 WHERE grp = 't' || ${threadid}::VARCHAR;
+
+loop k 0 8
+
+statement ok
+INSERT INTO gate_src VALUES (1000 + ${threadid} * 100 + ${k}, 't' || ${threadid}::VARCHAR, ${k} + 1);
+
+statement ok
+UPDATE gate_src SET v = v * 2 WHERE id = 1000 + ${threadid} * 100 + ${k};
+
+statement ok
+EXECUTE gate_bump;
+
+# An initial row and the row this client inserted (and updated) in its previous round.
+statement ok
+DELETE FROM gate_src WHERE id IN (${threadid} * 50 + ${k}, 1000 + ${threadid} * 100 + ${k} - 1);
+
+statement ok
+PRAGMA refresh('gate_totals');
+
+endloop
+
+endloop
+
+statement ok
+PRAGMA refresh('gate_totals');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM gate_totals
+                              EXCEPT ALL SELECT grp, SUM(v), COUNT(*) FROM gate_src GROUP BY grp))
+     + (SELECT count(*) FROM (SELECT grp, SUM(v), COUNT(*) FROM gate_src GROUP BY grp
+                              EXCEPT ALL SELECT * FROM gate_totals));
+----
+0
+
+query II
+SELECT count(*) FILTER (WHERE starts_with(grp, 't')), count(*) FILTER (WHERE starts_with(grp, 'g')) FROM gate_src;
+----
+4	168
+
+statement ok
+RESET checkpoint_threshold;

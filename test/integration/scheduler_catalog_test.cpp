@@ -1,6 +1,7 @@
 #include "duckdb.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
+#include <algorithm>
 #include <iostream>
 
 using namespace duckdb;
@@ -26,13 +27,17 @@ int main(int argc, char **argv) {
 		                 path + "' AS lake (DATA_PATH '" + path +
 		                 ".data'); "
 		                 "CREATE TABLE lake.source(i INTEGER); ATTACH ':memory:' AS other; "
-		                 "ATTACH ':memory:' AS empty_catalog;");
+		                 "ATTACH ':memory:' AS configured; ATTACH ':memory:' AS empty_catalog;");
 		RefreshMetadata metadata(con);
 		if (!metadata.GetScheduledViews().empty()) {
 			throw InvalidInputException("Expected no scheduled views");
 		}
-		for (auto catalog : {"memory", "other"}) {
+		// The last catalog separates control metadata and maintenance objects into quoted schemas.
+		for (auto catalog : {"memory", "other", "configured"}) {
+			bool configured = string(catalog) == "configured";
 			Execute(con, "USE " + string(catalog));
+			Execute(con, string("SET openivm_metadata_schema = '") + (configured ? "OpenIVM Control" : "") + "';");
+			Execute(con, string("SET openivm_internal_schema = '") + (configured ? "OpenIVM Internal" : "") + "';");
 			Execute(con, "CREATE TABLE source(i INTEGER); INSERT INTO source VALUES (1), (1), (2);");
 			Execute(con, "CREATE MATERIALIZED VIEW scheduled REFRESH EVERY '1 hour' AS SELECT * FROM source;");
 			Execute(con, "INSERT INTO source VALUES (2), (3); DELETE FROM source WHERE i=1; "
@@ -42,24 +47,62 @@ int main(int argc, char **argv) {
 			             "OR EXISTS (SELECT * FROM source EXCEPT ALL SELECT * FROM scheduled) "
 			             "THEN error('Scheduled view differs from source') ELSE true END;");
 		}
+		Execute(con, "SET openivm_metadata_schema = '';");
+		Execute(con, "SET openivm_internal_schema = '';");
+		Execute(con, "SELECT CASE WHEN (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'configured' "
+		             "AND schema_name = 'OpenIVM Control' AND table_name = 'openivm_views') = 1 "
+		             "AND (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'configured' "
+		             "AND schema_name = 'main' AND table_name IN ('openivm_views', 'openivm_delta_tables', "
+		             "'openivm_refresh_hooks', 'openivm_refresh_history', 'openivm_refresh_profile', "
+		             "'openivm_mv_dependencies')) = 0 "
+		             "AND (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'configured' "
+		             "AND schema_name = 'OpenIVM Internal' AND table_name = 'openivm_delta_6d61696e_source') = 1 "
+		             "AND (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'configured' "
+		             "AND schema_name = 'main' AND starts_with(table_name, 'openivm_') "
+		             "AND table_name <> 'openivm_source_deltas') = 0 "
+		             "AND (SELECT count(*) FROM configured.main.openivm_source_deltas) = 1 "
+		             "THEN true ELSE error('Configured metadata and internal schemas were not used') END;");
 		std::cout << "READY" << std::endl;
 		string line;
 		std::getline(std::cin, line);
-		auto catalogs = RefreshMetadata::MetadataCatalogs(con);
-		if (catalogs != vector<string> {"memory", "other"}) {
-			throw InvalidInputException("Source metadata discovery did not find both native catalogs");
+		vector<string> catalogs;
+		for (auto &location : RefreshMetadata::MetadataLocations(con)) {
+			catalogs.push_back(location.catalog);
+		}
+		std::sort(catalogs.begin(), catalogs.end());
+		catalogs.erase(std::unique(catalogs.begin(), catalogs.end()), catalogs.end());
+		if (catalogs != vector<string> {"configured", "memory", "other"}) {
+			throw InvalidInputException("Source metadata discovery did not find every native catalog");
 		}
 		auto views = metadata.GetScheduledViews();
-		if (views.size() != 2 || views[0].metadata_catalog != "memory" || views[1].metadata_catalog != "other" ||
-		    views[0].view_name != "__openivm_mv_6d656d6f7279_6d61696e_7363686564756c6564_" ||
-		    views[1].view_name != "__openivm_mv_6f74686572_6d61696e_7363686564756c6564_") {
-			throw InvalidInputException("Scheduler did not discover both native metadata catalogs");
+		if (views.size() != 3 || views[0].metadata_catalog != "configured" || views[1].metadata_catalog != "memory" ||
+		    views[2].metadata_catalog != "other" ||
+		    views[0].view_name != "__openivm_mv_636f6e66696775726564_6d61696e_7363686564756c6564_" ||
+		    views[1].view_name != "__openivm_mv_6d656d6f7279_6d61696e_7363686564756c6564_" ||
+		    views[2].view_name != "__openivm_mv_6f74686572_6d61696e_7363686564756c6564_") {
+			throw InvalidInputException("Scheduler did not discover every native metadata catalog");
 		}
 		// A native schema change must synchronize its delta table even while an
 		// unrelated DuckLake catalog is locked. A global information_schema scan
 		// can fail and silently skip that synchronization.
 		Execute(con, "ALTER TABLE source ADD COLUMN extra INTEGER DEFAULT 7;");
-		Execute(con, "SELECT extra FROM openivm_delta_source LIMIT 0;");
+		Execute(con, "SELECT extra FROM configured.\"OpenIVM Internal\".openivm_delta_6d61696e_source LIMIT 0;");
+		// A configured metadata location (#84) is discovered with its schema, without
+		// waiting for the daemon thread.
+		{
+			DuckDB placed_db(nullptr);
+			Connection placed(placed_db);
+			Execute(placed, "LOAD openivm; SET openivm_files_path='" + path +
+			                    ".placed.files'; ATTACH ':memory:' AS control; "
+			                    "SET openivm_metadata_catalog = 'control'; SET openivm_metadata_schema = 'openivm'; "
+			                    "CREATE TABLE source(i INTEGER); INSERT INTO source VALUES (1), (2); "
+			                    "CREATE MATERIALIZED VIEW placed REFRESH EVERY '1 hour' AS SELECT * FROM source;");
+			auto placed_views = RefreshMetadata(placed).GetScheduledViews();
+			if (placed_views.size() != 1 || placed_views[0].metadata_catalog != "control" ||
+			    placed_views[0].metadata_schema != "openivm" || placed_views[0].catalog_name != "memory") {
+				throw InvalidInputException("Scheduler did not discover the configured metadata location");
+			}
+		}
 		std::cout << "PASS" << std::endl;
 	} catch (const std::exception &e) {
 		std::cerr << e.what() << std::endl;

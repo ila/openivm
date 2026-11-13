@@ -6,9 +6,9 @@
 make test
 ```
 
-This runs every `test/sql/*.test` file with `build/release/test/unittest`, then the
-compiled N-term SQL integration check
-(`python3 test/integration/test_regular_nterm_compiled.py ./build/release/duckdb`).
+This runs the SQLLogicTest suites and the integration targets attached to
+`test_release_internal` in the Makefile, including compiled N-term SQL, metadata,
+source publication, and deterministic concurrency checks.
 Use `make test_debug` after a debug build. The DuckLake tests run `INSTALL ducklake`,
 so they need network access unless the extension is already installed.
 
@@ -20,7 +20,8 @@ build/release/test/unittest "test/sql/inner_join.test"
 
 ## Test Files
 
-All tests live in `test/sql/*.test` using DuckDB's SQLLogicTest format.
+SQLLogicTest suites live in `test/sql/*.test`. Standalone integration programs
+and their Python runners live in `test/integration/`.
 
 | Test file | Coverage |
 |---|---|
@@ -52,6 +53,44 @@ All tests live in `test/sql/*.test` using DuckDB's SQLLogicTest format.
 | `compile_refresh.test` | `openivm_compile_with_facts` compile-only refresh |
 | `time_travel.test`, `time_travel_ducklake.test` | Time-travel pins |
 | `ducklake_*.test` | The same operator families over DuckLake sources |
+| `metadata_location.test` | Shared native/DuckLake placement: markers, profiling, DAG/joins, crash recovery, transactions, reopen, read-only/missing controllers, native source cleanup and DROP |
+| `ducklake_chained_recovery.test` | Chained DuckLake views with default metadata: an interrupted upstream refresh neither loses nor doubles downstream changes |
+| `ducklake_concurrent_source_commit.test` | DuckLake source changes committed by another connection during a refresh: pinned watermark, retry, no lost or doubled changes |
+
+## Deterministic concurrency checks
+
+```sh
+make test_concurrency
+```
+
+The C++ harness covers writer/refresh ordering, transaction rollback, expanding
+write sets, and parent/child publication. It releases the owning transaction only
+after the competing connection is observed waiting on the mutation gate. The
+shared test helper also serves the source-publication integration tests.
+
+The scheduled-hook test polls committed hook completion with a bounded deadline;
+it does not assume the daemon finishes within a fixed sleep. Every refreshed MV
+is checked against its base query with `EXCEPT ALL` in both directions. The Python
+runner imposes a process timeout so a deadlock fails the test instead of hanging CI.
+
+## Remote metadata integration test
+
+`test/integration/test_remote_metadata.py` stores OpenIVM metadata in PostgreSQL and runs
+several DuckDB processes against it. It is skipped unless `OPENIVM_POSTGRES_DSN` names a
+disposable database; CI starts a PostgreSQL 16 service container
+(`.github/workflows/RemoteMetadata.yml`). Never point it at a shared server: each run creates
+and drops its own schemas. To run it locally:
+
+```bash
+docker run --rm -d --name openivm-pg -p 5432:5432 \
+    -e POSTGRES_USER=openivm -e POSTGRES_PASSWORD=openivm -e POSTGRES_DB=openivm_test postgres:16
+export OPENIVM_POSTGRES_DSN='host=localhost port=5432 user=openivm password=openivm dbname=openivm_test'
+python3 test/integration/test_remote_metadata.py ./build/release/duckdb --require
+docker stop openivm-pg
+```
+
+The test installs the `postgres`, `ducklake` and `sqlite` extensions, so it needs network
+access the first time.
 
 ## Verification Pattern
 

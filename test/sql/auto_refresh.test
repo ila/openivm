@@ -1395,3 +1395,67 @@ query I
 SELECT count(*) FROM (SELECT a.val, b.label, c.tag FROM ed_a a JOIN ed_b b ON a.id = b.id JOIN ed_c c ON a.id = c.id EXCEPT ALL SELECT * FROM mv_ed);
 ----
 0
+
+# ==========================================
+# Test 23: FK pruning is priced only for an insert-only primary-key side
+# ==========================================
+# The join refresh prunes the delta term of a primary-key table only while its
+# delta is insert-only. A batch that also deletes from that table runs the term,
+# so its estimate must include the delta-join scan.
+
+statement ok
+CREATE TABLE fkc_dim (id INT PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE fkc_fact (fid INT, dim_id INT REFERENCES fkc_dim(id), amt INT);
+
+statement ok
+INSERT INTO fkc_dim VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+INSERT INTO fkc_fact VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_fkc AS
+    SELECT d.name, SUM(f.amt) AS total, COUNT(*) AS cnt
+    FROM fkc_fact f JOIN fkc_dim d ON f.dim_id = d.id GROUP BY d.name;
+
+statement ok
+INSERT INTO fkc_dim VALUES (4, 'd'), (5, 'e');
+
+query IIIIII
+PRAGMA refresh_cost('mv_fkc');
+----
+incremental	1.600000	26.000000	1.600000	26.000000	0
+
+statement ok
+UPDATE fkc_dim SET name = 'dd' WHERE id = 4;
+
+statement ok
+DELETE FROM fkc_dim WHERE id IN (3, 5);
+
+query IIIIII
+PRAGMA refresh_cost('mv_fkc');
+----
+incremental	16.000000	26.000000	16.000000	26.000000	0
+
+statement ok
+PRAGMA refresh('mv_fkc');
+
+query I
+SELECT count(*) FROM (
+    SELECT name, total, cnt FROM mv_fkc
+    EXCEPT ALL
+    SELECT d.name, SUM(f.amt), COUNT(*) FROM fkc_fact f JOIN fkc_dim d ON f.dim_id = d.id GROUP BY d.name
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT d.name, SUM(f.amt), COUNT(*) FROM fkc_fact f JOIN fkc_dim d ON f.dim_id = d.id GROUP BY d.name
+    EXCEPT ALL
+    SELECT name, total, cnt FROM mv_fkc
+);
+----
+0

@@ -281,12 +281,13 @@ FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d
 ----
 1
 
-# Join-delta unions plus one union consolidating old/new published rows.
+# Three N-term arms use two unions; their canonical old-state reconstructions
+# use three more, plus one union consolidating old/new published rows.
 query I
 SELECT ((length(content) - length(replace(content, 'UNION ALL', ''))) / length('UNION ALL'))
 FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6373706a5f7472695f6d76_.sql');
 ----
-5
+6
 
 statement ok
 SET openivm_regular_nterm = false;
@@ -514,7 +515,7 @@ query I
 SELECT ((length(content) - length(replace(content, 'UNION ALL', ''))) / length('UNION ALL'))
 FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6373706a5f73656c665f6d76_.sql');
 ----
-5
+6
 
 statement ok
 INSERT INTO cspj_self_event VALUES (4, 1, 30, 'd'), (5, 2, 20, 'e'), (6, 2, 30, 'temporary');

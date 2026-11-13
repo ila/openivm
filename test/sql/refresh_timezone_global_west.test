@@ -1,0 +1,93 @@
+# name: test/sql/refresh_timezone_global_west.test
+# description: refreshes keep every change when the database default time zone is west of UTC
+# group: [sql]
+
+require openivm
+
+require icu
+
+# The helper connection that writes the view's own delta rows uses the database default
+# TimeZone, not the session's, so the delta timestamp default must be UTC-based.
+statement ok
+SET GLOBAL TimeZone = 'America/New_York';
+
+statement ok
+CREATE TABLE tzw_t(g INT, v INT);
+
+statement ok
+CREATE MATERIALIZED VIEW tzw_proj AS SELECT g, v FROM tzw_t;
+
+statement ok
+CREATE MATERIALIZED VIEW tzw_agg AS SELECT g, SUM(v) AS s, COUNT(*) AS n FROM tzw_t GROUP BY g;
+
+statement ok
+INSERT INTO tzw_t VALUES (1, 10);
+
+statement ok
+PRAGMA refresh('tzw_proj');
+
+statement ok
+PRAGMA refresh('tzw_agg');
+
+statement ok
+INSERT INTO tzw_t VALUES (1, 5);
+
+statement ok
+PRAGMA refresh('tzw_proj');
+
+statement ok
+PRAGMA refresh('tzw_agg');
+
+query III
+SELECT (SELECT count(*) FROM tzw_proj), (SELECT count(*) FROM tzw_agg), (SELECT count(*) FROM tzw_t);
+----
+2	1	2
+
+query I
+SELECT count(*) FROM (SELECT g, v FROM tzw_proj EXCEPT ALL SELECT g, v FROM tzw_t);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT g, v FROM tzw_t EXCEPT ALL SELECT g, v FROM tzw_proj);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT g, s, n FROM tzw_agg
+    EXCEPT ALL
+    SELECT g, SUM(v), COUNT(*) FROM tzw_t GROUP BY g
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT g, SUM(v), COUNT(*) FROM tzw_t GROUP BY g
+    EXCEPT ALL
+    SELECT g, s, n FROM tzw_agg
+);
+----
+0
+
+# East of UTC must also apply each change exactly once.
+statement ok
+SET GLOBAL TimeZone = 'Asia/Tokyo';
+
+statement ok
+INSERT INTO tzw_t VALUES (2, 7);
+
+statement ok
+PRAGMA refresh('tzw_proj');
+
+statement ok
+PRAGMA refresh('tzw_agg');
+
+query III
+SELECT (SELECT count(*) FROM tzw_proj), (SELECT count(*) FROM tzw_agg), (SELECT count(*) FROM tzw_t);
+----
+3	2	3
+
+statement ok
+SET GLOBAL TimeZone = 'UTC';

@@ -1,6 +1,6 @@
 # Building and running OpenIVM
 
-OpenIVM currently requires **DuckDB v1.5.4** and must be built from source.
+OpenIVM currently requires **DuckDB v2.0.0** and must be built from source.
 The build below produces both a DuckDB command-line
 program with OpenIVM built in and a loadable extension.
 
@@ -94,7 +94,7 @@ This opens or creates a persistent database in the current directory. Calling ju
 `duckdb` may start a different installation. At the DuckDB prompt, run:
 
 ```sql
-SELECT version(); -- expected: v1.5.4
+SELECT version(); -- expected: v2.0.0
 SELECT extension_name, loaded
 FROM duckdb_extensions()
 WHERE extension_name = 'openivm'; -- expected: openivm | true
@@ -200,6 +200,105 @@ that skips empty deltas may not compile a new file. Setting the path after CREAT
 does not retroactively create the setup files; do not replace an existing MV just
 to obtain an inspection file.
 
+### Archived compiled SQL
+
+Enable automatic archival before creating or refreshing a view:
+
+```sql
+SET openivm_archive_compiled_sql = true;  -- default: false
+SET openivm_compiled_sql_retention = 10;  -- latest distinct versions per view and operation
+```
+
+OpenIVM then archives the programs it runs for `CREATE MATERIALIZED VIEW` and
+refresh in two tables next to the view's `openivm_views` metadata, independently of
+`openivm_files_path`. Neither setting creates SQL artifact files. For DuckLake views the default is the native frontend database's
+`main` schema. With [custom metadata placement](../internals/metadata-placement.md),
+the archive follows the selected catalog and schema; qualify the tables below, for
+example as `control.openivm.openivm_compiled_programs` and
+`control.openivm.openivm_compiled_statements`.
+
+```sql
+SELECT view_catalog, view_schema, view_sql_name, operation, version,
+       statement_count, last_outcome, committed_count
+FROM openivm_compiled_programs ORDER BY view_name, operation, version;
+
+SELECT s.stmt_order, s.sql
+FROM openivm_compiled_statements s
+JOIN openivm_compiled_programs p USING (view_name, operation, version)
+WHERE p.view_catalog = current_database() AND p.view_schema = 'main'
+  AND p.view_sql_name = 'regional_totals' AND p.operation = 'refresh'
+  AND p.version = (SELECT max(version) FROM openivm_compiled_programs
+                   WHERE view_name = p.view_name AND operation = 'refresh')
+ORDER BY s.stmt_order;
+```
+
+- **Identity.** `view_name` is the internal key also used by `openivm_views`;
+  `view_catalog`, `view_schema` and `view_sql_name` give the qualified MV name.
+  `operation` is `create` or `refresh`. `compilation_id` identifies the operation that
+  first stored a version; `last_compilation_id` is the latest operation that ran
+  the same program. For refreshes outside an explicit transaction this is the
+  `refresh_id` in `openivm_refresh_profile` when profiling is enabled; refreshes
+  inside an explicit transaction are not profiled.
+- **Versions.** A program is the complete statement list, in execution order. A
+  new version is stored only when that list differs from the view's latest stored
+  version for the same operation. The comparison is exact: delta cutoffs, snapshot
+  IDs and catalog references are not normalized away. A refresh inside an explicit
+  transaction, for example, stamps its own timestamp, and DuckLake refreshes embed
+  snapshot IDs, so these usually store a new version. Refreshes skipped because
+  deltas are empty compile nothing and store nothing. If a DuckLake refresh rolls
+  back its first delete attempt and retries with ranked deletion, only the retried
+  program that committed is stored. For snapshot-published DuckLake views, the
+  executed publication statement is stored between the data statements and the
+  watermark update. Statements OpenIVM derives while it runs, such as DuckLake
+  delta-table definitions and pinned snapshot publications, are stored as the SQL
+  that actually ran. Cleanup of consumed delta rows after a refresh commits is
+  housekeeping and is not part of the stored program.
+- **Outcomes.** `last_outcome` describes the latest operation that ran the version:
+  `committed` (its transaction committed), `attempted` (it failed and rolled back,
+  so nothing was committed) or `unknown` (a cross-catalog refresh failed after its
+  first statements ran outside a transaction, or `COMMIT` itself failed, so some
+  effects may have committed). This includes a DuckLake refresh whose data statements
+  roll back, because its in-progress marker in the metadata location has already
+  committed.
+  `committed_count` counts committed runs. Compile-only calls such as
+  `openivm_compile_with_facts` are never archived, so a stored program has always
+  been executed.
+- **Transactions.** Native CREATE and refresh write the archive in their own
+  transaction, so it is visible only if they commit. A failed or rolled-back native
+  operation in an explicit transaction leaves no row. An autocommit refresh that
+  fails is recorded as `attempted` (or `unknown`) in a separate metadata
+  transaction. DuckLake data cannot share a transaction with native metadata, so
+  cross-catalog operations write the archive on separate connections: refreshes
+  in one metadata transaction after they commit (or fail), even inside an explicit
+  transaction, and DuckLake CREATE with its native metadata.
+- **Archive failures.** OpenIVM does not report success if the archive cannot be
+  written. For native operations the archive write is part of the transaction, so
+  a failed write rolls back the CREATE or refresh with an error. If a
+  cross-catalog refresh or DuckLake `CREATE OR REPLACE` commits but its archive
+  write fails, it returns an error that says it committed. If recording a failed refresh also fails, both
+  errors are reported.
+- **Retention.** `openivm_compiled_sql_retention` must be at least 1 and defaults
+  to 10. Each archived operation retains the newest N distinct versions for that
+  view and operation (`create` or `refresh`), deleting older program and statement
+  rows in the same transaction. All outcomes count toward the limit. Set it to 1
+  to keep only the latest program of each kind. Identical programs reuse their
+  version and still apply the current limit; empty-delta skips do not prune.
+  Lowering the limit takes effect on the next archived operation for each view
+  and operation, not immediately across the database. Pruning rolls back with
+  transactional archive writes. Version numbers continue increasing after pruning.
+- **Disabling and cleanup.** `SET openivm_archive_compiled_sql = false` stops
+  recording and pruning without deleting existing history or disabling file
+  export. Enabling it later records future operations, not earlier ones. History
+  survives `DROP VIEW` and `CREATE OR REPLACE`; a recreated view continues the same
+  version sequence. This is a per-view history bound, not a total byte limit or
+  expiration policy for dropped views. To remove history manually, delete matching
+  `(view_name, operation, version)` rows from both tables in one transaction.
+  Empty archive tables may exist even when recording is disabled. Reapply the
+  settings after reopening the database; use global settings for daemon refreshes.
+
+Archived SQL is for inspection and auditing. Later refreshes always compile against
+current state; do not run an archived program to refresh a view.
+
 ### Inspect or save compiled SQL without files
 
 The compiler also returns SQL as rows. This works without `openivm_files_path`:
@@ -217,7 +316,7 @@ SELECT * FROM openivm_compile_with_facts(
 
 This compiles a refresh without executing it or consuming the pending changes.
 The saved table is an ordinary user table, not automatically maintained OpenIVM
-metadata. The generated program depends on current state, including delta cutoffs
+metadata, and compile-only calls do not add to the compiled SQL archive. The generated program depends on current state, including delta cutoffs
 and snapshot IDs. Compile again for a later refresh; do not treat an old saved
 program as a reusable refresh procedure. Use `PRAGMA refresh` for normal execution.
 
@@ -263,21 +362,22 @@ DuckLake uses a different snapshot-based change-tracking path; see
 
 The **extension version requirement** and the **database file format** are separate:
 
-- OpenIVM must run with its matching DuckDB v1.5.4 build. A locally compiled
+- OpenIVM must run with its matching DuckDB v2.0.0 build. A locally compiled
   extension cannot be loaded into an arbitrary DuckDB version.
 - DuckDB supports reading older database formats, with backward compatibility
-  established from v0.10. A database does not need to have been created with v1.5.4
+  established from v0.10. A database does not need to have been created with v2.0.0
   to be usable here.
 - Reading a file written by a newer DuckDB release depends on the storage features
   used; forward compatibility is not guaranteed. `ATTACH` does not convert an
   incompatible format.
 
 See DuckDB's [storage compatibility documentation](https://duckdb.org/docs/stable/internals/storage).
-Files created with DuckDB v1.1.2 and v1.2.1 were tested with the v1.5.4 OpenIVM
-build, both opened directly and attached. Each case passed MV creation, mixed-DML
-refresh, and another refresh after closing and reopening the process. Results were
-checked against full recomputation with `EXCEPT ALL` in both directions. These checks
-do not cover every file version, extension-defined type, or stored SQL definition.
+The previous DuckDB v1.5.4 build was tested against files created with v1.1.2 and
+v1.2.1, including attach, refresh, and reopen. Those results do not establish
+compatibility of every stored definition or extension-defined type with v2.0.0.
+Keep a backup when upgrading an existing database, and verify refresh results
+against the original query. A newly created v2.0.0 database may use storage features
+that older DuckDB releases cannot read.
 
 If the file is incompatible, open it with a DuckDB version that can read it, export
 the required tables to Parquet, and import them into a new database using the
@@ -286,13 +386,12 @@ file until the imported data and queries have been verified.
 
 ## Loading the extension into another DuckDB client
 
-**This extension will not load into any other DuckDB version.** It is compiled for
-**v1.5.4**; v1.1.2 and v1.2.1 clients were both tested and rejected it with a version
-mismatch, even with unsigned extensions enabled. This is separate from opening
-older database files using the v1.5.4 executable.
+**The compiled extension requires DuckDB v2.0.0.** It cannot be loaded into a
+v1.5.4 client, even with unsigned extensions enabled. Opening an older database
+file with the v2.0.0 executable is a separate operation.
 
 The built CLI is the simplest starting point. For a separate compatible DuckDB
-v1.5.4 CLI, enable unsigned local extensions when launching it:
+v2.0.0 CLI, enable unsigned local extensions when launching it:
 
 ```bash
 duckdb -unsigned /absolute/path/to/test.duckdb

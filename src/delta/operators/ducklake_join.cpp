@@ -1,11 +1,9 @@
 #include "delta/operators/ducklake_join.hpp"
 #include "delta/operators/join.hpp"
-#include "delta/operators/join_key_probe.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
-#include "duckdb/common/unordered_map.hpp"
 #include "upsert/refresh_index_regen.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
@@ -21,86 +19,6 @@
 
 namespace duckdb {
 
-struct DuckLakeJoinColumnRef {
-	size_t leaf_index;
-	string column_name;
-};
-
-static void AddDuckLakeLeafColumnRefs(LogicalOperator *root, const JoinLeafInfo &leaf, size_t leaf_index,
-                                      unordered_map<uint64_t, DuckLakeJoinColumnRef> &column_refs) {
-	vector<LogicalOperator *> ancestors;
-	ancestors.reserve(leaf.path.size());
-	LogicalOperator *node = root;
-	for (auto child_idx : leaf.path) {
-		// Equality is already out of bounds for this planner-owned path.
-		if (child_idx >= node->children.size()) { // mull-ignore: cxx_ge_to_gt
-			throw InternalException("DuckLakeJoin: leaf path child %llu is out of bounds",
-			                        static_cast<idx_t>(child_idx));
-		}
-		ancestors.push_back(node);
-		node = node->children[child_idx].get();
-	}
-
-	auto *get = leaf.get;
-	if (!get) {
-		return;
-	}
-	unordered_map<uint64_t, string> visible_columns;
-	auto bindings = get->GetColumnBindings();
-	auto &column_ids = get->GetColumnIds();
-	// The <= mutant indexes one past bindings.
-	for (idx_t output_idx = 0; output_idx < bindings.size(); output_idx++) { // mull-ignore: cxx_lt_to_le
-		idx_t column_id_idx = output_idx;
-		if (!get->projection_ids.empty()) {
-			if (output_idx >= get->projection_ids.size()) { // mull-ignore: cxx_ge_to_gt
-				continue;
-			}
-			column_id_idx = get->projection_ids[output_idx];
-		}
-		if (column_id_idx >= column_ids.size() || // mull-ignore: cxx_ge_to_gt
-		    column_ids[column_id_idx].IsVirtualColumn()) {
-			continue;
-		}
-		visible_columns[DeltaJoinBindingKey(bindings[output_idx])] = get->GetColumnName(column_ids[column_id_idx]);
-	}
-
-	auto record_visible = [&]() {
-		for (auto &entry : visible_columns) {
-			column_refs[entry.first] = {leaf_index, entry.second};
-		}
-	};
-	record_visible();
-
-	for (size_t depth = leaf.path.size(); depth-- > 0;) {
-		auto *parent = ancestors[depth];
-		unordered_map<uint64_t, string> parent_columns;
-		if (parent->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-			auto &projection = parent->Cast<LogicalProjection>();
-			auto parent_bindings = parent->GetColumnBindings();
-			idx_t count = std::min<idx_t>(projection.expressions.size(), parent_bindings.size());
-			for (idx_t expr_idx = 0; expr_idx < count; expr_idx++) {
-				ColumnBinding child_binding;
-				if (!TryGetDeltaJoinColumnRef(*projection.expressions[expr_idx], child_binding)) {
-					continue;
-				}
-				auto child_entry = visible_columns.find(DeltaJoinBindingKey(child_binding));
-				if (child_entry != visible_columns.end()) {
-					parent_columns[DeltaJoinBindingKey(parent_bindings[expr_idx])] = child_entry->second;
-				}
-			}
-		} else {
-			for (auto &binding : parent->GetColumnBindings()) {
-				auto child_entry = visible_columns.find(DeltaJoinBindingKey(binding));
-				if (child_entry != visible_columns.end()) {
-					parent_columns[DeltaJoinBindingKey(binding)] = child_entry->second;
-				}
-			}
-		}
-		visible_columns = std::move(parent_columns);
-		record_visible();
-	}
-}
-
 static string DuckLakeQualifiedTable(const string &catalog, const string &schema, const string &table_name,
                                      int64_t snapshot_id) {
 	string result = SqlUtils::QuoteIdentifier(catalog) + "." + SqlUtils::QuoteIdentifier(schema) + "." +
@@ -112,86 +30,15 @@ static string DuckLakeQualifiedTable(const string &catalog, const string &schema
 	return result;
 }
 
-static bool DuckLakeDeltaKeyHasMatch(Connection &con, const string &catalog, const string &schema,
-                                     const string &table_name, const string &delta_column, int64_t old_snapshot,
-                                     int64_t current_snapshot, const string &other_catalog, const string &other_schema,
-                                     const string &other_table, const string &other_column, int64_t other_snapshot) {
-	string delta_col = SqlUtils::QuoteIdentifier(delta_column);
-	string other_col = SqlUtils::QuoteIdentifier(other_column);
-	string other_relation = DuckLakeQualifiedTable(other_catalog, other_schema, other_table, other_snapshot);
-	string old_snap = to_string(old_snapshot);
-	string cur_snap = to_string(current_snapshot);
-	string sql = "SELECT EXISTS(SELECT 1 FROM ("
-	             "SELECT " +
-	             delta_col + " AS openivm_key FROM ducklake_table_insertions('" + SqlUtils::EscapeValue(catalog) +
-	             "', '" + SqlUtils::EscapeValue(schema) + "', '" + SqlUtils::EscapeValue(table_name) + "', " +
-	             old_snap + ", " + cur_snap +
-	             ") "
-	             "UNION ALL "
-	             "SELECT " +
-	             delta_col + " AS openivm_key FROM ducklake_table_deletions('" + SqlUtils::EscapeValue(catalog) +
-	             "', '" + SqlUtils::EscapeValue(schema) + "', '" + SqlUtils::EscapeValue(table_name) + "', " +
-	             old_snap + ", " + cur_snap +
-	             ")) openivm_delta_keys "
-	             "JOIN (SELECT * FROM " +
-	             other_relation + ") openivm_other ON openivm_delta_keys.openivm_key = openivm_other." + other_col +
-	             " LIMIT 1)";
-	auto result = con.Query(sql);
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Could not probe key-domain intersection: %s\n",
-		                    result->HasError() ? result->GetError().c_str() : "no result");
-		return true;
-	}
-	return result->GetValue(0, 0).GetValue<bool>();
-}
-
-static bool PathStartsWith(const vector<size_t> &path, const vector<size_t> &prefix) {
-	// Equality is the exact-path case; reversing the guard would let std::equal read beyond path.
-	return path.size() >= prefix.size() && // mull-ignore: cxx_ge_to_gt,cxx_ge_to_lt
-	       std::equal(prefix.begin(), prefix.end(), path.begin());
-}
-
-static void DemoteOuterJoinsForLeaf(LogicalOperator *node, const vector<size_t> &leaf_path, vector<size_t> &path) {
-	if (auto *join = dynamic_cast<LogicalJoin *>(node)) {
-		bool left_has_delta = false;
-		bool right_has_delta = false;
-		path.push_back(0);
-		left_has_delta = PathStartsWith(leaf_path, path);
-		path.pop_back();
-		path.push_back(1);
-		right_has_delta = PathStartsWith(leaf_path, path);
-		path.pop_back();
-
-		bool demote = false;
-		switch (join->join_type) {
-		case JoinType::LEFT:
-			demote = right_has_delta;
-			break;
-		case JoinType::RIGHT:
-			demote = left_has_delta;
-			break;
-		case JoinType::OUTER:
-			demote = left_has_delta || right_has_delta;
-			break;
-		default:
-			break;
-		}
-		if (demote) {
-			join->join_type = JoinType::INNER;
-		}
-	}
-	// This planner traversal must visit [0, child_count); >= disables it and <= indexes one past children.
-	for (size_t child_idx = 0; child_idx < node->children.size(); // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
-	     child_idx++) {
-		path.push_back(child_idx);
-		DemoteOuterJoinsForLeaf(node->children[child_idx].get(), leaf_path, path);
-		path.pop_back();
-	}
-}
-
-static void DemoteOuterJoinsForLeaf(LogicalOperator *node, const vector<size_t> &leaf_path) {
-	vector<size_t> path;
-	DemoteOuterJoinsForLeaf(node, leaf_path, path);
+// Rows inserted into or deleted from a DuckLake table between two snapshots, projected to select_list.
+static string DuckLakeChangesSQL(const string &select_list, const string &catalog, const string &schema,
+                                 const string &table_name, int64_t old_snapshot, int64_t current_snapshot) {
+	auto rows = [&](const char *function_name) {
+		return "SELECT " + select_list + " FROM " +
+		       SqlUtils::DuckLakeTableFunction(function_name, catalog, schema, table_name, old_snapshot,
+		                                       current_snapshot);
+	};
+	return rows("ducklake_table_insertions") + " UNION ALL " + rows("ducklake_table_deletions");
 }
 
 static idx_t FindBindingPosition(LogicalOperator &op, const ColumnBinding &binding, const char *context_label) {
@@ -225,31 +72,71 @@ static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator
 		size_t child_side = leaf_path[depth];
 		auto &child = *parent->children[child_side];
 		idx_t mul_idx = FindBindingPosition(child, mul_binding, "DuckLakeJoin");
+		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Propagating multiplicity through %s child=%zu width=%zu mul=%zu\n",
+		                    parent->GetName().c_str(), child_side, child.GetColumnBindings().size(),
+		                    static_cast<size_t>(mul_idx));
+		auto shift_parent_projection = [&](idx_t insertion_idx) {
+			ShiftAncestorProjectionMap(ancestors, leaf_path, depth, insertion_idx, 1);
+		};
 
 		if (parent->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 			auto &projection = parent->Cast<LogicalProjection>();
 			projection.expressions.push_back(make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, mul_binding));
-			mul_binding = ColumnBinding(projection.table_index, projection.expressions.size() - 1);
+			mul_binding =
+			    ColumnBinding(TableIndex(projection.table_index), ProjectionIndex(projection.expressions.size() - 1));
 			continue;
 		}
 		if (parent->type == LogicalOperatorType::LOGICAL_FILTER) {
 			auto &filter = parent->Cast<LogicalFilter>();
-			if (!filter.projection_map.empty() && std::find(filter.projection_map.begin(), filter.projection_map.end(),
-			                                                mul_idx) == filter.projection_map.end()) {
-				filter.projection_map.push_back(mul_idx);
+			if (filter.projection_map.empty()) {
+				shift_parent_projection(mul_idx);
+			} else {
+				auto exposed = filter.GetColumnBindings();
+				if (std::find(exposed.begin(), exposed.end(), mul_binding) == exposed.end()) {
+					filter.projection_map.push_back(ProjectionIndex(mul_idx));
+				}
 			}
+			filter.ResolveOperatorTypes();
 			continue;
 		}
 		if (parent->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
-			// LogicalCrossProduct exposes both children's bindings unchanged.
+			// A new left column shifts the right side in any ancestor's positional map.
+			idx_t insertion_idx = mul_idx;
+			if (child_side == 1) {
+				insertion_idx += parent->children[0]->GetColumnBindings().size();
+			}
+			shift_parent_projection(insertion_idx);
+			parent->ResolveOperatorTypes();
 			continue;
 		}
 		if (auto *join = dynamic_cast<LogicalJoin *>(parent)) {
 			auto &projection_map = child_side == 0 ? join->left_projection_map : join->right_projection_map;
-			if (!projection_map.empty() &&
-			    std::find(projection_map.begin(), projection_map.end(), mul_idx) == projection_map.end()) {
-				projection_map.push_back(mul_idx);
+			OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Join projection map before multiplicity:");
+			for (auto projection : projection_map) {
+				OPENIVM_DEBUG_PRINT(" %zu", static_cast<size_t>(projection.GetIndex()));
 			}
+			OPENIVM_DEBUG_PRINT("\n");
+			if (projection_map.empty()) {
+				idx_t insertion_idx = mul_idx;
+				if (child_side == 1) {
+					insertion_idx += join->children[0]->GetColumnBindings().size();
+				}
+				shift_parent_projection(insertion_idx);
+			} else {
+				// Numeric map positions can alias a different column after a deeper join grows.
+				auto exposed = join->GetColumnBindings();
+				if (std::find(exposed.begin(), exposed.end(), mul_binding) == exposed.end()) {
+					idx_t insertion_idx = projection_map.size();
+					if (child_side == 1) {
+						insertion_idx += join->left_projection_map.empty()
+						                     ? join->children[0]->GetColumnBindings().size()
+						                     : join->left_projection_map.size();
+					}
+					projection_map.push_back(ProjectionIndex(mul_idx));
+					shift_parent_projection(insertion_idx);
+				}
+			}
+			join->ResolveOperatorTypes();
 			continue;
 		}
 		throw InternalException("DuckLakeJoin: unsupported ancestor %s in flattened path", parent->GetName());
@@ -263,7 +150,9 @@ static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator
 
 vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput input, ClientContext &context,
                                                            Binder &binder, const vector<JoinLeafInfo> &leaves,
-                                                           bool has_left_join, bool flattened_leaves) {
+                                                           bool has_left_join, bool flattened_leaves,
+                                                           const vector<vector<DeltaJoinKeyProbe>> &key_probes,
+                                                           DeltaSourceCache &source_cache) {
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
 
@@ -283,22 +172,24 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		                                            input.context.view + "': " + snapshot_result->GetError());
 	}
 	for (idx_t row = 0; row < snapshot_result->RowCount(); row++) {
-		if (snapshot_result->GetValue(0, row).IsNull() || snapshot_result->GetValue(1, row).IsNull()) {
+		if (snapshot_result->Collection().GetValue(0, row).IsNull() ||
+		    snapshot_result->Collection().GetValue(1, row).IsNull()) {
 			continue;
 		}
-		auto catalog = snapshot_result->GetValue(2, row).ToString();
-		auto schema = snapshot_result->GetValue(3, row).ToString();
-		auto name = RefreshMetadata::SourceTableName(snapshot_result->GetValue(0, row).ToString(), catalog, schema);
+		auto catalog = snapshot_result->Collection().GetValue(2, row).ToString();
+		auto schema = snapshot_result->Collection().GetValue(3, row).ToString();
+		auto name = RefreshMetadata::SourceTableName(snapshot_result->Collection().GetValue(0, row).ToString(), catalog,
+		                                             schema);
 		stored_snapshots[StringUtil::Lower(SqlUtils::FullName(catalog, schema, name))] =
-		    snapshot_result->GetValue(1, row).GetValue<int64_t>();
+		    snapshot_result->Collection().GetValue(1, row).GetValue<int64_t>();
 	}
 	for (size_t i = 0; i < N; i++) {
-		auto *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
+		auto *get = GetLeafScan(leaves[i]);
 		D_ASSERT(get);
 		auto table_ref = get->GetTable();
-		string table_name = table_ref.get()->name;
-		table_catalogs[i] = table_ref->ParentCatalog().GetName();
-		table_schemas[i] = table_ref->schema.name;
+		string table_name = table_ref.get()->name.GetIdentifierName();
+		table_catalogs[i] = table_ref->ParentCatalog().GetName().GetIdentifierName();
+		table_schemas[i] = table_ref->schema.name.GetIdentifierName();
 		table_names[i] = table_name;
 		auto stored_snapshot = stored_snapshots.find(
 		    StringUtil::Lower(SqlUtils::FullName(table_catalogs[i], table_schemas[i], table_name)));
@@ -307,7 +198,11 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 			                                            "' in view '" + input.context.view + "'");
 		}
 		old_snapshots[i] = stored_snapshot->second;
-		if (get->function.name == "ducklake_scan" && get->function.function_info) {
+		// CreateDeltaGetNode reuses this snapshot instead of re-reading it for every term.
+		auto &source_state = source_cache[table_ref.get()];
+		source_state.last_snapshot = old_snapshots[i];
+		source_state.has_last_snapshot = true;
+		if (get->function.GetName().GetIdentifierName() == "ducklake_scan" && get->function.function_info) {
 			auto &func_info = get->function.function_info->Cast<DuckLakeFunctionInfo>();
 			current_snapshots[i] = static_cast<int64_t>(func_info.snapshot.snapshot_id);
 		}
@@ -369,45 +264,13 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				}
 				continue;
 			}
-			string has_changes_sql =
-			    "SELECT EXISTS(SELECT 1 FROM ("
-			    "(SELECT 1 FROM ducklake_table_insertions('" +
-			    SqlUtils::EscapeValue(table_catalogs[i]) + "', '" + SqlUtils::EscapeValue(table_schemas[i]) + "', '" +
-			    SqlUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
-			    to_string(current_snapshots[i]) +
-			    ") LIMIT 1) "
-			    "UNION ALL "
-			    "(SELECT 1 FROM ducklake_table_deletions('" +
-			    SqlUtils::EscapeValue(table_catalogs[i]) + "', '" + SqlUtils::EscapeValue(table_schemas[i]) + "', '" +
-			    SqlUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
-			    to_string(current_snapshots[i]) + ") LIMIT 1)) openivm_delta_probe LIMIT 1)";
-			auto has_changes = con.Query(has_changes_sql);
-			if (has_changes->HasError()) {
-				OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Could not probe changes for %s.%s.%s: %s\n",
-				                    table_catalogs[i].c_str(), table_schemas[i].c_str(), table_names[i].c_str(),
-				                    has_changes->GetError().c_str());
-				continue;
-			}
-			// Malformed/no-result probes fail open. The metadata path normally handles this before the SQL fallback.
-			if (has_changes->RowCount() > 0 &&                   // mull-ignore: cxx_gt_to_ge,cxx_gt_to_le
-			    !has_changes->GetValue(0, 0).IsNull() &&         // mull-ignore: cxx_remove_negation
-			    !has_changes->GetValue(0, 0).GetValue<bool>()) { // mull-ignore: cxx_remove_negation
+			auto changes = DuckLakeChangesSQL("1", table_catalogs[i], table_schemas[i], table_names[i],
+			                                  old_snapshots[i], current_snapshots[i]);
+			// Failed probes fail open; the metadata path normally handles this before the SQL fallback.
+			if (!DeltaJoinProbeExists(con, "(" + changes + ") openivm_delta_probe", "DuckLakeJoin")) {
 				empty_table_delta[i] = true;
 			}
 		}
-	}
-
-	vector<vector<DeltaJoinKeyProbe>> key_probes(N);
-	if (skip_empty_enabled && !has_left_join) {
-		unordered_map<uint64_t, DuckLakeJoinColumnRef> column_refs;
-		for (size_t i = 0; i < N; i++) {
-			auto *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
-			if (!get) {
-				continue;
-			}
-			AddDuckLakeLeafColumnRefs(input.plan.get(), leaves[i], i, column_refs);
-		}
-		CollectDeltaJoinKeyProbes(input.plan.get(), column_refs, key_probes);
 	}
 
 	OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Building N-term telescoping delta terms (%zu leaves, flattened=%s)\n", N,
@@ -423,16 +286,22 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		}
 		bool key_domain_empty = false;
 		// Snapshot zero is valid; excluding it only disables this optional key-domain pruning.
-		if (skip_empty_enabled && current_snapshots[i] >= 0 && // mull-ignore: cxx_ge_to_gt
+		if (skip_empty_enabled && !has_left_join && current_snapshots[i] >= 0 && // mull-ignore: cxx_ge_to_gt
 		    !key_probes[i].empty()) {
 			for (auto &probe : key_probes[i]) {
 				size_t other = probe.other_leaf;
 				// A probe always targets another leaf, so > and >= differ only for an impossible self-probe.
 				int64_t other_snapshot = other > i ? old_snapshots[other] : -1; // mull-ignore: cxx_gt_to_ge
-				if (!DuckLakeDeltaKeyHasMatch(con, table_catalogs[i], table_schemas[i], table_names[i],
-				                              probe.delta_column, old_snapshots[i], current_snapshots[i],
-				                              table_catalogs[other], table_schemas[other], table_names[other],
-				                              probe.other_column, other_snapshot)) {
+				auto changes = DuckLakeChangesSQL(SqlUtils::QuoteIdentifier(probe.delta_column) + " AS openivm_key",
+				                                  table_catalogs[i], table_schemas[i], table_names[i], old_snapshots[i],
+				                                  current_snapshots[i]);
+				auto other_relation = DuckLakeQualifiedTable(table_catalogs[other], table_schemas[other],
+				                                             table_names[other], other_snapshot);
+				if (!DeltaJoinProbeExists(con,
+				                          "(" + changes + ") openivm_delta_keys JOIN (SELECT * FROM " + other_relation +
+				                              ") openivm_other ON openivm_delta_keys.openivm_key = openivm_other." +
+				                              SqlUtils::QuoteIdentifier(probe.other_column),
+				                          "DuckLakeJoin")) {
 					key_domain_empty = true;
 					OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Skipping term %zu: delta key %s.%s has no match in %s.%s\n", i,
 					                    table_names[i].c_str(), probe.delta_column.c_str(), table_names[other].c_str(),
@@ -455,79 +324,42 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		// term's delta. Preserved joins elsewhere in a left-deep star must remain
 		// outer joins so unmatched rows continue to flow to later dimensions.
 		if (has_left_join) {
-			if (flattened_leaves) {
-				DemoteOuterJoinsForLeaf(term.get(), leaves[i].path);
+			if (flattened_leaves || input.context.model.type == RefreshType::SIMPLE_PROJECTION) {
+				DemoteOuterJoinsForMask(term.get(), leaves, (1ULL << i), input.context.model.type);
 			} else if (leaves[i].is_right_of_left_join) {
 				DemoteLeftJoins(term.get());
 			}
 		}
 
-		// Replace leaf[i] with its delta scan.
-		ColumnBinding mul_binding;
+		// Replace leaf[i] with its delta: a bare GET directly, a GET wrapped in projections/filters by rewriting the
+		// entire subtree. Flattened leaves are always bare GETs under pass-through wrappers.
 		auto &delta_leaf_node = GetNodeAtPath(term, leaves[i].path);
-		auto *delta_get = delta_leaf_node->type == LogicalOperatorType::LOGICAL_GET
-		                      ? dynamic_cast<LogicalGet *>(delta_leaf_node.get())
-		                      : nullptr;
-		if (flattened_leaves || delta_get) {
-			// Simple GET leaf — replace directly.
-			D_ASSERT(delta_get);
-			DeltaGetResult delta_result =
-			    CreateDeltaGetNode(context, input.context.metadata_con, binder, delta_get, input.context.view);
-			mul_binding = delta_result.mul_binding;
-			delta_leaf_node = std::move(delta_result.node);
-			if (flattened_leaves) {
-				mul_binding = PropagateMultiplicityThroughPath(term, leaves[i].path, mul_binding);
-			}
+		D_ASSERT(!flattened_leaves || delta_leaf_node->type == LogicalOperatorType::LOGICAL_GET);
+		auto original_leaf_width = delta_leaf_node->GetColumnBindings().size();
+		auto delta = CompileRegularLeafDelta(input, context, binder, delta_leaf_node, term_root, source_cache);
+		delta_leaf_node = std::move(delta.op);
+		ColumnBinding mul_binding = delta.mul_binding;
+		if (flattened_leaves) {
+			mul_binding = PropagateMultiplicityThroughPath(term, leaves[i].path, mul_binding);
 		} else {
-			// GET wrapped in projections/filters — rewrite the entire subtree.
-			auto &subtree_ref = GetNodeAtPath(term, leaves[i].path);
-			auto rewritten = input.CompileCopiedSubtree(subtree_ref, term_root);
-			mul_binding = rewritten.mul_binding;
-			subtree_ref = std::move(rewritten.op);
-		}
-		if (!flattened_leaves) {
-			UpdateParentProjectionMap(term, leaves[i], mul_binding);
+			UpdateParentProjectionMap(term, leaves[i], mul_binding, original_leaf_width);
 		}
 
 		// Telescoping: pin leaves j > i to old snapshot (AT VERSION).
 		// Leaves j < i stay at current state (already the default).
 		for (size_t j = i + 1; j < N; j++) {
 			auto &leaf_node = GetNodeAtPath(term, leaves[j].path);
-			auto *old_get = leaf_node->type == LogicalOperatorType::LOGICAL_GET
-			                    ? dynamic_cast<LogicalGet *>(leaf_node.get())
-			                    : FindGetInSubtree(leaf_node.get());
-			if (old_get && old_get->function.name == "ducklake_scan" && old_get->function.function_info) {
+			auto *old_get = FindGetInSubtree(leaf_node.get());
+			if (old_get && old_get->function.GetName().GetIdentifierName() == "ducklake_scan" &&
+			    old_get->function.function_info) {
 				auto &func_info = old_get->function.function_info->Cast<DuckLakeFunctionInfo>();
 				func_info.snapshot.snapshot_id = static_cast<idx_t>(old_snapshots[j]);
 				OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Pinned leaf %zu (table_index=%lu) to old snapshot %ld\n", j,
-				                    (unsigned long)old_get->table_index, (long)old_snapshots[j]);
+				                    (unsigned long)old_get->table_index.index, (long)old_snapshots[j]);
 			}
 		}
 
-		term->ResolveOperatorTypes();
-
-		// Build projection: original columns + multiplicity from the single delta leaf.
-		auto term_bindings = term->GetColumnBindings();
-		auto term_types = term->types;
-		vector<unique_ptr<Expression>> proj_exprs;
-
-		// Emit all columns except the multiplicity binding from the delta.
-		uint64_t mul_key =
-		    (uint64_t)mul_binding.table_index ^ ((uint64_t)mul_binding.column_index * 0x9e3779b97f4a7c15ULL);
-		for (idx_t c = 0; c < term_bindings.size(); c++) {
-			uint64_t key = (uint64_t)term_bindings[c].table_index ^
-			               ((uint64_t)term_bindings[c].column_index * 0x9e3779b97f4a7c15ULL);
-			if (key != mul_key) {
-				proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[c], term_bindings[c]));
-			}
-		}
-		// Append multiplicity as the last column.
-		proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(input.mul_type, mul_binding));
-
-		auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(proj_exprs));
-		projection->children.push_back(std::move(term));
-		projection->ResolveOperatorTypes();
-		terms.push_back(std::move(projection));
+		terms.push_back(FinalizeJoinTerm(binder, std::move(term), {}, {mul_binding}, input.mul_type, false));
 
 		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Term %zu: delta on leaf %zu, %zu leaves pinned to old\n", i, i, N - i - 1);
 	}

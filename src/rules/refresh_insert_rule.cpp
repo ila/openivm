@@ -1,30 +1,29 @@
 #include "rules/refresh_insert_rule.hpp"
 #include "compile_facts.hpp"
 #include "rules/schema_evolution.hpp"
+#include "core/metadata_location.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/parser_ddl.hpp"
 #include "core/refresh_metadata.hpp"
-#include "core/published_view.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
 #include "rules/transactional_delta_capture.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/enums/database_modification_type.hpp"
-#include "duckdb/main/client_data.hpp"
 #include "duckdb/main/connection.hpp"
-#include "duckdb/main/database_manager.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
-#include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_execute.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
-#include "duckdb/planner/operator/logical_simple.hpp"
+#include "duckdb/planner/operator/logical_alter.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
@@ -53,24 +52,27 @@ public:
 		OPENIVM_DEBUG_PRINT("[TRANSACTIONAL DDL] restoring %zu metadata snapshots\n", restore_sql.size());
 		try {
 			Connection con(*context.db);
-			auto schema_result = con.Query("SET schema='" + string(DEFAULT_SCHEMA) + "'");
-			if (schema_result->HasError()) {
-				OPENIVM_DEBUG_PRINT("[TRANSACTIONAL DDL] metadata restore setup failed: %s\n",
-				                    schema_result->GetError().c_str());
-			} else {
-				for (auto it = restore_sql.rbegin(); it != restore_sql.rend(); ++it) {
-					auto result = con.Query(*it);
-					if (result->HasError()) {
-						OPENIVM_DEBUG_PRINT("[TRANSACTIONAL DDL] metadata restore failed: %s\n",
-						                    result->GetError().c_str());
-					}
+			TransactionalMVLockState::Get(*con.context)
+			    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+			for (auto it = restore_sql.rbegin(); it != restore_sql.rend(); ++it) {
+				con.BeginTransaction();
+				auto result = con.Query(*it);
+				if (!result->HasError()) {
+					result = con.Query("COMMIT");
+				} else {
+					con.Query("ROLLBACK");
+				}
+				if (result->HasError()) {
+					Printer::Print(
+					    "OpenIVM could not restore materialized view metadata after a rolled-back DDL statement: " +
+					    result->GetError());
 				}
 			}
 		} catch (std::exception &ex) {
-			// Transaction callbacks must always release the mutation gate. A
-			// helper-restore error is diagnostic here; the caller transaction has
-			// already rolled back and cannot report a second failure safely.
-			OPENIVM_DEBUG_PRINT("[TRANSACTIONAL DDL] metadata rollback callback failed: %s\n", ex.what());
+			// Transaction callbacks must always release the mutation gate.
+			Printer::Print(string("OpenIVM could not restore materialized view metadata after a rolled-back DDL "
+			                      "statement: ") +
+			               ex.what());
 		}
 		Clear();
 	}
@@ -85,82 +87,75 @@ private:
 	unique_ptr<MutationLockGuard> mutation_guard;
 };
 
-static string BuildRestoreRowsSQL(MaterializedQueryResult &rows, const string &table_name) {
+// Restores the snapshotted rows. Native catalogs replace them by primary key; remote SQL
+// catalogs have no INSERT OR REPLACE, so the rows sharing their key are deleted and then
+// reinserted (the caller runs both in one transaction).
+static string BuildRestoreRowsSQL(QueryResult &rows, const string &table_name, const vector<string> &key_columns,
+                                  bool native) {
 	if (rows.RowCount() == 0) {
 		return "";
 	}
-	string columns;
-	for (auto &name : rows.names) {
-		if (!columns.empty()) {
-			columns += ", ";
-		}
-		columns += SqlUtils::QuoteIdentifier(name);
-	}
-	string values;
-	for (idx_t row = 0; row < rows.RowCount(); row++) {
-		if (!values.empty()) {
-			values += ", ";
-		}
-		values += "(";
-		for (idx_t col = 0; col < rows.ColumnCount(); col++) {
-			if (col > 0) {
-				values += ", ";
+	auto names = IdentifiersToStrings(rows.GetNames());
+	vector<idx_t> key_indexes;
+	for (auto &key : key_columns) {
+		for (idx_t col = 0; col < names.size(); col++) {
+			if (StringUtil::CIEquals(names[col], key)) {
+				key_indexes.push_back(col);
+				break;
 			}
-			values += rows.GetValue(col, row).ToSQLString();
 		}
-		values += ")";
 	}
-	return "INSERT OR REPLACE INTO " + table_name + " (" + columns + ") VALUES " + values;
+	if (key_indexes.size() != key_columns.size()) {
+		throw CatalogException("OpenIVM metadata snapshot of %s lacks its key columns", table_name);
+	}
+	string columns = SqlUtils::JoinQuotedColumns(names);
+	vector<string> row_values;
+	vector<string> row_keys;
+	for (idx_t row = 0; row < rows.RowCount(); row++) {
+		vector<string> cells;
+		for (idx_t col = 0; col < rows.ColumnCount(); col++) {
+			cells.push_back(rows.Collection().GetValue(col, row).ToSQLString());
+		}
+		row_values.push_back("(" + StringUtil::Join(cells, ", ") + ")");
+		row_keys.push_back("(" +
+		                   StringUtil::Join(key_indexes, key_indexes.size(), " AND ",
+		                                    [&](idx_t col) {
+			                                    return SqlUtils::QuoteIdentifier(names[col]) +
+			                                           " IS NOT DISTINCT FROM " +
+			                                           rows.Collection().GetValue(col, row).ToSQLString();
+		                                    }) +
+		                   ")");
+	}
+	string values = StringUtil::Join(row_values, ", ");
+	string keys = StringUtil::Join(row_keys, " OR ");
+	if (native) {
+		return "INSERT OR REPLACE INTO " + table_name + " (" + columns + ") VALUES " + values;
+	}
+	return "DELETE FROM " + table_name + " WHERE " + keys + ";\nINSERT INTO " + table_name + " (" + columns +
+	       ") VALUES " + values + ";\n";
 }
 
 static void RegisterMetadataRestore(ClientContext &context, Connection &con, const string &table_name,
                                     const string &predicate) {
-	auto rows = con.Query("SELECT * FROM " + SqlUtils::QuoteIdentifier(table_name) + " WHERE " + predicate);
+	auto location = RefreshMetadata::CurrentLocation(con);
+	auto target = SqlUtils::FullName(location.catalog, location.schema, table_name);
+	auto rows = con.Query("SELECT * FROM " + target + " WHERE " + predicate);
 	if (rows->HasError()) {
 		throw CatalogException("OpenIVM could not snapshot helper metadata: %s", rows->GetError());
 	}
-	auto location = con.Query("SELECT current_database(), current_schema()");
-	if (location->HasError()) {
-		throw CatalogException("OpenIVM could not resolve metadata restore location: %s", location->GetError());
-	}
-	auto restore = BuildRestoreRowsSQL(*rows, SqlUtils::FullName(location->GetValue(0, 0).ToString(),
-	                                                             location->GetValue(1, 0).ToString(), table_name));
+	auto restore = BuildRestoreRowsSQL(*rows, target, {"view_name"}, location.IsNative());
 	if (!restore.empty()) {
 		TransactionalHelperUndoState::Get(context).AddRestoreSQL(std::move(restore));
 	}
 }
 
-static void ExecuteHelperMetadataSQL(Connection &con, const string &sql) {
-	auto result = con.Query(sql);
-	if (result->HasError()) {
-		throw CatalogException("OpenIVM metadata update failed: %s", result->GetError());
-	}
-}
-
-static void DropCatalogEntry(ClientContext &context, const string &catalog_name, const string &schema_name,
-                             const string &entry_name, CatalogType type) {
-	DropInfo info;
-	info.type = type;
-	info.catalog = catalog_name;
-	info.schema = schema_name;
-	info.name = entry_name;
-	info.if_not_found = OnEntryNotFound::RETURN_NULL;
-	auto &catalog = Catalog::GetCatalog(context, catalog_name);
-	MetaTransaction::Get(context).ModifyDatabase(catalog.GetAttached(), DatabaseModificationType::DROP_CATALOG_ENTRY);
-	catalog.DropEntry(context, info);
-}
-
-static void DropQualifiedCatalogEntry(ClientContext &context, const string &qualified_name,
-                                      const string &fallback_catalog, const string &fallback_schema, CatalogType type) {
-	auto components = SqlUtils::ParseQualifiedIdentifier(qualified_name);
-	if (components.size() == 1) {
-		DropCatalogEntry(context, fallback_catalog, fallback_schema, components[0], type);
-	} else if (components.size() == 2) {
-		DropCatalogEntry(context, fallback_catalog, components[0], components[1], type);
-	} else if (components.size() == 3) {
-		DropCatalogEntry(context, components[0], components[1], components[2], type);
-	} else {
-		throw InternalException("OpenIVM could not resolve internal relation '%s'", qualified_name);
+static void SnapshotSchemaEvolutionMetadata(ClientContext &context, Connection &con, const MetadataLocation &location) {
+	TransactionalMVLockState::Get(*con.context)
+	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	RefreshMetadata::UseLocation(con, location);
+	RefreshMetadata(con).SnapshotTransaction(context);
+	if (auto state = TransactionalMVMetadataState::TryGet(context)) {
+		state->Apply(con);
 	}
 }
 
@@ -168,111 +163,35 @@ static void AlterDeltaInCallerTransaction(ClientContext &context, AlterTableInfo
                                           const string &catalog_name, const string &schema_name,
                                           const string &delta_name) {
 	auto delta_alter = source_alter.Copy();
-	delta_alter->catalog = catalog_name;
-	delta_alter->schema = schema_name;
-	delta_alter->name = delta_name;
-	auto &catalog = Catalog::GetCatalog(context, catalog_name);
+	delta_alter->SetQualifiedName(Identifier(catalog_name), Identifier(schema_name), Identifier(delta_name));
+	auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
 	MetaTransaction::Get(context).ModifyDatabase(catalog.GetAttached(), DatabaseModificationType::ALTER_TABLE);
 	catalog.Alter(context, *delta_alter);
 }
 
-static pair<string, string> ResolveDDLLocus(ClientContext &context, const string &catalog_name,
-                                            const string &schema_name) {
-	auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
-	string default_catalog =
-	    default_entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : default_entry.catalog;
-	return {
-	    catalog_name.empty() ? default_catalog : catalog_name,
-	    schema_name.empty() ? (default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema) : schema_name,
-	};
-}
-
-static bool SameRelationLocus(const string &left_catalog, const string &left_schema, const string &right_catalog,
-                              const string &right_schema) {
-	return StringUtil::CIEquals(left_catalog, right_catalog) && StringUtil::CIEquals(left_schema, right_schema);
-}
-
-static string MVInternalPrefix(ClientContext &context, const RefreshMetadata::StoredViewLocation &location,
-                               const string &view_name, const string &sql_name) {
-	QueryErrorContext error_context;
-	auto entry = Catalog::GetEntry(context, location.catalog_name, location.schema_name,
-	                               EntryLookupInfo(CatalogType::VIEW_ENTRY, sql_name, error_context),
-	                               OnEntryNotFound::RETURN_NULL);
-	if (entry) {
-		auto data_table = IncrementalTableNames::DataTableName(view_name);
-		auto &view = dynamic_cast<ViewCatalogEntry &>(*entry);
-		auto data_ref = SqlUtils::FindTableReference(view.sql, data_table);
-		auto separator = data_ref.rfind('.');
-		if (separator != string::npos) {
-			return data_ref.substr(0, separator + 1);
-		}
+static optional_ptr<TableCatalogEntry> GetNativeDMLTable(LogicalOperator &dml) {
+	optional_ptr<TableCatalogEntry> table;
+	switch (dml.type) {
+	case LogicalOperatorType::LOGICAL_INSERT:
+		table = &dml.Cast<LogicalInsert>().table;
+		break;
+	case LogicalOperatorType::LOGICAL_DELETE:
+		table = &dml.Cast<LogicalDelete>().table;
+		break;
+	case LogicalOperatorType::LOGICAL_UPDATE:
+		table = &dml.Cast<LogicalUpdate>().table;
+		break;
+	case LogicalOperatorType::LOGICAL_MERGE_INTO:
+		table = &dml.Cast<LogicalMergeInto>().table;
+		break;
+	default:
+		throw InternalException("OpenIVM expected a source DML operator");
 	}
-	return SqlUtils::QualifiedPrefix(location.catalog_name, location.schema_name);
-}
-
-static void DropTrackedMaterializedView(ClientContext &context, Connection &con, RefreshMetadata &metadata,
-                                        const string &view_name, bool drop_user_view) {
-	auto location = metadata.GetStoredViewLocation(view_name);
-	auto delta_sources = metadata.GetDeltaSources(view_name, location.catalog_name, location.schema_name);
-	auto sql_name = metadata.GetViewSQLName(view_name);
-	auto internal_prefix = MVInternalPrefix(context, location, view_name, sql_name);
-	auto escaped_view_name = SqlUtils::EscapeValue(view_name);
-	auto view_predicate = "view_name = '" + escaped_view_name + "'";
-	RegisterMetadataRestore(context, con, openivm::VIEWS_TABLE, view_predicate);
-	RegisterMetadataRestore(context, con, openivm::DELTA_TABLES_TABLE, view_predicate);
-	auto dependency_predicate = "parent_view = '" + escaped_view_name + "' OR child_view = '" + escaped_view_name + "'";
-	RegisterMetadataRestore(context, con, openivm::MV_DEPS_TABLE, dependency_predicate);
-	ExecuteHelperMetadataSQL(con, "DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                                  escaped_view_name + "'");
-	ExecuteHelperMetadataSQL(con, "DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	                                  escaped_view_name + "'");
-	ExecuteHelperMetadataSQL(con, "DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE " + dependency_predicate);
-	if (drop_user_view) {
-		DropCatalogEntry(context, location.catalog_name, location.schema_name, sql_name, CatalogType::VIEW_ENTRY);
-	}
-	DropQualifiedCatalogEntry(context,
-	                          internal_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name)),
-	                          location.catalog_name, location.schema_name, CatalogType::TABLE_ENTRY);
-	DropQualifiedCatalogEntry(context,
-	                          internal_prefix +
-	                              KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(view_name)),
-	                          location.catalog_name, location.schema_name, CatalogType::TABLE_ENTRY);
-
-	for (auto &name : {PublishedViewName(view_name), SqlUtils::DeltaName(PublishedViewName(view_name))}) {
-		DropQualifiedCatalogEntry(context, internal_prefix + SqlUtils::QuoteIdentifier(name), location.catalog_name,
-		                          location.schema_name, CatalogType::TABLE_ENTRY);
-	}
-
-	for (auto &source : delta_sources) {
-		// DuckLake entries store the base table name — never drop it.
-		if (source.catalog_type == "ducklake" || metadata.IsMaterializedViewDelta(source)) {
-			continue;
-		}
-		auto remaining =
-		    con.Query("SELECT count(*) FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
-		              RefreshMetadata::SourcePredicate(source.table_name, source.catalog_name, source.schema_name));
-		if (!remaining->HasError() && remaining->RowCount() > 0 && remaining->GetValue(0, 0).GetValue<int64_t>() == 0) {
-			DropCatalogEntry(
-			    context, source.catalog_name, source.schema_name,
-			    RefreshMetadata::SourceTableName(source.table_name, source.catalog_name, source.schema_name),
-			    CatalogType::TABLE_ENTRY);
-		}
-	}
-}
-
-static optional_ptr<TableCatalogEntry> TryGetTrackedDeltaTable(ClientContext &context, TableCatalogEntry &table) {
-	const auto &table_name = table.name;
-	if (table_name.empty() || SqlUtils::IsDelta(table_name) || IncrementalTableNames::IsDataTable(table_name) ||
-	    table.catalog.GetCatalogType() == "ducklake") {
+	if (table->name.GetIdentifierName().empty() ||
+	    IncrementalTableNames::IsMaintenanceTable(table->name.GetIdentifierName()) || !table->catalog.IsDuckCatalog()) {
 		return nullptr;
 	}
-	auto delta_table =
-	    Catalog::GetEntry<TableCatalogEntry>(context, table.catalog.GetName(), table.schema.name,
-	                                         SqlUtils::DeltaName(table_name), OnEntryNotFound::RETURN_NULL);
-	if (!delta_table) {
-		return nullptr;
-	}
-	return &delta_table->Cast<TableCatalogEntry>();
+	return table;
 }
 
 static void ResolveInsertDefaults(OptimizerExtensionInput &input, LogicalInsert &insert) {
@@ -300,13 +219,13 @@ static void ResolveInsertDefaults(OptimizerExtensionInput &input, LogicalInsert 
 }
 
 static idx_t FindExpressionBindingIndex(LogicalOperator &child, const Expression &expression) {
-	if (expression.type != ExpressionType::BOUND_COLUMN_REF) {
+	if (expression.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		throw InternalException("OpenIVM expected a bound row-id column reference");
 	}
 	auto &column_ref = expression.Cast<BoundColumnRefExpression>();
 	auto bindings = child.GetColumnBindings();
 	for (idx_t index = 0; index < bindings.size(); index++) {
-		if (bindings[index] == column_ref.binding) {
+		if (bindings[index] == column_ref.Binding()) {
 			return index;
 		}
 	}
@@ -316,7 +235,7 @@ static idx_t FindExpressionBindingIndex(LogicalOperator &child, const Expression
 static void ResolveUpdateDefaults(OptimizerExtensionInput &input, LogicalUpdate &update) {
 	bool has_default = false;
 	for (auto &expression : update.expressions) {
-		has_default = has_default || expression->type == ExpressionType::VALUE_DEFAULT;
+		has_default = has_default || expression->GetExpressionType() == ExpressionType::VALUE_DEFAULT;
 	}
 	if (!has_default) {
 		return;
@@ -338,7 +257,7 @@ static void ResolveUpdateDefaults(OptimizerExtensionInput &input, LogicalUpdate 
 
 	vector<idx_t> default_indexes(update.expressions.size(), DConstants::INVALID_INDEX);
 	for (idx_t index = 0; index < update.expressions.size(); index++) {
-		if (update.expressions[index]->type != ExpressionType::VALUE_DEFAULT) {
+		if (update.expressions[index]->GetExpressionType() != ExpressionType::VALUE_DEFAULT) {
 			continue;
 		}
 		default_indexes[index] = projection_expressions.size();
@@ -348,7 +267,7 @@ static void ResolveUpdateDefaults(OptimizerExtensionInput &input, LogicalUpdate 
 	const auto row_id_output_index = projection_expressions.size();
 	projection_expressions.push_back(make_uniq<BoundColumnRefExpression>(child_types.back(), child_bindings.back()));
 	for (idx_t index = 0; index < update.expressions.size(); index++) {
-		auto return_type = update.expressions[index]->return_type;
+		auto return_type = update.expressions[index]->GetReturnType();
 		idx_t output_index;
 		if (default_indexes[index] != DConstants::INVALID_INDEX) {
 			output_index = default_indexes[index];
@@ -356,8 +275,8 @@ static void ResolveUpdateDefaults(OptimizerExtensionInput &input, LogicalUpdate 
 			output_index = FindExpressionBindingIndex(*update.children[0], *update.expressions[index]);
 			D_ASSERT(output_index + 1 < child_bindings.size());
 		}
-		update.expressions[index] =
-		    make_uniq<BoundColumnRefExpression>(return_type, ColumnBinding(projection_index, output_index));
+		update.expressions[index] = make_uniq<BoundColumnRefExpression>(
+		    return_type, ColumnBinding(TableIndex(projection_index), ProjectionIndex(output_index)));
 	}
 
 	auto projection = make_uniq<LogicalProjection>(projection_index, std::move(projection_expressions));
@@ -375,72 +294,66 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
                                                   duckdb::unique_ptr<LogicalOperator> &plan) {
 	auto root = plan.get();
 
-	// Handle DROP TABLE/VIEW: clean up IVM metadata if the dropped object is an IVM view
-	if (root->type == LogicalOperatorType::LOGICAL_DROP) {
-		auto *simple = dynamic_cast<LogicalSimple *>(root);
-		if (!simple) {
+	if (root->type == LogicalOperatorType::LOGICAL_CREATE_TABLE) {
+		auto &create = root->Cast<LogicalCreateTable>();
+		auto &catalog = create.schema.catalog;
+		if (!catalog.IsDuckCatalog() || create.info->Base().temporary) {
 			return;
 		}
-		auto *drop_info = dynamic_cast<DropInfo *>(simple->info.get());
-		if (!drop_info || (drop_info->type != CatalogType::TABLE_ENTRY && drop_info->type != CatalogType::VIEW_ENTRY)) {
+		auto &info = create.info->Base();
+		// MV lifecycle programs publish their own signed output changes. Their
+		// backing/publication rebuilds are not replacements of user sources.
+		if (IncrementalTableNames::IsMaintenanceTable(info.GetQualifiedName().Name().GetIdentifierName())) {
 			return;
 		}
-
-		auto table_name = drop_info->name;
-		auto target_locus = ResolveDDLLocus(input.context, drop_info->catalog, drop_info->schema);
-		Connection con(*input.context.db);
-		RefreshMetadata::UseCatalog(input.context, con, target_locus.first);
-
-		auto view_check = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-		                            SqlUtils::EscapeValue(table_name) + "'");
-		if (!view_check->HasError() && view_check->RowCount() > 0) {
-			RefreshMetadata metadata(con);
-			auto location = metadata.GetStoredViewLocation(table_name);
-			if (SameRelationLocus(location.catalog_name, location.schema_name, target_locus.first,
-			                      target_locus.second)) {
-				TransactionalMVLockState::Get(input.context).AcquireMutationLock();
-				OPENIVM_DEBUG_PRINT("[INSERT RULE] DROP TABLE '%s' — cleaning up IVM metadata\n", table_name.c_str());
-				bool drop_user_view = drop_info->type == CatalogType::VIEW_ENTRY;
-				DropTrackedMaterializedView(input.context, con, metadata, table_name, drop_user_view);
-				if (drop_user_view) {
-					// The original logical DROP remains as an idempotent no-op.
-					drop_info->if_not_found = OnEntryNotFound::RETURN_NULL;
+		auto old_table = Catalog::GetEntry<TableCatalogEntry>(
+		    input.context,
+		    QualifiedName(Identifier(catalog.GetName().GetIdentifierName()),
+		                  Identifier(create.schema.name.GetIdentifierName()),
+		                  Identifier(info.GetQualifiedName().Name().GetIdentifierName())),
+		    OnEntryNotFound::RETURN_NULL);
+		if (old_table && info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
+			return;
+		}
+		auto delta =
+		    TransactionalMVLockState::Get(input.context)
+		        .FindSourceDeltaForWrite(catalog.GetName().GetIdentifierName(), create.schema.name.GetIdentifierName(),
+		                                 info.GetQualifiedName().Name().GetIdentifierName());
+		auto token = RefreshMetadata::SourceGeneration(input.context, catalog.GetName().GetIdentifierName(),
+		                                               create.schema.name.GetIdentifierName(),
+		                                               info.GetQualifiedName().Name().GetIdentifierName());
+		if (delta) {
+			idx_t count = 0;
+			for (auto &column : delta->GetColumns().Physical()) {
+				if (column.Name() == openivm::MULTIPLICITY_COL || column.Name() == openivm::TIMESTAMP_COL) {
+					continue;
 				}
+				count++;
+				if (!info.columns.ColumnExists(column.Name()) ||
+				    info.columns.GetColumn(column.Name()).Type() != column.Type()) {
+					throw BinderException("OpenIVM replacement schema is incompatible with retained deltas for source "
+					                      "'%s'; drop dependent materialized views before changing its schema",
+					                      info.GetQualifiedName().Name().GetIdentifierName());
+				}
+			}
+			if (count != info.columns.LogicalColumnCount()) {
+				throw BinderException("OpenIVM replacement schema is incompatible with retained deltas for source "
+				                      "'%s'; drop dependent materialized views before changing its schema",
+				                      info.GetQualifiedName().Name().GetIdentifierName());
 			}
 		}
-
-		// Handle CASCADE: drop dependent MVs
-		auto dep_check = con.Query(
-		    "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
-		    RefreshMetadata::SourcePredicate(SqlUtils::DeltaName(table_name), target_locus.first, target_locus.second));
-		if (!dep_check->HasError() && dep_check->RowCount() > 0 && drop_info->cascade) {
-			TransactionalMVLockState::Get(input.context).AcquireMutationLock();
-			RefreshMetadata cascade_metadata(con);
-			vector<string> dependent_views;
-			unordered_set<string> seen_dependents;
-			for (size_t i = 0; i < dep_check->RowCount(); i++) {
-				auto direct_view = dep_check->GetValue(0, i).ToString();
-				auto downstream = cascade_metadata.GetDownstreamViews(direct_view);
-				for (auto it = downstream.rbegin(); it != downstream.rend(); ++it) {
-					if (seen_dependents.insert(*it).second) {
-						dependent_views.push_back(*it);
-					}
-				}
-				if (seen_dependents.insert(direct_view).second) {
-					dependent_views.push_back(std::move(direct_view));
-				}
-			}
-			for (auto &dep_view : dependent_views) {
-				DropTrackedMaterializedView(input.context, con, cascade_metadata, dep_view, true);
-			}
+		if (delta || !token.empty() || !create.children.empty() ||
+		    info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
+			auto wrapper = make_uniq<LogicalSourceLifecycle>(old_table, delta);
+			wrapper->children.push_back(std::move(plan));
+			plan = std::move(wrapper);
 		}
-
 		return;
 	}
 
 	// Handle ALTER TABLE: sync delta table schema or block if referenced column is affected
 	if (root->type == LogicalOperatorType::LOGICAL_ALTER) {
-		auto *simple = dynamic_cast<LogicalSimple *>(root);
+		auto *simple = dynamic_cast<LogicalAlter *>(root);
 		if (!simple) {
 			return;
 		}
@@ -449,29 +362,52 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			return;
 		}
 
-		auto source = Catalog::GetEntry<TableCatalogEntry>(input.context, alter_info->catalog, alter_info->schema,
-		                                                   alter_info->name, OnEntryNotFound::RETURN_NULL);
+		auto source = Catalog::GetEntry<TableCatalogEntry>(
+		    input.context,
+		    QualifiedName(Identifier(alter_info->GetQualifiedName().Catalog().GetIdentifierName()),
+		                  Identifier(alter_info->GetQualifiedName().Schema().GetIdentifierName()),
+		                  Identifier(alter_info->GetQualifiedName().Name().GetIdentifierName())),
+		    OnEntryNotFound::RETURN_NULL);
 		if (!source) {
 			return;
 		}
 		// SQL identifiers are case-insensitive; metadata stores the catalog spelling.
-		string table_name = source->name;
+		string table_name = source->name.GetIdentifierName();
 		string delta_name = SqlUtils::DeltaName(table_name);
-		auto source_locus = std::make_pair(source->ParentCatalog().GetName(), source->schema.name);
+		auto source_locus = std::make_pair(source->ParentCatalog().GetName().GetIdentifierName(),
+		                                   source->schema.name.GetIdentifierName());
 
 		// Resolve only the source's delta table in the caller transaction. Scanning
 		// information_schema touches unrelated external catalogs and can silently
-		// skip schema synchronization when one of them is unavailable.
-		auto delta_entry = Catalog::GetEntry<TableCatalogEntry>(input.context, source_locus.first, source_locus.second,
-		                                                        delta_name, OnEntryNotFound::RETURN_NULL);
+		// skip schema synchronization when one of them is unavailable. Source
+		// admission keeps an untracked ALTER local; tracked ownership escalates to
+		// the mutation gate and is rechecked there.
+		auto delta_entry = TransactionalMVLockState::Get(input.context)
+		                       .FindSourceDeltaForWrite(source_locus.first, source_locus.second, table_name);
+		auto wrap_generation = [&]() {
+			if (source->catalog.IsDuckCatalog()) {
+				auto wrapper = make_uniq<LogicalSourceLifecycle>(source, delta_entry);
+				wrapper->children.push_back(std::move(plan));
+				plan = std::move(wrapper);
+			}
+		};
 		if (!delta_entry) {
-			return; // not an IVM-tracked table
+			wrap_generation();
+			return;
 		}
-		Connection con(*input.context.db);
-		RefreshMetadata::UseCatalog(input.context, con, source_locus.first);
-		TransactionalMVLockState::Get(input.context).AcquireMutationLock();
+		// The physical delta may sit in an internal schema; metadata still keys it by delta_name.
+		auto delta_locus =
+		    std::make_pair(delta_entry->schema.name.GetIdentifierName(), delta_entry->name.GetIdentifierName());
 
 		switch (alter_info->alter_table_type) {
+		case AlterTableType::RENAME_TABLE:
+		case AlterTableType::ALTER_COLUMN_TYPE:
+			throw CatalogException("Cannot %s on IVM-tracked source '%s': OpenIVM cannot preserve its delta capture "
+			                       "and dependent view definitions across this change. Drop its dependent "
+			                       "materialized views first, alter the source, then recreate the views.",
+			                       alter_info->alter_table_type == AlterTableType::RENAME_TABLE ? "rename table"
+			                                                                                    : "change column type",
+			                       SqlUtils::FullName(source_locus.first, source_locus.second, table_name));
 		case AlterTableType::ADD_COLUMN: {
 			auto *add_info = dynamic_cast<AddColumnInfo *>(alter_info);
 			if (!add_info) {
@@ -479,8 +415,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			}
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] ALTER TABLE ADD COLUMN '%s' — syncing delta table\n",
 			                    add_info->new_column.Name().c_str());
-			AlterDeltaInCallerTransaction(input.context, *alter_info, source_locus.first, source_locus.second,
-			                              delta_name);
+			AlterDeltaInCallerTransaction(input.context, *alter_info, source_locus.first, delta_locus.first,
+			                              delta_locus.second);
 			break;
 		}
 		case AlterTableType::REMOVE_COLUMN: {
@@ -488,11 +424,12 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			if (!remove_info) {
 				break;
 			}
-			string col_name = remove_info->removed_column;
-			for (auto &catalog : RefreshMetadata::MetadataCatalogs(con)) {
-				RefreshMetadata::UseCatalog(input.context, con, catalog);
-				auto referencing_mv = FirstMVReferencingColumn(con, delta_name, source_locus.first, source_locus.second,
-				                                               table_name, col_name);
+			string col_name = remove_info->removed_column.GetIdentifierName();
+			for (auto &location : RefreshMetadata::MetadataLocations(input.context, openivm::DELTA_TABLES_TABLE)) {
+				Connection con(*input.context.db);
+				SnapshotSchemaEvolutionMetadata(input.context, con, location);
+				auto referencing_mv = FirstMVReferencingColumn(input.context, con, delta_name, source_locus.first,
+				                                               source_locus.second, table_name, col_name);
 				if (!referencing_mv.empty()) {
 					throw CatalogException("Cannot drop column '" + col_name +
 					                       "': it is referenced by materialized view '" + referencing_mv +
@@ -500,8 +437,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 				}
 			}
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] ALTER TABLE DROP COLUMN '%s' — syncing delta table\n", col_name.c_str());
-			AlterDeltaInCallerTransaction(input.context, *alter_info, source_locus.first, source_locus.second,
-			                              delta_name);
+			AlterDeltaInCallerTransaction(input.context, *alter_info, source_locus.first, delta_locus.first,
+			                              delta_locus.second);
 			break;
 		}
 		case AlterTableType::RENAME_COLUMN: {
@@ -509,25 +446,58 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			if (!rename_info) {
 				break;
 			}
-			string old_name = rename_info->old_name;
-			string new_name = rename_info->new_name;
+			string old_name = rename_info->old_name.GetIdentifierName();
+			string new_name = rename_info->new_name.GetIdentifierName();
 			auto dependent_view_predicate =
 			    "view_name IN (SELECT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
 			    RefreshMetadata::SourcePredicate(delta_name, source_locus.first, source_locus.second) + ")";
-			for (auto &catalog : RefreshMetadata::MetadataCatalogs(con)) {
-				RefreshMetadata::UseCatalog(input.context, con, catalog);
-				RegisterMetadataRestore(input.context, con, openivm::VIEWS_TABLE, dependent_view_predicate);
-				RewriteDependentViewMetadataForRename(con, delta_name, source_locus.first, source_locus.second,
-				                                      table_name, old_name, new_name);
+			vector<MetadataLocation> affected_locations;
+			for (auto &location : RefreshMetadata::MetadataLocations(input.context, openivm::DELTA_TABLES_TABLE)) {
+				Connection con(*input.context.db);
+				SnapshotSchemaEvolutionMetadata(input.context, con, location);
+				auto rows = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE " +
+				                      dependent_view_predicate + " LIMIT 1");
+				if (rows->HasError()) {
+					throw CatalogException(rows->GetError());
+				}
+				if (!rows->RowCount()) {
+					continue;
+				}
+				MetadataLocator::RequireWritable(location, "rename source column");
+				MetadataLocator::RejectExplicitTransaction(input.context, location, source_locus.first,
+				                                           "ALTER TABLE RENAME COLUMN");
+				affected_locations.push_back(location);
+			}
+			for (auto &location : affected_locations) {
+				Connection con(*input.context.db);
+				SnapshotSchemaEvolutionMetadata(input.context, con, location);
+				// DuckDB permits writes to one native catalog per transaction. Keep
+				// the existing audited helper/undo path for other committed catalogs.
+				if (!StringUtil::CIEquals(location.catalog, source_locus.first)) {
+					RegisterMetadataRestore(input.context, con, openivm::VIEWS_TABLE, dependent_view_predicate);
+				}
+				RewriteDependentViewMetadataForRename(input.context, con, delta_name, source_locus.first,
+				                                      source_locus.second, table_name, old_name, new_name);
 			}
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] ALTER TABLE RENAME COLUMN '%s' → '%s' — syncing delta table\n",
 			                    old_name.c_str(), new_name.c_str());
-			AlterDeltaInCallerTransaction(input.context, *alter_info, source_locus.first, source_locus.second,
-			                              delta_name);
+			AlterDeltaInCallerTransaction(input.context, *alter_info, source_locus.first, delta_locus.first,
+			                              delta_locus.second);
 			break;
 		}
 		default:
 			break;
+		}
+		wrap_generation();
+		return;
+	}
+
+	// A cached EXECUTE has no logical child. A rebound EXECUTE does: capture
+	// its DML below just like a directly submitted statement.
+	if (root->type == LogicalOperatorType::LOGICAL_EXECUTE && root->children.empty()) {
+		auto &prepared = root->Cast<LogicalExecute>().prepared;
+		if (prepared && prepared->physical_plan) {
+			AdmitPlanMutations(input.context, prepared->physical_plan->Root());
 		}
 		return;
 	}
@@ -547,76 +517,76 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		dml = dml_owner->get();
 	}
 
-	switch (dml->type) {
-	case LogicalOperatorType::LOGICAL_INSERT: {
-		auto &insert = dml->Cast<LogicalInsert>();
-		const auto &table_name = insert.table.name;
-		auto delta_table = TryGetTrackedDeltaTable(input.context, insert.table);
-		if (!delta_table) {
-			return;
-		}
-		ResolveInsertDefaults(input, insert);
-		auto capture =
-		    make_uniq<LogicalTransactionalDeltaCapture>(insert.table, *delta_table, DeltaCaptureMode::INSERT);
-		capture->children.push_back(std::move(insert.children[0]));
-		insert.children[0] = std::move(capture);
-		OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional INSERT delta capture for '%s'\n", table_name.c_str());
-		break;
-	}
-	case LogicalOperatorType::LOGICAL_DELETE: {
-		auto &delete_op = dml->Cast<LogicalDelete>();
-		const auto &table_name = delete_op.table.name;
-		auto delta_table = TryGetTrackedDeltaTable(input.context, delete_op.table);
-		if (!delta_table) {
-			return;
-		}
-		D_ASSERT(delete_op.expressions.size() == 1);
-		auto row_id_index = FindExpressionBindingIndex(*delete_op.children[0], *delete_op.expressions[0]);
-		auto capture = make_uniq<LogicalTransactionalDeltaCapture>(
-		    delete_op.table, *delta_table, DeltaCaptureMode::DELETE, vector<unique_ptr<Expression>> {},
-		    vector<PhysicalIndex> {}, optional_idx(row_id_index));
-		capture->children.push_back(std::move(delete_op.children[0]));
-		delete_op.children[0] = std::move(capture);
-		OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional DELETE delta capture for '%s'\n", table_name.c_str());
-		break;
-	}
-	case LogicalOperatorType::LOGICAL_UPDATE: {
-		auto &update = dml->Cast<LogicalUpdate>();
-		const auto &table_name = update.table.name;
-		auto delta_table = TryGetTrackedDeltaTable(input.context, update.table);
-		if (!delta_table) {
-			return;
-		}
-		ResolveUpdateDefaults(input, update);
-		vector<unique_ptr<Expression>> update_expressions;
-		update_expressions.reserve(update.expressions.size());
-		for (idx_t index = 0; index < update.expressions.size(); index++) {
-			update_expressions.push_back(update.expressions[index]->Copy());
-		}
-		auto row_id_index = update.children[0]->GetColumnBindings().size() - 1;
-		auto capture = make_uniq<LogicalTransactionalDeltaCapture>(update.table, *delta_table, DeltaCaptureMode::UPDATE,
-		                                                           std::move(update_expressions), update.columns,
-		                                                           optional_idx(row_id_index));
-		capture->children.push_back(std::move(update.children[0]));
-		update.children[0] = std::move(capture);
-		OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional UPDATE delta capture for '%s'\n", table_name.c_str());
-		break;
-	}
-	case LogicalOperatorType::LOGICAL_MERGE_INTO: {
-		auto &merge = dml->Cast<LogicalMergeInto>();
-		const auto &table_name = merge.table.name;
-		auto delta_table = TryGetTrackedDeltaTable(input.context, merge.table);
-		if (!delta_table) {
-			return;
-		}
-		auto capture = make_uniq<LogicalTransactionalMergeDeltaCapture>(merge.table, *delta_table);
-		capture->children.push_back(std::move(*dml_owner));
-		*dml_owner = std::move(capture);
-		OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional MERGE action delta capture for '%s'\n", table_name.c_str());
-		break;
-	}
-	default:
+	auto table = GetNativeDMLTable(*dml);
+	if (!table) {
 		return;
 	}
+	auto delta_table =
+	    TransactionalMVLockState::Get(input.context)
+	        .FindSourceDeltaForWrite(table->catalog.GetName().GetIdentifierName(),
+	                                 table->schema.name.GetIdentifierName(), table->name.GetIdentifierName());
+	if (delta_table) {
+		switch (dml->type) {
+		case LogicalOperatorType::LOGICAL_INSERT: {
+			auto &insert = dml->Cast<LogicalInsert>();
+			const auto &table_name = insert.table.name;
+			ResolveInsertDefaults(input, insert);
+			auto capture =
+			    make_uniq<LogicalTransactionalDeltaCapture>(insert.table, *delta_table, DeltaCaptureMode::INSERT);
+			capture->children.push_back(std::move(insert.children[0]));
+			insert.children[0] = std::move(capture);
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional INSERT delta capture for '%s'\n", table_name.c_str());
+			break;
+		}
+		case LogicalOperatorType::LOGICAL_DELETE: {
+			auto &delete_op = dml->Cast<LogicalDelete>();
+			const auto &table_name = delete_op.table.name;
+			D_ASSERT(delete_op.expressions.size() == 1);
+			auto row_id_index = FindExpressionBindingIndex(*delete_op.children[0], *delete_op.expressions[0]);
+			auto capture = make_uniq<LogicalTransactionalDeltaCapture>(
+			    delete_op.table, *delta_table, DeltaCaptureMode::DELETE, vector<unique_ptr<Expression>> {},
+			    vector<PhysicalIndex> {}, optional_idx(row_id_index));
+			capture->children.push_back(std::move(delete_op.children[0]));
+			delete_op.children[0] = std::move(capture);
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional DELETE delta capture for '%s'\n", table_name.c_str());
+			break;
+		}
+		case LogicalOperatorType::LOGICAL_UPDATE: {
+			auto &update = dml->Cast<LogicalUpdate>();
+			const auto &table_name = update.table.name;
+			ResolveUpdateDefaults(input, update);
+			vector<unique_ptr<Expression>> update_expressions;
+			update_expressions.reserve(update.expressions.size());
+			for (idx_t index = 0; index < update.expressions.size(); index++) {
+				update_expressions.push_back(update.expressions[index]->Copy());
+			}
+			auto row_id_index = update.children[0]->GetColumnBindings().size() - 1;
+			auto capture = make_uniq<LogicalTransactionalDeltaCapture>(
+			    update.table, *delta_table, DeltaCaptureMode::UPDATE, std::move(update_expressions), update.columns,
+			    optional_idx(row_id_index));
+			capture->children.push_back(std::move(update.children[0]));
+			update.children[0] = std::move(capture);
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional UPDATE delta capture for '%s'\n", table_name.c_str());
+			break;
+		}
+		case LogicalOperatorType::LOGICAL_MERGE_INTO: {
+			auto &merge = dml->Cast<LogicalMergeInto>();
+			const auto &table_name = merge.table.name;
+			auto capture = make_uniq<LogicalTransactionalMergeDeltaCapture>(merge.table, *delta_table);
+			capture->children.push_back(std::move(*dml_owner));
+			*dml_owner = std::move(capture);
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional MERGE action delta capture for '%s'\n",
+			                    table_name.c_str());
+			break;
+		}
+		default:
+			return;
+		}
+	}
+	// Put the execution marker in the DML input pipeline, before its native sink.
+	// Plain EXPLAIN builds this operator but never initializes its runtime state.
+	auto execution = make_uniq<LogicalSourceWriteExecution>(*table, delta_table);
+	execution->children.push_back(std::move(dml->children[0]));
+	dml->children[0] = std::move(execution);
 }
 } // namespace duckdb

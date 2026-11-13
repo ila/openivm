@@ -5,13 +5,10 @@
 
 namespace duckdb {
 
-const char *DeltaMaintenanceModeName(DeltaMaintenanceMode mode);
-const char *DeltaMaintenanceStateKindName(DeltaMaintenanceStateKind state);
-
 DeltaModelNodeKind NodeKindForOperator(LogicalOperator &op);
-void BuildDeltaModelNodes(DeltaViewModel &model, const CreateMVPlanFacts &facts, const vector<string> &output_names);
-void BuildDeltaModelBaseAffectedDomains(DeltaViewModel &model, const CreateMVPlanFacts &facts);
-void ValidateDeltaViewModelInvariants(const DeltaViewModel &model);
+// Builds one model node per plan node plus the CREATE-time profile counts. `full_only` marks views for which no
+// incremental rule applies to any node (unsupported construct or unrecognized pattern).
+void BuildDeltaModelNodes(DeltaViewModel &model, const CreateMVPlanFacts &facts, bool full_only);
 void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFacts &facts,
                                    const vector<string> &output_names);
 string BuildDeltaViewModelLineageJson(const DeltaViewModel &model);

@@ -1,0 +1,414 @@
+# name: test/sql/metadata_location.test
+# description: Shared native/DuckLake metadata placement, recovery, reopen and transaction contracts
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository'; LOAD ducklake;
+
+foreach backend,marker duckdb,data ducklake,metadata_contract_ducklake
+
+load __TEST_DIR__/metadata_contract_${backend}.db
+
+statement ok
+SET openivm_disable_daemon=true;
+SET openivm_archive_compiled_sql=true;
+SET openivm_profile_refresh=true;
+SET openivm_cascade_refresh='off';
+ATTACH '__TEST_DIR__/d_${backend}.db' AS data (TYPE ${backend});
+ATTACH '__TEST_DIR__/metadata_control_${backend}.db' AS control;
+
+statement error
+SET SESSION openivm_metadata_catalog='control';
+----
+database-wide
+
+statement ok
+SET openivm_metadata_catalog='control';
+SET openivm_metadata_schema='OpenIVM Control';
+SET openivm_internal_schema='Maintenance Space';
+CREATE SCHEMA data.observation;
+CREATE TABLE data.observation.orders(id INTEGER,k INTEGER,v INTEGER);
+INSERT INTO data.observation.orders VALUES (1,1,10),(2,1,20),(3,2,5),(4,NULL,8);
+CREATE MATERIALIZED VIEW data.observation.totals AS
+SELECT k,SUM(v) s,COUNT(*) c FROM data.observation.orders GROUP BY k;
+CREATE MATERIALIZED VIEW data.observation.report AS SELECT * FROM data.observation.totals WHERE s>10;
+
+query I
+SELECT count(*) FROM control."OpenIVM Control".openivm_views
+WHERE view_catalog='data' AND view_schema='observation' AND internal_schema='Maintenance Space';
+----
+2
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name IN ('data','metadata_contract_${backend}')
+AND table_name IN ('openivm_views','openivm_delta_tables');
+----
+0
+
+query TT
+SELECT metadata_catalog,metadata_schema FROM ${marker}.main.openivm_metadata_location;
+----
+control	OpenIVM Control
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='control'
+AND (starts_with(table_name,'openivm_data_') OR starts_with(table_name,'openivm_visible_'));
+----
+0
+
+# One fixture covers every durable boundary and the ordinary rollback path.
+# Before the data commit the old bag survives; afterward the new bag is visible.
+foreach point,committed,pending,mode after_intent,false,true,incremental partial_data,false,true,incremental before_data_commit,false,true,incremental after_data_commit,true,true,incremental after_data_commit,true,true,full data_statement_error,false,false,incremental
+
+statement ok
+CREATE OR REPLACE TEMP TABLE before_refresh AS SELECT * FROM data.observation.totals;
+INSERT INTO data.observation.orders VALUES (500,3,7),(500,3,7),(501,4,9);
+UPDATE data.observation.orders SET v=v+1 WHERE id=500;
+DELETE FROM data.observation.orders WHERE id=501 OR id=1;
+SET openivm_refresh_mode='${mode}';
+SET openivm_test_fail_point=CASE WHEN '${point}'='partial_data' THEN
+CASE WHEN '${backend}'='ducklake' THEN 'after_view_delta' ELSE 'before_data_commit' END ELSE '${point}' END;
+
+statement error
+PRAGMA refresh('data.observation.totals');
+----
+<REGEX>:(?s).*(after_intent|after_view_delta|before_data_commit|after_data_commit|data_statement_error).*
+
+statement ok
+SET openivm_test_fail_point='';
+
+query I
+SELECT refresh_in_progress='${pending}'::BOOLEAN FROM control."OpenIVM Control".openivm_views
+WHERE view_sql_name='totals';
+----
+true
+
+query I
+SELECT CASE WHEN ${committed} THEN
+(SELECT count(*) FROM ((SELECT * FROM data.observation.totals EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k EXCEPT ALL SELECT * FROM data.observation.totals)))
+ELSE (SELECT count(*) FROM ((SELECT * FROM data.observation.totals EXCEPT ALL SELECT * FROM before_refresh)
+UNION ALL (SELECT * FROM before_refresh EXCEPT ALL SELECT * FROM data.observation.totals))) END;
+----
+0
+
+statement ok
+PRAGMA refresh('data.observation.report');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM data.observation.report EXCEPT ALL SELECT * FROM data.observation.totals WHERE s>10)
+UNION ALL (SELECT * FROM data.observation.totals WHERE s>10 EXCEPT ALL SELECT * FROM data.observation.report));
+----
+0
+
+statement ok
+PRAGMA refresh('data.observation.totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM data.observation.totals EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k EXCEPT ALL SELECT * FROM data.observation.totals));
+----
+0
+
+statement ok
+PRAGMA refresh('data.observation.report');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM data.observation.report EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k HAVING SUM(v)>10)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k HAVING SUM(v)>10 EXCEPT ALL SELECT * FROM data.observation.report));
+----
+0
+
+query I
+SELECT refresh_in_progress FROM control."OpenIVM Control".openivm_views WHERE view_sql_name='totals';
+----
+false
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+query II
+SELECT count(*) FILTER(WHERE step_name='create_mv_total')>0,
+count(*) FILTER(WHERE step_name='total_refresh')>0 FROM control."OpenIVM Control".openivm_refresh_profile;
+----
+true	true
+
+# Split metadata/data writes cannot escape an explicit caller transaction.
+
+statement ok
+BEGIN; INSERT INTO data.observation.orders VALUES (900,9,90);
+
+statement error
+PRAGMA refresh('data.observation.totals');
+----
+cannot run inside an explicit transaction
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM data.observation.totals EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k EXCEPT ALL SELECT * FROM data.observation.totals));
+----
+0
+
+statement ok
+BEGIN;
+
+statement error
+CREATE MATERIALIZED VIEW data.observation.rejected AS SELECT * FROM data.observation.orders;
+----
+cannot run inside an explicit transaction
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement error
+DROP VIEW data.observation.report;
+----
+cannot run inside an explicit transaction
+
+statement ok
+ROLLBACK;
+
+# Source capture stays local while metadata is read-only or detached.
+
+statement ok
+DETACH control;
+ATTACH '__TEST_DIR__/metadata_control_${backend}.db' AS control (READ_ONLY);
+INSERT INTO data.observation.orders VALUES (901,9,9),(902,9,10);
+UPDATE data.observation.orders SET v=v+3 WHERE id=901;
+DELETE FROM data.observation.orders WHERE id=902;
+
+statement error
+PRAGMA refresh('data.observation.totals');
+----
+attached read-only
+
+statement error
+CREATE MATERIALIZED VIEW data.observation.rejected AS SELECT * FROM data.observation.orders;
+----
+attached read-only
+
+statement ok
+DETACH control;
+
+statement error
+PRAGMA refresh('data.observation.totals');
+----
+is not attached
+
+statement ok
+ALTER TABLE data.observation.orders ADD COLUMN note VARCHAR;
+INSERT INTO data.observation.orders(id,k,v) VALUES (903,10,4),(904,10,5);
+UPDATE data.observation.orders SET v=v+1 WHERE id=903;
+DELETE FROM data.observation.orders WHERE id=904;
+ATTACH '__TEST_DIR__/metadata_control_${backend}.db' AS control;
+
+statement ok
+PRAGMA refresh_pipeline('data.observation.totals','data.observation.report');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM data.observation.totals EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k EXCEPT ALL SELECT * FROM data.observation.totals));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM data.observation.report EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k HAVING SUM(v)>10)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k HAVING SUM(v)>10 EXCEPT ALL SELECT * FROM data.observation.report));
+----
+0
+
+# A real controller marker, rather than copied settings, drives reopen.
+
+statement ok
+SET openivm_metadata_catalog=''; RESET openivm_metadata_schema;
+SET openivm_internal_schema='';
+
+restart
+
+statement ok
+LOAD ducklake;
+ATTACH '__TEST_DIR__/d_${backend}.db' AS data (TYPE ${backend});
+ATTACH '__TEST_DIR__/metadata_control_${backend}.db' AS control;
+
+statement ok
+PRAGMA refresh_pipeline('data.observation.totals','data.observation.report');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM data.observation.totals EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k EXCEPT ALL SELECT * FROM data.observation.totals));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM data.observation.report EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k HAVING SUM(v)>10)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k HAVING SUM(v)>10 EXCEPT ALL SELECT * FROM data.observation.report));
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW data.observation.discovered AS SELECT * FROM data.observation.totals;
+
+query I
+SELECT count(*) FROM control."OpenIVM Control".openivm_views;
+----
+3
+
+statement ok
+ATTACH ':memory:' AS other_control; SET openivm_metadata_catalog='other_control';
+
+statement error
+PRAGMA refresh('data.observation.totals');
+----
+is recorded in control
+
+statement ok
+SET openivm_metadata_catalog='control';
+
+# Same-named join inputs and a DAG use the selected metadata and maintenance schemas.
+statement ok
+SET openivm_internal_schema='Maintenance Space';
+CREATE SCHEMA data.reference;
+CREATE TABLE data.reference.orders(id INTEGER,v INTEGER);
+INSERT INTO data.reference.orders VALUES(2,10),(2,20),(3,30);
+CREATE MATERIALIZED VIEW data.observation.joined AS
+SELECT a.k,SUM(b.v) total,COUNT(b.id) c FROM data.observation.orders a
+LEFT JOIN data.reference.orders b USING(id) GROUP BY a.k;
+
+query I
+SELECT type FROM control."OpenIVM Control".openivm_views WHERE view_sql_name='joined';
+----
+0
+
+statement ok
+INSERT INTO data.reference.orders VALUES(500,7),(700,8);
+UPDATE data.reference.orders SET v=v+1 WHERE id=500;
+DELETE FROM data.reference.orders WHERE id=700;
+INSERT INTO data.observation.orders(id,k,v) VALUES(700,5,7),(701,5,8);
+UPDATE data.observation.orders SET v=v+4 WHERE id=700;
+DELETE FROM data.observation.orders WHERE id=701;
+
+statement ok
+PRAGMA refresh_pipeline('data.observation.report','data.observation.joined','data.observation.totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM data.observation.totals EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k EXCEPT ALL SELECT * FROM data.observation.totals));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM data.observation.report EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k HAVING SUM(v)>10)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM data.observation.orders GROUP BY k HAVING SUM(v)>10 EXCEPT ALL SELECT * FROM data.observation.report));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM data.observation.joined EXCEPT ALL SELECT a.k,SUM(b.v),COUNT(b.id) FROM data.observation.orders a LEFT JOIN data.reference.orders b USING(id) GROUP BY a.k)
+UNION ALL (SELECT a.k,SUM(b.v),COUNT(b.id) FROM data.observation.orders a LEFT JOIN data.reference.orders b USING(id) GROUP BY a.k EXCEPT ALL SELECT * FROM data.observation.joined));
+----
+0
+
+# With data and metadata in the same catalog, explicit transactions stay atomic.
+
+statement ok
+SET openivm_internal_schema='';
+
+statement ok
+CREATE TABLE control.main.source(i INTEGER);
+INSERT INTO control.main.source VALUES (1),(1),(2);
+CREATE MATERIALIZED VIEW control.main.local_mv AS SELECT * FROM control.main.source;
+
+foreach outcome ROLLBACK COMMIT
+
+statement ok
+BEGIN;
+INSERT INTO control.main.source VALUES (1),(2),(3),(3);
+DELETE FROM control.main.source WHERE i=1;
+UPDATE control.main.source SET i=4 WHERE i=2;
+
+statement ok
+PRAGMA refresh('control.main.local_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM control.main.local_mv EXCEPT ALL SELECT * FROM control.main.source)
+UNION ALL (SELECT * FROM control.main.source EXCEPT ALL SELECT * FROM control.main.local_mv));
+----
+0
+
+statement ok
+${outcome};
+
+query I
+SELECT count(*) FROM ((SELECT * FROM control.main.local_mv EXCEPT ALL SELECT * FROM control.main.source)
+UNION ALL (SELECT * FROM control.main.source EXCEPT ALL SELECT * FROM control.main.local_mv));
+----
+0
+
+endloop
+
+# External source cleanup waits for the MV/watermark commit, even when the source is in control.
+
+statement ok
+CREATE MATERIALIZED VIEW data.observation.external_source AS SELECT * FROM control.main.source;
+
+statement ok
+INSERT INTO control.main.source VALUES (1),(2),(3),(3);
+DELETE FROM control.main.source WHERE i=1;
+UPDATE control.main.source SET i=4 WHERE i=2;
+
+statement ok
+PRAGMA refresh('control.main.local_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM control.main.local_mv EXCEPT ALL SELECT * FROM control.main.source)
+UNION ALL (SELECT * FROM control.main.source EXCEPT ALL SELECT * FROM control.main.local_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('data.observation.external_source');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM data.observation.external_source EXCEPT ALL SELECT * FROM control.main.source)
+UNION ALL (SELECT * FROM control.main.source EXCEPT ALL SELECT * FROM data.observation.external_source));
+----
+0
+
+query I
+SELECT count(*) FROM control.main.openivm_delta_source;
+----
+0
+
+statement ok
+DROP VIEW control.main.local_mv;
+DROP VIEW data.observation.external_source;
+DROP VIEW data.observation.joined;
+DROP VIEW data.observation.totals CASCADE;
+
+query I
+SELECT count(*) FROM control."OpenIVM Control".openivm_views;
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='data'
+AND schema_name='Maintenance Space' AND starts_with(table_name,'openivm_');
+----
+0
+
+statement ok
+SET openivm_metadata_catalog=''; RESET openivm_metadata_schema;
+
+endloop

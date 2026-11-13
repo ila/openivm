@@ -5,11 +5,31 @@
 #include "duckdb.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 
+#include <functional>
+
 namespace duckdb {
 
 struct CreateMVPlanFacts;
 class BoundWindowExpression;
+class LogicalComparisonJoin;
+class LogicalAggregate;
+class LogicalProjection;
 bool IsRunningWindowCandidate(const BoundWindowExpression &window);
+
+/// The single-child path from a plan root down to the first operator that is neither a projection nor accepted by
+/// `pass_through` (a MATERIALIZED_CTE passes through to its consumer, children[1]).
+struct OutputSpine {
+	vector<LogicalProjection *> projections; // root first
+	LogicalOperator *parent = nullptr;       // operator directly above `bottom`, nullptr when `bottom` is the root
+	LogicalOperator *bottom = nullptr;
+};
+OutputSpine FindOutputSpine(LogicalOperator *root, const std::function<bool(const LogicalOperator &)> &pass_through);
+/// The aggregate at the bottom of the spine, directly or below a HAVING filter.
+LogicalAggregate *SpineAggregate(const OutputSpine &spine);
+
+/// Keep the first usable projection refresh key whose lineage stays on
+/// preserved inputs; search its preserved subtree when that key is unsafe.
+LogicalComparisonJoin *FindProjectionKeyJoin(LogicalOperator &plan);
 
 struct PlanRewriteNeeds {
 	bool inline_cte_refs = false;
@@ -19,14 +39,14 @@ struct PlanRewriteNeeds {
 	bool derived_aggregates = false;
 	bool has_aggregate = false;
 	bool outer_join_support = false;
+	bool blocking_set_operation = false;
 	bool semi_anti_subqueries = false;
 	bool running_window_state = false;
 };
 
-/// Strip AGG(...) FILTER (WHERE p) by converting to AGG(CASE WHEN p THEN arg
-/// END). Must be called on both the SELECT plan (for LPTS serialization) and
-/// the full CREATE plan (for AnalyzePlan / find_group_cols) so the checker sees
-/// no FILTER aggregates.
+/// Convert FILTER to a NULL-masked argument only for known NULL-ignoring unary
+/// aggregates and COUNT(*). Retain native FILTER for all other signatures.
+/// Apply to both the SELECT serialization plan and the full CREATE analysis plan.
 void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator> &plan);
 
 /// Fold uncorrelated constant scalar subqueries (e.g. `(SELECT k FROM
@@ -50,6 +70,12 @@ void FoldConstantScalarSubqueries(ClientContext &context, unique_ptr<LogicalOper
 /// that cannot match the plan are skipped without another preflight traversal.
 void PlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
                  vector<string> &planner_names, const PlanRewriteNeeds &needs);
+
+/// Expand materialized CTE references into independently renumbered plan copies.
+/// Join delta compilation needs one leaf per CTE occurrence so it can generate
+/// every inclusion-exclusion cross-term. This is also used after rebinding the
+/// compact CTE graph emitted by LPTS for a stored materialized-view definition.
+void InlineMaterializedCteRefs(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
 
 bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &plan, const CreateMVPlanFacts &facts,
                                 const vector<string> &output_names, string &sql);

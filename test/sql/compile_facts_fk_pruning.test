@@ -66,6 +66,22 @@ FROM openivm_compile_with_facts(
 )
 WHERE stmt_kind = 'data';
 
+# Spark serializes facts with a space after every colon (and around separators). Every field,
+# including target_dialect, delta_shape members and fk_relations arrays, must parse the same way.
+statement ok
+CREATE TABLE cfkp_sql_fk_facts_spaced AS
+SELECT string_agg(sql, ' ' ORDER BY stmt_order) AS prog
+FROM openivm_compile_with_facts(
+    'cfkp_mv',
+    '{"target_dialect": "duckdb", "compile_only": true, "delta_shape": {"cfkp_fact_sales": "GENERAL", "cfkp_dim_product": "INSERT_ONLY", "cfkp_dim_region": "INSERT_ONLY"}, "fk_relations": [{"child_table": "cfkp_fact_sales", "child_columns": ["product_id"], "parent_table": "cfkp_dim_product", "parent_columns": ["product_id"], "rely": true}, {"child_table": "cfkp_fact_sales", "child_columns": ["region_id"], "parent_table": "cfkp_dim_region", "parent_columns": ["region_id"], "rely": true}]}'
+)
+WHERE stmt_kind = 'data';
+
+query I
+SELECT (SELECT prog FROM cfkp_sql_fk_facts) = (SELECT prog FROM cfkp_sql_fk_facts_spaced);
+----
+true
+
 # Empty FK facts preserve the old generated SQL byte-for-byte.
 query I
 SELECT (SELECT prog FROM cfkp_sql_baseline) = (SELECT prog FROM cfkp_sql_empty_facts);

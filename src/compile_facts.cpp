@@ -27,103 +27,6 @@ CompileFacts CompileFacts::Default(SqlDialect dialect) {
 
 namespace {
 
-bool ExtractJsonBool(const string &json, const string &key, bool &val) {
-	string needle = "\"" + key + "\":";
-	size_t pos = json.find(needle);
-	if (pos == string::npos) {
-		return false;
-	}
-	pos += needle.size();
-	while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) {
-		pos++;
-	}
-	if (pos + 4 <= json.size() && json.compare(pos, 4, "true") == 0) {
-		val = true;
-		return true;
-	}
-	if (pos + 5 <= json.size() && json.compare(pos, 5, "false") == 0) {
-		val = false;
-		return true;
-	}
-	return false;
-}
-
-bool ExtractJsonInt(const string &json, const string &key, int &val) {
-	string needle = "\"" + key + "\":";
-	size_t pos = json.find(needle);
-	if (pos == string::npos) {
-		return false;
-	}
-	pos += needle.size();
-	while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) {
-		pos++;
-	}
-	size_t start = pos;
-	if (pos < json.size() && (json[pos] == '-' || json[pos] == '+')) {
-		pos++;
-	}
-	while (pos < json.size() && std::isdigit(static_cast<unsigned char>(json[pos]))) {
-		pos++;
-	}
-	if (start == pos) {
-		return false;
-	}
-	try {
-		val = std::stoi(json.substr(start, pos - start));
-		return true;
-	} catch (...) {
-		return false;
-	}
-}
-
-bool ExtractDeltaShapeObject(const string &json, unordered_map<string, string> &delta_shape) {
-	string needle = "\"delta_shape\":{";
-	size_t pos = json.find(needle);
-	if (pos == string::npos) {
-		return false;
-	}
-	pos += needle.size();
-	while (pos < json.size()) {
-		while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == ',')) {
-			pos++;
-		}
-		if (pos < json.size() && json[pos] == '}') {
-			return true;
-		}
-		if (pos >= json.size() || json[pos] != '"') {
-			return false;
-		}
-		size_t key_start = pos;
-		size_t key_end = json.find("\":\"", key_start + 1);
-		if (key_end == string::npos) {
-			return false;
-		}
-		string key_json = "{" + json.substr(key_start, key_end - key_start + 1) + "}";
-		string table;
-		if (!MetadataJson::ExtractJsonString(key_json, "", table)) {
-			table = json.substr(key_start + 1, key_end - key_start - 1);
-		}
-		pos = key_end + 3;
-		string value;
-		while (pos < json.size()) {
-			char c = json[pos];
-			if (c == '\\' && pos + 1 < json.size()) {
-				value += json[pos + 1];
-				pos += 2;
-				continue;
-			}
-			if (c == '"') {
-				pos++;
-				break;
-			}
-			value += c;
-			pos++;
-		}
-		delta_shape[table] = value;
-	}
-	return false;
-}
-
 SqlDialect ParseDialectString(const string &s) {
 	// Reuse the lpts helper so dialect names stay in lockstep with the
 	// LPTS pipeline. LPTS throws on unrecognised values which is exactly
@@ -149,16 +52,13 @@ CompileFacts ParseFactsJson(const string &json) {
 	}
 	out.target_dialect = ParseDialectString(dialect_str);
 
-	int sv = 0;
-	if (ExtractJsonInt(json, "schema_version", sv)) {
-		out.schema_version = sv;
-	}
-	ExtractJsonBool(json, "compile_only", out.compile_only);
-	ExtractJsonBool(json, "force_view_delta_cascade", out.force_view_delta_cascade);
-	ExtractJsonBool(json, "assume_insert_only", out.assume_insert_only);
-	ExtractDeltaShapeObject(json, out.delta_shape);
-	ExtractJsonBool(json, "running_window_incremental", out.running_window_incremental);
-	ExtractJsonBool(json, "emit_spark_hints", out.emit_spark_hints);
+	MetadataJson::ExtractJsonInt(json, "schema_version", out.schema_version);
+	MetadataJson::ExtractJsonBool(json, "compile_only", out.compile_only);
+	MetadataJson::ExtractJsonBool(json, "force_view_delta_cascade", out.force_view_delta_cascade);
+	MetadataJson::ExtractJsonBool(json, "assume_insert_only", out.assume_insert_only);
+	MetadataJson::ExtractJsonStringMap(json, "delta_shape", out.delta_shape);
+	MetadataJson::ExtractJsonBool(json, "running_window_incremental", out.running_window_incremental);
+	MetadataJson::ExtractJsonBool(json, "emit_spark_hints", out.emit_spark_hints);
 
 	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "fk_relations")) {
 		CompileFactsFkRelation fk;
@@ -179,7 +79,7 @@ CompileFacts ParseFactsJson(const string &json) {
 		if (fk.parent_columns.empty()) {
 			MetadataJson::ExtractJsonStringArray(object, "pk_cols", fk.parent_columns);
 		}
-		ExtractJsonBool(object, "rely", fk.rely);
+		MetadataJson::ExtractJsonBool(object, "rely", fk.rely);
 		if (fk.rely && !fk.child_table.empty() && !fk.parent_table.empty() && !fk.child_columns.empty() &&
 		    fk.child_columns.size() == fk.parent_columns.size()) {
 			out.fk_relations.push_back(std::move(fk));
@@ -267,56 +167,18 @@ struct CompileWithFactsGlobalState : public GlobalTableFunctionState {
 	idx_t offset = 0;
 };
 
-// Splits a SQL fragment on top-level `;` boundaries (ignoring `;` inside
-// quoted strings) and pushes each non-empty trimmed statement, tagged
-// with `kind`, into the bind result.
+// Pushes each top-level statement of a SQL fragment, tagged with `kind`, into the bind result.
 static void PushBucket(CompileWithFactsBindData &bd, const string &kind, const string &sql_block) {
-	if (sql_block.empty()) {
-		return;
-	}
-	string current;
-	current.reserve(sql_block.size());
-	char in_quote = 0; // either 0, '\'', or '"'
-	for (size_t i = 0; i < sql_block.size(); i++) {
-		char c = sql_block[i];
-		if (in_quote) {
-			current += c;
-			if (c == in_quote) {
-				in_quote = 0;
-			} else if (c == '\\' && i + 1 < sql_block.size()) {
-				current += sql_block[++i];
-			}
-			continue;
-		}
-		if (c == '\'' || c == '"') {
-			in_quote = c;
-			current += c;
-			continue;
-		}
-		if (c == ';') {
-			string trimmed = current;
-			StringUtil::Trim(trimmed);
-			if (!trimmed.empty()) {
-				bd.stmt_kinds.push_back(kind);
-				bd.stmt_sqls.push_back(trimmed + ";");
-			}
-			current.clear();
-		} else {
-			current += c;
-		}
-	}
-	string tail = current;
-	StringUtil::Trim(tail);
-	if (!tail.empty()) {
+	for (auto &statement : SqlUtils::SplitSQLStatements(sql_block)) {
 		bd.stmt_kinds.push_back(kind);
-		bd.stmt_sqls.push_back(tail + ";");
+		bd.stmt_sqls.push_back(statement + ";");
 	}
 }
 
 } // namespace
 
 unique_ptr<FunctionData> OpenIvmCompileWithFactsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                                     vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs.size() < 2) {
 		throw InvalidInputException("openivm_compile_with_facts(view_name, facts_json) requires exactly two arguments");
 	}
@@ -377,15 +239,15 @@ void OpenIvmCompileWithFactsExecute(ClientContext &context, TableFunctionInput &
 	idx_t total = bd.stmt_sqls.size();
 	idx_t emitted = 0;
 	while (state.offset < total && emitted < STANDARD_VECTOR_SIZE) {
-		output.SetValue(0, emitted, Value::INTEGER(bd.refresh_type_int));
-		output.SetValue(1, emitted, Value(bd.refresh_type_name));
-		output.SetValue(2, emitted, Value::INTEGER(static_cast<int32_t>(state.offset)));
-		output.SetValue(3, emitted, Value(bd.stmt_kinds[state.offset]));
-		output.SetValue(4, emitted, Value(bd.stmt_sqls[state.offset]));
+		output.data[0].SetValue(emitted, Value::INTEGER(bd.refresh_type_int));
+		output.data[1].SetValue(emitted, Value(bd.refresh_type_name));
+		output.data[2].SetValue(emitted, Value::INTEGER(static_cast<int32_t>(state.offset)));
+		output.data[3].SetValue(emitted, Value(bd.stmt_kinds[state.offset]));
+		output.data[4].SetValue(emitted, Value(bd.stmt_sqls[state.offset]));
 		state.offset++;
 		emitted++;
 	}
-	output.SetCardinality(emitted);
+	output.SetCardinalityUnsafe(emitted);
 }
 
 } // namespace openivm

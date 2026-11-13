@@ -39,12 +39,13 @@ struct RefreshCostEstimate {
 	}
 };
 
-/// Estimate costs of incremental refresh vs full recompute for the given view query plan.
-/// Walks the plan tree, collects base table and delta table cardinalities,
-/// and computes a cost estimate for both strategies. If sufficient execution
-/// history exists, applies learned regression to calibrate predictions.
-RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator &plan, const string &view_name,
-                                        const DeltaActivityResult *delta_activity = nullptr);
+/// Estimate costs of incremental refresh vs full recompute for the stored view query.
+/// Plans the query, walks the plan tree to collect base table and pending delta
+/// cardinalities, and computes a cost estimate for both strategies. If sufficient
+/// execution history exists, applies learned regression to calibrate predictions.
+/// Runs inside the caller's transaction on `context`.
+RefreshCostEstimate EstimateViewRefreshCost(ClientContext &context, const string &view_query_sql,
+                                            const string &view_name, const DeltaActivityResult &delta_activity);
 
 /// Pragma function: returns the refresh cost estimate for a view as a string.
 string RefreshCostQuery(ClientContext &context, const FunctionParameters &parameters);
