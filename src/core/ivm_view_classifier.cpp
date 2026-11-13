@@ -8,6 +8,8 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_distinct.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 
 #include <unordered_set>
 
@@ -240,6 +242,45 @@ static OutputSpine DistinctSpine(const CreateMVPlanFacts &facts) {
 	});
 }
 
+// DISTINCT ON partitions by its targets; payload columns choose a winner within each key.
+static vector<string> DistinctOnGroupColumns(const CreateMVPlanFacts &facts, const vector<string> &output_names) {
+	auto spine = DistinctSpine(facts);
+	if (!spine.bottom || spine.bottom->type != LogicalOperatorType::LOGICAL_DISTINCT) {
+		return {};
+	}
+	auto &distinct = spine.bottom->Cast<LogicalDistinct>();
+	if (distinct.distinct_type != DistinctType::DISTINCT_ON) {
+		return {};
+	}
+	auto outputs =
+	    spine.projections.empty() ? distinct.GetColumnBindings() : spine.projections.front()->GetColumnBindings();
+	vector<string> keys;
+	for (auto &target : distinct.distinct_targets) {
+		auto binding = target->Cast<BoundColumnRefExpression>().Binding();
+		for (auto projection = spine.projections.rbegin(); projection != spine.projections.rend(); ++projection) {
+			bool found = false;
+			for (idx_t i = 0; i < (*projection)->expressions.size(); i++) {
+				auto &expression = *(*projection)->expressions[i];
+				if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+				    expression.Cast<BoundColumnRefExpression>().Binding() == binding) {
+					binding = ColumnBinding((*projection)->table_index, ProjectionIndex(i));
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				return {};
+			}
+		}
+		auto output = std::find(outputs.begin(), outputs.end(), binding);
+		if (output == outputs.end() || idx_t(output - outputs.begin()) >= output_names.size()) {
+			return {};
+		}
+		keys.push_back(output_names[output - outputs.begin()]);
+	}
+	return keys;
+}
+
 static bool HasOuterProjectionOverDistinct(const CreateMVPlanFacts &facts) {
 	auto spine = DistinctSpine(facts);
 	return !spine.projections.empty() && spine.bottom && spine.bottom->type == LogicalOperatorType::LOGICAL_DISTINCT;
@@ -254,7 +295,9 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 	model.union_distinct_over_agg =
 	    has_union_over_agg && (analysis.found_union_distinct || (analysis.found_distinct && model.distinct_at_top));
 
-	if (model.union_distinct_over_agg) {
+	if (analysis.found_distinct_on) {
+		model.group_columns = DistinctOnGroupColumns(facts, output_names);
+	} else if (model.union_distinct_over_agg) {
 		model.group_columns = DeriveGroupColumnNames(facts, group_index, group_count, output_names);
 	} else if (analysis.found_union_distinct && !analysis.found_aggregation) {
 		AddVisibleGroupNames(model.group_columns, output_names);
@@ -408,6 +451,8 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		model.type = RefreshType::FULL_REFRESH;
 	} else if (analysis.found_window) {
 		model.type = RefreshType::WINDOW_PARTITION;
+	} else if (analysis.found_distinct_on && !model.group_columns.empty()) {
+		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_grouping_sets) {
 		model.type = model.group_columns.empty() ? RefreshType::FULL_REFRESH : RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_semi_anti_join && analysis.found_aggregation) {
@@ -472,6 +517,10 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 
 static void SelectGroupRecomputeAffectedMode(DeltaViewModel &model, const DeltaViewModelInput &input) {
 	if (model.type != RefreshType::GROUP_RECOMPUTE) {
+		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA;
+		return;
+	}
+	if (input.facts && input.facts->analysis.found_distinct_on) {
 		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA;
 		return;
 	}

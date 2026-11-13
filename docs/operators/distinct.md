@@ -96,6 +96,26 @@ CREATE MATERIALIZED VIEW distinct_pairs AS
 --             FROM sales GROUP BY region, product
 ```
 
+## DISTINCT ON
+
+`DISTINCT ON (key)` keeps one candidate per key using its `ORDER BY`, including
+explicit NULL ordering and tie-breakers:
+
+```sql
+CREATE MATERIALIZED VIEW latest_sale AS
+    SELECT DISTINCT ON (product) product, sold_at, amount
+    FROM sales
+    ORDER BY product, sold_at DESC, sale_id DESC;
+```
+
+OpenIVM preserves this winner selection and uses affected-group maintenance
+(`GROUP_RECOMPUTE`). A refresh finds keys touched by source changes, then replaces
+the winners for those keys. Deleting a winner exposes the next candidate. Keys
+omitted from the visible output are retained as hidden maintenance columns;
+computed and multi-column keys use the same path. Source-delta discovery runs
+before winner selection and any predicate on the winner, so a newly rejected
+winner still removes the old visible row. Unchanged keys remain in storage.
+
 ## Limitations
 
 - `DISTINCT` adds a hidden column to the MV table. This is invisible to `SELECT *` but present in the physical storage.

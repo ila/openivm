@@ -1200,7 +1200,7 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs, const string &catalog_prefix,
                              bool emit_cascade_delta, GroupRecomputeAffectedMode affected_mode,
-                             const string &additional_affected_groups) {
+                             const string &additional_affected_groups, const string &affected_query_sql) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 
 	// No GROUP BY columns or no source deltas registered → can't scope; fall back to full.
@@ -1214,7 +1214,7 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 
 	string affected_temp_table = SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
 	string recompute_query = view_query_sql;
-	if (affected_mode != GroupRecomputeAffectedMode::DIRECT_SOURCE_KEYS &&
+	if (affected_query_sql.empty() && affected_mode != GroupRecomputeAffectedMode::DIRECT_SOURCE_KEYS &&
 	    ShouldUseCurrentDiffGroupRecompute(view_query_sql, delta_table_specs)) {
 		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected "
 		                    "keys for large affected query\n");
@@ -1227,7 +1227,7 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns, catalog_prefix,
 		                                         emit_cascade_delta);
 	}
-	string affected_view_query_sql = view_query_sql;
+	string affected_view_query_sql = affected_query_sql.empty() ? view_query_sql : affected_query_sql;
 	if (affected_mode == GroupRecomputeAffectedMode::SOURCE_DELTA_RELAX_AGGREGATE_FILTER &&
 	    !TryBuildGroupRecomputeAffectedQuery(view_query_sql, affected_view_query_sql)) {
 		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected "
@@ -1293,6 +1293,20 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 		}
 
 		for (idx_t occurrence = 0; occurrence < filtered_variants.size(); occurrence++) {
+			if (!affected_query_sql.empty()) {
+				// Both joined rows may have been deleted in the same batch. Remaining
+				// occurrences need current rows plus both delta images to recover old keys.
+				for (const auto &other : delta_table_specs) {
+					string source_ref = SqlUtils::FindTableReference(filtered_variants[occurrence], other.source_sql);
+					if (source_ref.empty()) {
+						continue;
+					}
+					string candidates = "(SELECT * FROM " + source_ref + " UNION ALL SELECT * FROM " +
+					                    BuildGroupRecomputeDeltaRowsSQL(other) + ")";
+					filtered_variants[occurrence] =
+					    SqlUtils::ReplaceTableReferences(filtered_variants[occurrence], source_ref, candidates);
+				}
+			}
 			if (!affected_subquery.empty()) {
 				affected_subquery += "\n  UNION\n  ";
 			} else {

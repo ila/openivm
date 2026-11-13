@@ -325,36 +325,40 @@ static void PreserveTopLevelOutputAliases(SelectStatement &stmt, const vector<st
 static bool RewriteStoredViewQuery(ClientContext &context, Connection &con, RefreshMetadata &metadata,
                                    const string &view_name, const string &table_name, const string &old_name,
                                    const string &new_name, bool persist) {
-	string sql = metadata.GetViewQuery(view_name);
-	if (sql.empty()) {
-		return false;
-	}
-	auto parser = Parser::GetBuiltinParser();
-	parser.ParseQuery(sql);
-	if (parser.statements.empty() || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
-		throw CatalogException("Cannot rewrite materialized view '" + view_name +
-		                       "' after column rename: stored query is not a SELECT");
-	}
-	auto &stmt = parser.statements[0]->Cast<SelectStatement>();
-	bool changed = RewriteQueryNodeScoped(*stmt.node, table_name, old_name, new_name, unordered_set<string>());
-	if (!changed) {
-		return false;
-	}
-	if (!persist) {
+	auto rewrite = [&](const string &column, const string &sql) {
+		if (sql.empty()) {
+			return false;
+		}
+		auto parser = Parser::GetBuiltinParser();
+		parser.ParseQuery(sql);
+		if (parser.statements.empty() || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+			throw CatalogException("Cannot rewrite materialized view '" + view_name +
+			                       "' after column rename: stored query is not a SELECT");
+		}
+		auto &stmt = parser.statements[0]->Cast<SelectStatement>();
+		bool changed = RewriteQueryNodeScoped(*stmt.node, table_name, old_name, new_name, unordered_set<string>());
+		if (!changed) {
+			return false;
+		}
+		if (!persist) {
+			return true;
+		}
+		auto internal_location = metadata.GetInternalLocation(view_name);
+		auto &data = Catalog::GetEntry<TableCatalogEntry>(
+		    context,
+		    QualifiedName(Identifier(internal_location.catalog_name), Identifier(internal_location.schema_name),
+		                  Identifier(IncrementalTableNames::DataTableName(view_name))));
+		vector<string> output_columns;
+		for (auto &column : data.GetColumns().Physical()) {
+			output_columns.push_back(column.Name().GetIdentifierName());
+		}
+		PreserveTopLevelOutputAliases(stmt, output_columns);
+		string rewritten = stmt.ToString();
+		UpdateViewMetadataValue(con, view_name, column, rewritten);
 		return true;
-	}
-	auto internal_location = metadata.GetInternalLocation(view_name);
-	auto &data = Catalog::GetEntry<TableCatalogEntry>(
-	    context, QualifiedName(Identifier(internal_location.catalog_name), Identifier(internal_location.schema_name),
-	                           Identifier(IncrementalTableNames::DataTableName(view_name))));
-	vector<string> output_columns;
-	for (auto &column : data.GetColumns().Physical()) {
-		output_columns.push_back(column.Name().GetIdentifierName());
-	}
-	PreserveTopLevelOutputAliases(stmt, output_columns);
-	string rewritten = stmt.ToString();
-	UpdateViewMetadataValue(con, view_name, "sql_string", rewritten);
-	return true;
+	};
+	bool changed = rewrite("sql_string", metadata.GetViewQuery(view_name));
+	return rewrite("group_recompute_affected_query", metadata.GetGroupRecomputeAffectedQuery(view_name)) || changed;
 }
 
 static bool AuxSourceMatches(const string &source, const string &table_name) {

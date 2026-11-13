@@ -1335,3 +1335,308 @@ SELECT COUNT(*) FROM ((SELECT * FROM distinct_switch_child EXCEPT ALL SELECT grp
 
 statement ok
 SET openivm_distinct_aux_state=false;
+
+# Issue #155: preserve DISTINCT ON winner selection and repair only affected keys.
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+CREATE TABLE distinct_on_source(k INT,region VARCHAR,id INT,v INT);
+
+statement ok
+INSERT INTO distinct_on_source VALUES(1,'a',1,10),(1,'a',2,20),(1,'b',3,NULL),(1,'b',4,15),(2,'a',5,-3),(2,'a',6,7),(NULL,'a',7,4),(NULL,'a',8,9),(3,NULL,9,5),(3,NULL,10,NULL),(4,'d',11,6),(4,'d',11,6),(5,'x',12,8);
+
+statement ok
+CREATE TABLE distinct_on_tags(region VARCHAR,label VARCHAR);
+
+statement ok
+INSERT INTO distinct_on_tags VALUES('a','one'),('b','two'),('d','four'),('x','gone');
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_original AS
+SELECT DISTINCT ON(k) k,v FROM distinct_on_source ORDER BY k,v DESC;
+
+statement ok
+CREATE VIEW distinct_on_original_expected AS
+SELECT DISTINCT ON(k) k,v FROM distinct_on_source ORDER BY k,v DESC;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_ordered AS
+SELECT DISTINCT ON(k) k,v,id FROM distinct_on_source ORDER BY k,v DESC NULLS LAST,id;
+
+statement ok
+CREATE VIEW distinct_on_ordered_expected AS
+SELECT DISTINCT ON(k) k,v,id FROM distinct_on_source ORDER BY k,v DESC NULLS LAST,id;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_multi AS
+SELECT DISTINCT ON(k,region) k,region,id,v FROM distinct_on_source ORDER BY k NULLS FIRST,region NULLS LAST,v ASC NULLS FIRST,id DESC;
+
+statement ok
+CREATE VIEW distinct_on_multi_expected AS
+SELECT DISTINCT ON(k,region) k,region,id,v FROM distinct_on_source ORDER BY k NULLS FIRST,region NULLS LAST,v ASC NULLS FIRST,id DESC;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_hidden_key AS
+SELECT DISTINCT ON(k) v,id FROM distinct_on_source ORDER BY k,v DESC,id;
+
+statement ok
+CREATE VIEW distinct_on_hidden_key_expected AS
+SELECT DISTINCT ON(k) v,id FROM distinct_on_source ORDER BY k,v DESC,id;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_computed AS
+SELECT DISTINCT ON(k%2) k%2 bucket,v,id FROM distinct_on_source ORDER BY k%2,v DESC,id;
+
+statement ok
+CREATE VIEW distinct_on_computed_expected AS
+SELECT DISTINCT ON(k%2) k%2 bucket,v,id FROM distinct_on_source ORDER BY k%2,v DESC,id;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_limited AS
+SELECT DISTINCT ON(k) k,v,id FROM distinct_on_source ORDER BY v DESC,k NULLS LAST,id LIMIT 2 OFFSET 1;
+
+statement ok
+CREATE VIEW distinct_on_limited_expected AS
+SELECT DISTINCT ON(k) k,v,id FROM distinct_on_source ORDER BY v DESC,k NULLS LAST,id LIMIT 2 OFFSET 1;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_cte AS
+WITH d AS (SELECT DISTINCT ON(k) k,v,id FROM distinct_on_source ORDER BY k,v DESC,id) SELECT id,v,k FROM d WHERE v IS NOT NULL;
+
+statement ok
+CREATE VIEW distinct_on_cte_expected AS
+WITH d AS (SELECT DISTINCT ON(k) k,v,id FROM distinct_on_source ORDER BY k,v DESC,id) SELECT id,v,k FROM d WHERE v IS NOT NULL;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_hidden_computed AS
+SELECT DISTINCT ON(k%2) v,id FROM distinct_on_source ORDER BY k%2,v DESC,id;
+
+statement ok
+CREATE VIEW distinct_on_hidden_computed_expected AS
+SELECT DISTINCT ON(k%2) v,id FROM distinct_on_source ORDER BY k%2,v DESC,id;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_postfilter AS
+SELECT k,id,v FROM (SELECT DISTINCT ON(k) k,id,v FROM distinct_on_source ORDER BY k,v DESC,id) d WHERE id%2=0;
+
+statement ok
+CREATE VIEW distinct_on_postfilter_expected AS
+SELECT k,id,v FROM (SELECT DISTINCT ON(k) k,id,v FROM distinct_on_source ORDER BY k,v DESC,id) d WHERE id%2=0;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_repeated_keys AS
+SELECT DISTINCT ON(k,k,k) k,v FROM distinct_on_source ORDER BY k,v DESC;
+
+statement ok
+CREATE VIEW distinct_on_repeated_keys_expected AS
+SELECT DISTINCT ON(k,k,k) k,v FROM distinct_on_source ORDER BY k,v DESC;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_join AS
+SELECT DISTINCT ON(a.k) a.k,a.id,a.v,b.label FROM distinct_on_source a JOIN distinct_on_tags b ON a.region=b.region ORDER BY a.k,a.v DESC,a.id,b.label;
+
+statement ok
+CREATE VIEW distinct_on_join_expected AS
+SELECT DISTINCT ON(a.k) a.k,a.id,a.v,b.label FROM distinct_on_source a JOIN distinct_on_tags b ON a.region=b.region ORDER BY a.k,a.v DESC,a.id,b.label;
+
+query I
+SELECT count(*) FROM openivm_views
+WHERE view_sql_name LIKE 'distinct_on_%'
+  AND (type <> 6 OR group_recompute_affected_mode <> 'source_delta'
+       OR group_recompute_affected_query IS NULL);
+----
+0
+
+foreach variant original ordered multi hidden_key computed limited cte hidden_computed postfilter repeated_keys join
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_on_{variant} EXCEPT ALL SELECT * FROM distinct_on_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_on_{variant}_expected EXCEPT ALL SELECT * FROM distinct_on_{variant})
+);
+----
+0
+
+endloop
+
+# Confirm hidden/computed keys keep scoped incremental programs.
+foreach variant original ordered multi hidden_key computed limited cte hidden_computed postfilter repeated_keys join
+
+query I
+SELECT count(*) > 0 FROM openivm_compile_with_facts(
+  'distinct_on_{variant}', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind = 'data' AND refresh_type = 6 AND contains(sql, 'openivm_affected_');
+----
+true
+
+query I
+SELECT count(*) FROM openivm_compile_with_facts(
+  'distinct_on_{variant}', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind = 'data' AND sql LIKE 'DELETE FROM%openivm_data_%' AND NOT contains(sql, 'WHERE');
+----
+0
+
+endloop
+
+# Winner deletion, key moves, transient candidates, and both join inputs changing
+# happen together before one refresh. The post-winner filter rejects the new key-2 winner.
+
+statement ok
+INSERT INTO distinct_on_source VALUES(1,'a',13,99),(2,'a',14,8),(6,'a',15,3),(7,'x',16,88),(2,'a',17,99);
+
+statement ok
+UPDATE distinct_on_source SET v=-9 WHERE id=13;
+
+statement ok
+UPDATE distinct_on_source SET k=8 WHERE id=5;
+
+statement ok
+UPDATE distinct_on_source SET v=5 WHERE id=10;
+
+statement ok
+DELETE FROM distinct_on_source WHERE id IN(2,6) OR k IN(5,7);
+
+statement ok
+INSERT INTO distinct_on_tags VALUES('b','aaa');
+
+statement ok
+DELETE FROM distinct_on_tags WHERE region='x';
+
+foreach variant original ordered multi hidden_key computed limited cte hidden_computed postfilter repeated_keys join
+
+statement ok
+PRAGMA refresh('distinct_on_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_on_{variant} EXCEPT ALL SELECT * FROM distinct_on_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_on_{variant}_expected EXCEPT ALL SELECT * FROM distinct_on_{variant})
+);
+----
+0
+
+endloop
+
+# Full refresh keeps the same winners; subsequent incremental maintenance resumes.
+
+statement ok
+SET openivm_refresh_mode='full';
+
+statement ok
+INSERT INTO distinct_on_source VALUES (1,'a',18,200),(NULL,'a',19,100),(9,'b',20,50);
+
+statement ok
+UPDATE distinct_on_source SET v=201 WHERE id=18;
+
+statement ok
+DELETE FROM distinct_on_source WHERE id=19;
+
+foreach variant original ordered multi hidden_key computed limited cte hidden_computed postfilter repeated_keys join
+
+statement ok
+PRAGMA refresh('distinct_on_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_on_{variant} EXCEPT ALL SELECT * FROM distinct_on_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_on_{variant}_expected EXCEPT ALL SELECT * FROM distinct_on_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+DELETE FROM distinct_on_source WHERE id IN (17,18);
+
+statement ok
+UPDATE distinct_on_source SET k=10,v=300 WHERE id=20;
+
+statement ok
+INSERT INTO distinct_on_source VALUES (1,'a',21,400),(NULL,'a',22,500);
+
+statement ok
+UPDATE distinct_on_source SET v=-400 WHERE id=21;
+
+foreach variant original ordered multi hidden_key computed limited cte hidden_computed postfilter repeated_keys join
+
+statement ok
+PRAGMA refresh('distinct_on_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_on_{variant} EXCEPT ALL SELECT * FROM distinct_on_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_on_{variant}_expected EXCEPT ALL SELECT * FROM distinct_on_{variant})
+);
+----
+0
+
+endloop
+
+statement ok
+DELETE FROM distinct_on_source;
+
+statement ok
+DELETE FROM distinct_on_tags;
+
+foreach variant original ordered multi hidden_key computed limited cte hidden_computed postfilter repeated_keys join
+
+statement ok
+PRAGMA refresh('distinct_on_{variant}');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_on_{variant} EXCEPT ALL SELECT * FROM distinct_on_{variant}_expected)
+  UNION ALL
+  (SELECT * FROM distinct_on_{variant}_expected EXCEPT ALL SELECT * FROM distinct_on_{variant})
+);
+----
+0
+
+endloop
+
+# Renaming a source key must rewrite candidate discovery as well as the winner query.
+
+statement ok
+CREATE TABLE distinct_on_rename_source(k INT,id INT,v INT);
+
+statement ok
+INSERT INTO distinct_on_rename_source VALUES (1,1,10),(1,2,20),(2,3,30);
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_on_rename AS SELECT DISTINCT ON(k%2) id,v FROM distinct_on_rename_source ORDER BY k%2,v DESC,id;
+
+statement ok
+ALTER TABLE distinct_on_rename_source RENAME COLUMN k TO renamed_k;
+
+statement ok
+INSERT INTO distinct_on_rename_source VALUES (1,4,100),(NULL,5,200);
+
+statement ok
+UPDATE distinct_on_rename_source SET renamed_k=4 WHERE id=1;
+
+statement ok
+DELETE FROM distinct_on_rename_source WHERE id=2;
+
+statement ok
+PRAGMA refresh('distinct_on_rename');
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM distinct_on_rename EXCEPT ALL
+   (SELECT DISTINCT ON(renamed_k%2) id,v FROM distinct_on_rename_source ORDER BY renamed_k%2,v DESC,id))
+  UNION ALL
+  ((SELECT DISTINCT ON(renamed_k%2) id,v FROM distinct_on_rename_source ORDER BY renamed_k%2,v DESC,id)
+   EXCEPT ALL SELECT * FROM distinct_on_rename)
+);
+----
+0
