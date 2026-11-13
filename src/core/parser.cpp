@@ -664,13 +664,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		view_query = original_view_query;
 		lpts_fallback = true;
 	}
-	if (analysis.found_retained_aggregate_filter) {
-		view_query = original_view_query;
-		lpts_fallback = true;
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Native aggregate FILTER requires original SQL for "
-		                    "group-recompute: %s\n",
-		                    view_query.c_str());
-	}
 	auto classification_start = create_profile_now();
 	bool has_full_outer_aggregate = analysis.found_full_outer && analysis.found_aggregation;
 	bool has_cte_self_join = facts.has_repeated_cte_ref_under_join;

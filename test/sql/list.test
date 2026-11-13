@@ -173,7 +173,8 @@ SELECT COUNT(*) FROM (
 ----
 0
 
-# Retained ORDER BY/LIMIT fallback must use current-vs-stored affected keys.
+# The normalized storage query retains all groups; ORDER BY/LIMIT belongs to
+# the public view, so source-delta keys suffice to maintain the stored groups.
 # The unchanged second-place group has to enter the LIMIT after the old top group
 # loses rows, even though that second-place group has no delta.
 statement ok
@@ -204,7 +205,25 @@ SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61
 query T
 SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c6973745f66696c7465725f746f706b_';
 ----
-current_diff
+source_delta_relax_aggregate_filter
+
+statement ok
+CREATE VIEW list_filter_topk_all AS
+    SELECT grp,
+           LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked,
+           COUNT(*) AS cnt
+    FROM list_filter_topk_items GROUP BY grp;
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT grp, well_stocked, cnt FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f6c6973745f66696c7465725f746f706b_
+     EXCEPT ALL SELECT * FROM list_filter_topk_all)
+    UNION ALL
+    (SELECT * FROM list_filter_topk_all EXCEPT ALL
+     SELECT grp, well_stocked, cnt FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f6c6973745f66696c7465725f746f706b_)
+);
+----
+0
 
 query I
 WITH expected AS (
@@ -254,6 +273,17 @@ statement ok
 PRAGMA refresh('mv_list_filter_topk');
 
 query I
+SELECT COUNT(*) FROM (
+    (SELECT grp, well_stocked, cnt FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f6c6973745f66696c7465725f746f706b_
+     EXCEPT ALL SELECT * FROM list_filter_topk_all)
+    UNION ALL
+    (SELECT * FROM list_filter_topk_all EXCEPT ALL
+     SELECT grp, well_stocked, cnt FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f6c6973745f66696c7465725f746f706b_)
+);
+----
+0
+
+query I
 WITH expected AS (
     SELECT grp,
            LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked,
@@ -291,9 +321,8 @@ SELECT COUNT(*) FROM (
 ----
 0
 
-# Fallback top-k views store the already-limited original query in the data table,
-# but the user-facing view still needs ORDER BY. This catches stale physical order
-# after only the second group changes.
+# The user-facing top-k view must reapply ORDER BY after refresh. This catches
+# stale physical order after only the second group changes.
 statement ok
 CREATE TABLE list_filter_order_items (grp INT, item INT, qty INT);
 
