@@ -220,7 +220,8 @@ static bool HasUnsupportedConstruct(const DeltaViewModel &model, const CreateMVP
 	       analysis.found_non_foldable_unnest || analysis.found_unsupported_aggregate ||
 	       analysis.found_unsupported_filtered_aggregate || analysis.found_unsupported_join_type ||
 	       analysis.found_unsupported_order_by || analysis.found_unsupported_operator ||
-	       (analysis.found_grouping_sets && no_group_keys) || (analysis.found_filtered_list && no_group_keys) ||
+	       (analysis.found_grouping_sets && no_group_keys) ||
+	       (analysis.found_retained_aggregate_filter && no_group_keys && !analysis.found_minmax) ||
 	       (analysis.found_semi_anti_join && analysis.found_aggregation && no_group_keys) ||
 	       (analysis.found_semi_anti_join && !analysis.found_aggregation && !input.semi_anti_aux_candidate) ||
 	       !analysis.incremental_compatible;
@@ -414,10 +415,12 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		model.type = model.group_columns.empty() ? RefreshType::FULL_REFRESH : RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_semi_anti_join && !analysis.found_aggregation) {
 		model.type = semi_anti_stateful ? RefreshType::SEMI_ANTI_RECOMPUTE : RefreshType::FULL_REFRESH;
-	} else if (analysis.found_filtered_list && !model.group_columns.empty()) {
+	} else if (analysis.found_retained_aggregate_filter && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
-	} else if (analysis.found_filtered_list) {
-		model.type = RefreshType::FULL_REFRESH;
+	} else if (analysis.found_retained_aggregate_filter) {
+		// Scalar MIN/MAX and ARG_MIN/ARG_MAX already have a native recompute path
+		// in CompileSimpleAggregates; retaining FILTER does not change that path.
+		model.type = analysis.found_minmax ? RefreshType::SIMPLE_AGGREGATE : RefreshType::FULL_REFRESH;
 	} else if (input.has_computed_sum_aggregate_projection) {
 		model.type = model.group_columns.empty() ? RefreshType::FULL_REFRESH : RefreshType::GROUP_RECOMPUTE;
 	} else if (input.stored_query_retains_aggregate_filter && analysis.found_aggregation &&

@@ -112,6 +112,20 @@ static const char *SumSqPrefix(const string &func_name) {
 	}
 	return openivm::SUM_SQ_COL_PREFIX; // stddev, stddev_samp
 }
+
+static bool CanMaskAggregateFilter(const BoundAggregateExpression &aggregate) {
+	const auto &name = aggregate.Function().GetName().GetIdentifierName();
+	if (aggregate.GetChildren().empty()) {
+		return name == "count_star";
+	}
+	if (aggregate.GetChildren().size() != 1) {
+		return false;
+	}
+	return name == "count" || name == "sum" || name == "min" || name == "max" || name == "avg" ||
+	       IsStddevOrVariance(name) || name == "bool_and" || name == "bool_or" || name == "bit_and" ||
+	       name == "bit_or" || name == "bit_xor" || name == "product" || name == "any_value";
+}
+
 void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
 	for (auto &child : plan->children) {
 		RewriteAggregateFilters(context, child);
@@ -140,10 +154,9 @@ void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator>
 		if (!bound.GetFilter()) {
 			continue;
 		}
-		// NULL masking only removes rows for aggregates that ignore NULL arguments.
-		const auto &name = bound.Function().GetName().GetIdentifierName();
-		if (name == "list" || name == "first" || name == "last" || name == "arg_min_null" || name == "arg_max_null") {
-			OPENIVM_DEBUG_PRINT("[PlanRewrite] Preserved FILTER for NULL-retaining aggregate %s\n", name.c_str());
+		if (!CanMaskAggregateFilter(bound)) {
+			OPENIVM_DEBUG_PRINT("[PlanRewrite] Preserved native FILTER for aggregate %s\n",
+			                    bound.Function().GetName().GetIdentifierName().c_str());
 			continue;
 		}
 		auto filter_expr = std::move(bound.GetFilterMutable()); // nulls bound.filter
@@ -293,8 +306,10 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 	bool has_derived = false;
 	for (auto &expr : agg.expressions) {
 		if (expr->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE) {
-			auto &name = expr->Cast<BoundAggregateExpression>().Function().GetName().GetIdentifierName();
-			if (name == "avg" || IsStddevOrVariance(name)) {
+			auto &bound_agg = expr->Cast<BoundAggregateExpression>();
+			auto &name = bound_agg.Function().GetName().GetIdentifierName();
+			// Keep DISTINCT aggregates intact for the existing affected-group recompute path.
+			if ((name == "avg" || IsStddevOrVariance(name)) && !bound_agg.IsDistinct()) {
 				has_derived = true;
 				break;
 			}
@@ -337,7 +352,7 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 
 		bool is_avg = (bound.Function().GetName().GetIdentifierName() == "avg");
 		bool is_stddev = IsStddevOrVariance(bound.Function().GetName().GetIdentifierName());
-		if (!is_avg && !is_stddev) {
+		if ((!is_avg && !is_stddev) || bound.IsDistinct()) {
 			nondecomposed_remap[i] = new_exprs.size();
 			new_exprs.push_back(std::move(expr));
 			continue;

@@ -5066,3 +5066,242 @@ SELECT * FROM null_filter_group_mv EXCEPT ALL SELECT * FROM null_filter_group_ex
 query IIIIIII
 SELECT * FROM null_filter_group_expected EXCEPT ALL SELECT * FROM null_filter_group_mv;
 ----
+
+# PR #159 review: unrecognized aggregate signatures must retain their FILTER.
+# The *_nulls_last variants retain NULL arguments, including their N variants.
+statement ok
+CREATE TABLE filter_safe_source(grp INT, id INT, v INT, p BOOLEAN);
+
+statement ok
+INSERT INTO filter_safe_source VALUES
+    (1, 1, 100, false), (1, 2, NULL, false), (1, 3, 5, true), (1, 4, 9, true),
+    (2, 1, NULL, true), (2, 2, 7, true), (2, NULL, 11, true), (3, 1, 8, NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW nulls_last_filter_mv AS
+SELECT ARG_MIN_NULLS_LAST(v, id) FILTER (WHERE p) AS a,
+       ARG_MAX_NULLS_LAST(v, -id) FILTER (WHERE p) AS b,
+       ARG_MIN_NULLS_LAST(v, id, 2) FILTER (WHERE p) AS a_n,
+       ARG_MAX_NULLS_LAST(v, -id, 2) FILTER (WHERE p) AS b_n
+FROM filter_safe_source WHERE grp = 1;
+
+statement ok
+CREATE VIEW nulls_last_filter_expected AS
+SELECT ARG_MIN_NULLS_LAST(v, id) FILTER (WHERE p) AS a,
+       ARG_MAX_NULLS_LAST(v, -id) FILTER (WHERE p) AS b,
+       ARG_MIN_NULLS_LAST(v, id, 2) FILTER (WHERE p) AS a_n,
+       ARG_MAX_NULLS_LAST(v, -id, 2) FILTER (WHERE p) AS b_n
+FROM filter_safe_source WHERE grp = 1;
+
+query II
+SELECT a, b FROM nulls_last_filter_mv;
+----
+5	5
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM nulls_last_filter_mv EXCEPT ALL SELECT * FROM nulls_last_filter_expected)
+    UNION ALL
+    (SELECT * FROM nulls_last_filter_expected EXCEPT ALL SELECT * FROM nulls_last_filter_mv)
+);
+----
+0
+
+# Supported multi-argument aggregates keep their native FILTER and use the same
+# affected-group maintenance already used for filtered LIST aggregates.
+statement ok
+CREATE MATERIALIZED VIEW native_filter_mv AS
+SELECT grp,
+       ARG_MIN(v, id) FILTER (WHERE p) AS a, ARG_MAX(v, id) FILTER (WHERE p) AS b,
+       ARG_MIN(v, id, 2) FILTER (WHERE p) AS a_n, ARG_MAX(v, id, 2) FILTER (WHERE p) AS b_n,
+       MIN(v, 2) FILTER (WHERE p) AS lo_n, MAX(v, 2) FILTER (WHERE p) AS hi_n,
+       SUM(v) FILTER (WHERE p) AS total, COUNT(*) FILTER (WHERE p) AS n
+FROM filter_safe_source GROUP BY grp;
+
+statement ok
+CREATE VIEW native_filter_expected AS
+SELECT grp,
+       ARG_MIN(v, id) FILTER (WHERE p) AS a, ARG_MAX(v, id) FILTER (WHERE p) AS b,
+       ARG_MIN(v, id, 2) FILTER (WHERE p) AS a_n, ARG_MAX(v, id, 2) FILTER (WHERE p) AS b_n,
+       MIN(v, 2) FILTER (WHERE p) AS lo_n, MAX(v, 2) FILTER (WHERE p) AS hi_n,
+       SUM(v) FILTER (WHERE p) AS total, COUNT(*) FILTER (WHERE p) AS n
+FROM filter_safe_source GROUP BY grp;
+
+statement ok
+CREATE MATERIALIZED VIEW native_filter_scalar_mv AS
+SELECT ARG_MIN(v, grp * 100 + id) FILTER (WHERE p) AS a,
+       ARG_MAX(v, grp * 100 + id) FILTER (WHERE p) AS b,
+       LIST(v ORDER BY grp, id, v) AS all_values
+FROM filter_safe_source;
+
+statement ok
+CREATE VIEW native_filter_scalar_expected AS
+SELECT ARG_MIN(v, grp * 100 + id) FILTER (WHERE p) AS a,
+       ARG_MAX(v, grp * 100 + id) FILTER (WHERE p) AS b,
+       LIST(v ORDER BY grp, id, v) AS all_values
+FROM filter_safe_source;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'native_filter_scalar_mv';
+----
+1
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM native_filter_scalar_mv EXCEPT ALL SELECT * FROM native_filter_scalar_expected)
+    UNION ALL
+    (SELECT * FROM native_filter_scalar_expected EXCEPT ALL SELECT * FROM native_filter_scalar_mv)
+);
+----
+0
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'native_filter_mv';
+----
+6
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM native_filter_mv EXCEPT ALL SELECT * FROM native_filter_expected)
+    UNION ALL
+    (SELECT * FROM native_filter_expected EXCEPT ALL SELECT * FROM native_filter_mv)
+);
+----
+0
+
+# An insert-only refresh must also repair the selected N values correctly.
+statement ok
+INSERT INTO filter_safe_source VALUES (1, 5, 6, true), (2, 3, 6, true), (4, 1, 9, true), (4, 2, 10, false);
+
+statement ok
+PRAGMA refresh('nulls_last_filter_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM nulls_last_filter_mv EXCEPT ALL SELECT * FROM nulls_last_filter_expected)
+    UNION ALL
+    (SELECT * FROM nulls_last_filter_expected EXCEPT ALL SELECT * FROM nulls_last_filter_mv)
+);
+----
+0
+
+statement ok
+PRAGMA refresh('native_filter_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM native_filter_mv EXCEPT ALL SELECT * FROM native_filter_expected)
+    UNION ALL
+    (SELECT * FROM native_filter_expected EXCEPT ALL SELECT * FROM native_filter_mv)
+);
+----
+0
+
+# Consolidate conflicting inserts, updates and deletes before refreshing.
+statement ok
+INSERT INTO filter_safe_source VALUES (1, 6, 3, true), (1, 7, -10, false), (2, 4, 9, true), (5, 1, 20, true);
+
+statement ok
+UPDATE filter_safe_source SET p = false WHERE grp = 1 AND id = 3;
+
+statement ok
+UPDATE filter_safe_source SET v = 4, p = true WHERE grp = 1 AND id = 7;
+
+statement ok
+UPDATE filter_safe_source SET v = 21 WHERE grp = 5;
+
+statement ok
+UPDATE filter_safe_source SET v = 2 WHERE grp = 2 AND id = 1;
+
+statement ok
+DELETE FROM filter_safe_source WHERE (grp = 1 AND id = 6) OR (grp = 2 AND id = 2) OR grp = 5;
+
+statement ok
+PRAGMA refresh('native_filter_scalar_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM native_filter_scalar_mv EXCEPT ALL SELECT * FROM native_filter_scalar_expected)
+    UNION ALL
+    (SELECT * FROM native_filter_scalar_expected EXCEPT ALL SELECT * FROM native_filter_scalar_mv)
+);
+----
+0
+
+statement ok
+PRAGMA refresh('nulls_last_filter_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM nulls_last_filter_mv EXCEPT ALL SELECT * FROM nulls_last_filter_expected)
+    UNION ALL
+    (SELECT * FROM nulls_last_filter_expected EXCEPT ALL SELECT * FROM nulls_last_filter_mv)
+);
+----
+0
+
+statement ok
+PRAGMA refresh('native_filter_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM native_filter_mv EXCEPT ALL SELECT * FROM native_filter_expected)
+    UNION ALL
+    (SELECT * FROM native_filter_expected EXCEPT ALL SELECT * FROM native_filter_mv)
+);
+----
+0
+
+statement ok
+DELETE FROM filter_safe_source WHERE p;
+
+statement ok
+PRAGMA refresh('nulls_last_filter_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM nulls_last_filter_mv EXCEPT ALL SELECT * FROM nulls_last_filter_expected)
+    UNION ALL
+    (SELECT * FROM nulls_last_filter_expected EXCEPT ALL SELECT * FROM nulls_last_filter_mv)
+);
+----
+0
+
+statement ok
+PRAGMA refresh('native_filter_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM native_filter_mv EXCEPT ALL SELECT * FROM native_filter_expected)
+    UNION ALL
+    (SELECT * FROM native_filter_expected EXCEPT ALL SELECT * FROM native_filter_mv)
+);
+----
+0
+
+statement ok
+DELETE FROM filter_safe_source;
+
+statement ok
+PRAGMA refresh('nulls_last_filter_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM nulls_last_filter_mv EXCEPT ALL SELECT * FROM nulls_last_filter_expected)
+    UNION ALL
+    (SELECT * FROM nulls_last_filter_expected EXCEPT ALL SELECT * FROM nulls_last_filter_mv)
+);
+----
+0
+
+statement ok
+PRAGMA refresh('native_filter_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM native_filter_mv EXCEPT ALL SELECT * FROM native_filter_expected)
+    UNION ALL
+    (SELECT * FROM native_filter_expected EXCEPT ALL SELECT * FROM native_filter_mv)
+);
+----
+0

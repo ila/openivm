@@ -600,9 +600,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	OPENIVM_DEBUG_PRINT("[CREATE MV] View query: %s\n", view_query.c_str());
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Logical plan:\n%s\n", plan->ToString().c_str());
 
-	// Normalize FILTER aggregates in the full plan before analysis so the checker
-	// sees CASE expressions instead of raw FILTER and doesn't set incremental_compatible=false.
-	// (PlanRewrite already rewrote select_plan for the LPTS view_query above.)
+	// Apply the same safe FILTER normalization to the full analysis plan as to
+	// select_plan above. Aggregates that cannot use NULL masking retain native FILTER.
 	auto analysis_start = create_profile_now();
 	if (full_plan_rewrite_needs.aggregate_filters) {
 		RewriteAggregateFilters(context, plan);
@@ -665,10 +664,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		view_query = original_view_query;
 		lpts_fallback = true;
 	}
-	if (analysis.found_filtered_list) {
+	if (analysis.found_retained_aggregate_filter) {
 		view_query = original_view_query;
 		lpts_fallback = true;
-		OPENIVM_DEBUG_PRINT("[CREATE MV] LIST FILTER requires original SQL for "
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Native aggregate FILTER requires original SQL for "
 		                    "group-recompute: %s\n",
 		                    view_query.c_str());
 	}
