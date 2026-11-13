@@ -2188,6 +2188,7 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::Filtered
 	io.Str("output_col", m.output_col);
 	io.Str("op", m.comparison_op);
 	io.Str("threshold", m.threshold_sql);
+	io.Str("filter", m.filter, Presence::OPTIONAL);
 }
 
 template <class IO>

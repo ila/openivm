@@ -172,12 +172,12 @@ string BuildSemiAntiInitialDataSQL(const string &data_table, const string &aux_t
 string CompileFilteredGroupCount(const string &view_name, const string &aux_table, const string &delta_source,
                                  const string &last_update, const string &group_col, const string &sum_col,
                                  const string &source_group_expr, const string &source_sum_expr,
-                                 const string &output_col, const string &comparison_op, const string &threshold_sql,
-                                 const string &catalog_prefix = "");
+                                 const string &filter_sql, const string &output_col, const string &comparison_op,
+                                 const string &threshold_sql, const string &catalog_prefix = "");
 string BuildFilteredGroupCountAuxStateCreateSQL(const string &target_table, const string &source_table,
                                                 const string &group_col, const string &sum_col,
                                                 const string &source_group_expr, const string &source_sum_expr,
-                                                bool replace);
+                                                const string &filter_sql, bool replace);
 
 } // namespace duckdb
 

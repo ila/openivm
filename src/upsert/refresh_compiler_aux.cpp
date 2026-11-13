@@ -1297,20 +1297,21 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 string BuildFilteredGroupCountAuxStateCreateSQL(const string &target_table, const string &source_table,
                                                 const string &group_col, const string &sum_col,
                                                 const string &source_group_expr, const string &source_sum_expr,
-                                                bool replace) {
+                                                const string &filter_sql, bool replace) {
 	string group_q = SqlUtils::QuoteIdentifier(group_col);
 	string sum_q = SqlUtils::QuoteIdentifier(sum_col);
 	string group_expr = source_group_expr.empty() ? group_q : source_group_expr;
 	string sum_expr = source_sum_expr.empty() ? sum_q : source_sum_expr;
+	string filter = filter_sql.empty() ? "" : " WHERE " + filter_sql;
 	return CreateAuxTablePrefix(target_table, replace) + " AS SELECT " + group_expr + " AS " + group_q + ", sum(" +
-	       sum_expr + ") AS openivm_sum FROM " + source_table + " GROUP BY " + group_expr;
+	       sum_expr + ") AS openivm_sum FROM " + source_table + filter + " GROUP BY " + group_expr;
 }
 
 string CompileFilteredGroupCount(const string &view_name, const string &aux_table, const string &delta_source,
                                  const string &last_update, const string &group_col, const string &sum_col,
                                  const string &source_group_expr, const string &source_sum_expr,
-                                 const string &output_col, const string &comparison_op, const string &threshold_sql,
-                                 const string &catalog_prefix) {
+                                 const string &filter_sql, const string &output_col, const string &comparison_op,
+                                 const string &threshold_sql, const string &catalog_prefix) {
 	if (aux_table.empty() || delta_source.empty() || last_update.empty() || group_col.empty() || sum_col.empty() ||
 	    output_col.empty() || comparison_op.empty() || threshold_sql.empty()) {
 		throw InternalException("CompileFilteredGroupCount called with incomplete metadata for view '%s'", view_name);
@@ -1331,12 +1332,13 @@ string CompileFilteredGroupCount(const string &view_name, const string &aux_tabl
 	string old_visible = "CASE WHEN " + old_sum + " " + comparison_op + " " + threshold_sql + " THEN 1 ELSE 0 END";
 	string new_visible = "CASE WHEN " + new_sum + " " + comparison_op + " " + threshold_sql + " THEN 1 ELSE 0 END";
 	string aux_match = SqlUtils::BuildNullSafeMatch(vector<string> {group_col}, "_aux", "d");
+	string filter = filter_sql.empty() ? "" : " AND (" + filter_sql + ")";
 
 	string sql;
 	sql += "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(dsum_table) + " AS\n  SELECT " + source_group +
 	       " AS " + group_q + ", " + dsum_expr + " AS openivm_delta_sum\n  FROM " + delta_q + "\n  WHERE " +
-	       string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP\n  GROUP BY " +
-	       source_group + "\n  HAVING " + dsum_expr + " <> 0;\n\n";
+	       string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP" + filter +
+	       "\n  GROUP BY " + source_group + "\n  HAVING " + dsum_expr + " <> 0;\n\n";
 
 	sql += "WITH openivm_transition AS (\n  SELECT SUM((" + new_visible + ") - (" + old_visible +
 	       ")) AS openivm_delta_count\n  FROM " + SqlUtils::QuoteIdentifier(dsum_table) + " d LEFT JOIN " + aux_q +
@@ -1351,8 +1353,8 @@ string CompileFilteredGroupCount(const string &view_name, const string &aux_tabl
 	sql += "DELETE FROM " + aux_q + " WHERE openivm_sum = 0;\n";
 	sql += "DROP TABLE IF EXISTS " + SqlUtils::QuoteIdentifier(dsum_table) + ";\n";
 
-	OPENIVM_DEBUG_PRINT("[CompileFilteredGroupCount] group=%s, sum=%s, op=%s, aux=%s\n", group_col.c_str(),
-	                    sum_col.c_str(), comparison_op.c_str(), aux_table.c_str());
+	OPENIVM_DEBUG_PRINT("[CompileFilteredGroupCount] group=%s, sum=%s, op=%s, aux=%s, filter=%s\n", group_col.c_str(),
+	                    sum_col.c_str(), comparison_op.c_str(), aux_table.c_str(), filter_sql.c_str());
 	return sql;
 }
 

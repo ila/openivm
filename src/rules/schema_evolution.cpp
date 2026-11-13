@@ -412,6 +412,7 @@ static bool RewriteFilteredGroupCountMetaFields(RefreshMetadata::FilteredGroupCo
 	auto qualifiers = SingleQualifier(meta.source);
 	changed |= SqlUtils::RewriteColumnReferences(meta.source_group_expr, old_name, new_name, qualifiers, true);
 	changed |= SqlUtils::RewriteColumnReferences(meta.source_sum_expr, old_name, new_name, qualifiers, true);
+	changed |= SqlUtils::RewriteColumnReferences(meta.filter, old_name, new_name, qualifiers, true);
 	return changed;
 }
 
