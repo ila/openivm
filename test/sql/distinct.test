@@ -1575,3 +1575,257 @@ SELECT count(*) FROM (
 
 statement ok
 SET openivm_distinct_aux_state=false;
+
+# DISTINCT aux inputs retain group aliases, shared SUM outputs, and constants.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE TABLE aux_projection_source(k INT,v INT,active BOOLEAN);
+
+statement ok
+INSERT INTO aux_projection_source VALUES
+    (1,10,true),(1,NULL,true),(2,5,true),(2,5,true),
+    (NULL,NULL,true),(4,99,false);
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_alias AS SELECT k AS g,SUM(v) total FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE VIEW expected_projected_distinct_alias AS SELECT k AS g,SUM(v) total FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_duplicate AS SELECT k,SUM(v) a,SUM(v) b FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE VIEW expected_projected_distinct_duplicate AS SELECT k,SUM(v) a,SUM(v) b FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_constant AS SELECT k,42 flag,SUM(v) total,'steady' marker,NULL empty_marker FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE VIEW expected_projected_distinct_constant AS SELECT k,42 flag,SUM(v) total,'steady' marker,NULL empty_marker FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_combined AS SELECT k%2 AS g,SUM(v) a,SUM(v) b,42 flag FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k%2;
+
+statement ok
+CREATE VIEW expected_projected_distinct_combined AS SELECT k%2 AS g,SUM(v) a,SUM(v) b,42 flag FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k%2;
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_cte AS WITH d AS (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) SELECT k AS g,SUM(v) total FROM d GROUP BY k;
+
+statement ok
+CREATE VIEW expected_projected_distinct_cte AS WITH d AS (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) SELECT k AS g,SUM(v) total FROM d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_collision AS SELECT k AS v,SUM(v) AS k FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE VIEW expected_projected_distinct_collision AS SELECT k AS v,SUM(v) AS k FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_duplicate_keys AS
+SELECT k AS g,k AS h,SUM(v) total FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE VIEW expected_projected_distinct_duplicate_keys AS
+SELECT k AS g,k AS h,SUM(v) total FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_cast_constant AS
+SELECT k,42 flag,SUM(v)::BIGINT total FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+statement ok
+CREATE VIEW expected_projected_distinct_cast_constant AS
+SELECT k,42 flag,SUM(v)::BIGINT total FROM (SELECT DISTINCT k,v FROM aux_projection_source WHERE active) d GROUP BY k;
+
+foreach kind alias duplicate constant combined cte collision duplicate_keys cast_constant
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='projected_distinct_{kind}';
+----
+8
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM projected_distinct_{kind} EXCEPT ALL SELECT * FROM expected_projected_distinct_{kind})
+    UNION ALL
+    (SELECT * FROM expected_projected_distinct_{kind} EXCEPT ALL SELECT * FROM projected_distinct_{kind})
+);
+----
+0
+
+endloop
+
+# Conflicting writes change membership, predicates, and nullable group keys before refresh.
+statement ok
+INSERT INTO aux_projection_source VALUES(1,8,true),(1,8,true),(2,NULL,true),(3,9,true),(3,9,true),(5,999,true);
+
+statement ok
+UPDATE aux_projection_source SET v=-2 WHERE k=3;
+
+statement ok
+UPDATE aux_projection_source SET active=false WHERE k=1 AND v=8;
+
+statement ok
+UPDATE aux_projection_source SET v=7 WHERE k IS NULL;
+
+statement ok
+DELETE FROM aux_projection_source WHERE k=5 OR (k=1 AND v=10);
+
+statement ok
+DELETE FROM aux_projection_source WHERE rowid IN(SELECT rowid FROM aux_projection_source WHERE k=2 AND v=5 LIMIT 1);
+
+foreach kind alias duplicate constant combined cte collision duplicate_keys cast_constant
+
+statement ok
+PRAGMA refresh('projected_distinct_{kind}');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM projected_distinct_{kind} EXCEPT ALL SELECT * FROM expected_projected_distinct_{kind})
+    UNION ALL
+    (SELECT * FROM expected_projected_distinct_{kind} EXCEPT ALL SELECT * FROM projected_distinct_{kind})
+);
+----
+0
+
+endloop
+
+# Keep NULL-only groups, then exercise forced refresh and aux-state rebuilding.
+statement ok
+DELETE FROM aux_projection_source WHERE active AND v IS NOT NULL;
+
+statement ok
+SET openivm_refresh_mode='full';
+
+foreach kind alias duplicate constant combined cte collision duplicate_keys cast_constant
+
+statement ok
+PRAGMA refresh('projected_distinct_{kind}');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM projected_distinct_{kind} EXCEPT ALL SELECT * FROM expected_projected_distinct_{kind})
+    UNION ALL
+    (SELECT * FROM expected_projected_distinct_{kind} EXCEPT ALL SELECT * FROM projected_distinct_{kind})
+);
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+# Repopulate groups with shared sums and preserve constant output values.
+statement ok
+INSERT INTO aux_projection_source VALUES(1,11,true),(1,11,true),(2,0,true),(3,4,true),(3,-4,true);
+
+statement ok
+UPDATE aux_projection_source SET v=12 WHERE k=1 AND v=11;
+
+statement ok
+DELETE FROM aux_projection_source WHERE rowid IN(SELECT rowid FROM aux_projection_source WHERE k=1 AND v=12 LIMIT 1);
+
+foreach kind alias duplicate constant combined cte collision duplicate_keys cast_constant
+
+statement ok
+PRAGMA refresh('projected_distinct_{kind}');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM projected_distinct_{kind} EXCEPT ALL SELECT * FROM expected_projected_distinct_{kind})
+    UNION ALL
+    (SELECT * FROM expected_projected_distinct_{kind} EXCEPT ALL SELECT * FROM projected_distinct_{kind})
+);
+----
+0
+
+endloop
+
+# Remove every group.
+statement ok
+DELETE FROM aux_projection_source;
+
+foreach kind alias duplicate constant combined cte collision duplicate_keys cast_constant
+
+statement ok
+PRAGMA refresh('projected_distinct_{kind}');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM projected_distinct_{kind} EXCEPT ALL SELECT * FROM expected_projected_distinct_{kind})
+    UNION ALL
+    (SELECT * FROM expected_projected_distinct_{kind} EXCEPT ALL SELECT * FROM projected_distinct_{kind})
+);
+----
+0
+
+endloop
+
+statement ok
+SET openivm_distinct_aux_state=false;
+
+# Cast only the updated raw SUM; adding individually rounded deltas loses fractions.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE TABLE distinct_cast_decimal_source(k INT,v DECIMAL(12,2));
+
+statement ok
+INSERT INTO distinct_cast_decimal_source VALUES(1,0.40),(1,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_cast_decimal_mv AS
+SELECT k,42 flag,SUM(v)::BIGINT total FROM (SELECT DISTINCT k,v FROM distinct_cast_decimal_source) d GROUP BY k;
+
+statement ok
+CREATE VIEW distinct_cast_decimal_expected AS
+SELECT k,42 flag,SUM(v)::BIGINT total FROM (SELECT DISTINCT k,v FROM distinct_cast_decimal_source) d GROUP BY k;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='distinct_cast_decimal_mv';
+----
+8
+
+statement ok
+INSERT INTO distinct_cast_decimal_source VALUES(1,0.45),(1,0.45),(2,1.20),(3,99.0);
+
+statement ok
+UPDATE distinct_cast_decimal_source SET v=1.40 WHERE k=2;
+
+statement ok
+DELETE FROM distinct_cast_decimal_source WHERE k=3;
+
+statement ok
+PRAGMA refresh('distinct_cast_decimal_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM distinct_cast_decimal_mv EXCEPT ALL SELECT * FROM distinct_cast_decimal_expected)
+    UNION ALL
+    (SELECT * FROM distinct_cast_decimal_expected EXCEPT ALL SELECT * FROM distinct_cast_decimal_mv)
+);
+----
+0
+
+statement ok
+DELETE FROM distinct_cast_decimal_source WHERE v IS NOT NULL;
+
+statement ok
+PRAGMA refresh('distinct_cast_decimal_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM distinct_cast_decimal_mv EXCEPT ALL SELECT * FROM distinct_cast_decimal_expected)
+    UNION ALL
+    (SELECT * FROM distinct_cast_decimal_expected EXCEPT ALL SELECT * FROM distinct_cast_decimal_mv)
+);
+----
+0
+
+statement ok
+SET openivm_distinct_aux_state=false;

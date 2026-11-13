@@ -474,6 +474,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	bool has_hidden_minmax_having = false;
 	bool has_computed_minmax_aggregate_projection = false;
 	DerivedAggregateOutputInfo derived_aggregate_outputs;
+	string single_sum_state_column;
 	vector<RefreshMetadata::FullOuterScope> full_outer_scopes;
 	bool has_computed_sum_aggregate_projection = false;
 	bool has_query_dependent_binding = false;
@@ -519,6 +520,19 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		output_names = PrepareOutputNames(select_plan.get(), select_output_names);
 
 		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
+		if (select_rewrite_needs.distinct && !post_rewrite_facts.aggregates.empty()) {
+			auto &aggregate = *post_rewrite_facts.aggregates.front();
+			for (idx_t i = 0; i < aggregate.expressions.size(); i++) {
+				auto &expression = aggregate.expressions[i];
+				if (expression->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE &&
+				    expression->Cast<BoundAggregateExpression>().Function().GetName().GetIdentifierName() == "sum") {
+					single_sum_state_column =
+					    ResolvePlanOutputColumn(ColumnBinding(aggregate.aggregate_index, ProjectionIndex(i)),
+					                            *select_plan, post_rewrite_facts, output_names);
+					break;
+				}
+			}
+		}
 		full_outer_scopes = BuildFullOuterScopes(post_rewrite_facts);
 		stored_query_has_aggregate_filter = post_rewrite_facts.has_filter_above_aggregate;
 		has_hidden_minmax_having = post_rewrite_facts.has_hidden_minmax_having_column;
@@ -725,9 +739,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// Outer-aggregate spec for the v0 aux-state pipeline. Single SUM(<arg>) only —
 	// any other shape (multiple SUMs, AVG, COUNT, etc.) demotes to GROUP_RECOMPUTE.
 	// `sum_arg` is the column name from the DISTINCT input (one of distinct_cols).
-	// `sum_out` is the user-facing output column name in the data table.
+	// `sum_out` names the stored raw SUM state, including hidden state for cast outputs.
 	string distinct_sum_arg;
 	string distinct_sum_out;
+	vector<DerivedAggregateOutput> distinct_group_inputs;
 	SemiAntiExtract semi_anti_extract;
 	FilteredGroupCountExtract filtered_group_count_extract;
 	FilteredGroupCountAuxRequirement filtered_group_count_aux_candidate;
@@ -873,7 +888,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			int sum_count = 0;
 			bool unsupported_agg = false;
 			if (outer_agg) {
-				for (auto &expr : outer_agg->expressions) {
+				auto &output_plan =
+				    plan->type == LogicalOperatorType::LOGICAL_CREATE_TABLE ? *plan->children[0] : *plan;
+				for (idx_t agg_index = 0; agg_index < outer_agg->expressions.size(); agg_index++) {
+					auto &expr = outer_agg->expressions[agg_index];
 					if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
 						continue;
 					}
@@ -894,8 +912,37 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 					auto &bcr = bound.GetChildren()[0]->Cast<BoundColumnRefExpression>();
 					distinct_sum_arg =
 					    bcr.GetAlias().empty() ? bcr.GetName().GetIdentifierName() : bcr.GetAlias().GetIdentifierName();
-					distinct_sum_out = bound.GetAlias().GetIdentifierName();
+					distinct_sum_out =
+					    ResolvePlanOutputColumn(ColumnBinding(outer_agg->aggregate_index, ProjectionIndex(agg_index)),
+					                            output_plan, facts, output_names);
+					if (!single_sum_state_column.empty()) {
+						distinct_sum_out = single_sum_state_column;
+					}
+					if (distinct_sum_out.empty()) {
+						distinct_sum_out = bound.GetAlias().GetIdentifierName();
+					}
 					sum_count++;
+				}
+				for (auto &node : facts.plan_nodes_post_order) {
+					auto *candidate = node.plan_node;
+					if (candidate->type != LogicalOperatorType::LOGICAL_DISTINCT ||
+					    candidate->GetColumnBindings().size() != distinct_extracted_cols.size()) {
+						continue;
+					}
+					for (idx_t group_index = 0; group_index < outer_agg->groups.size(); group_index++) {
+						auto names = ResolvePlanOutputColumns(
+						    ColumnBinding(outer_agg->group_index, ProjectionIndex(group_index)), output_plan, facts,
+						    output_names);
+						string expression;
+						if (names.empty() || !RenderPlanOutputExpression(*outer_agg->groups[group_index], *candidate,
+						                                                 facts, distinct_extracted_cols, expression)) {
+							throw InternalException("Could not resolve DISTINCT aggregate group input");
+						}
+						for (auto &name : names) {
+							distinct_group_inputs.push_back({std::move(name), expression});
+						}
+					}
+					break;
 				}
 			}
 			if (!outer_agg || unsupported_agg || sum_count != 1) {
@@ -926,7 +973,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                          distinct_extracted_source,
 		                          distinct_extracted_filter,
 		                          distinct_sum_arg,
-		                          distinct_sum_out};
+		                          distinct_sum_out,
+		                          distinct_group_inputs};
 		model_input.distinct_aux_candidate = &distinct_aux_candidate;
 	}
 	RefreshMetadata::CountDistinctAuxMeta count_distinct_aux_candidate;

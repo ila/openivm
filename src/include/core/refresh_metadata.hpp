@@ -328,7 +328,8 @@ public:
 	// body with the DISTINCT keyword stripped; `source` is the base table referenced
 	// by `input_sql`'s FROM clause; `filter` is the WHERE predicate (empty if none);
 	// `sum_arg` and `sum_out` describe the parent aggregate's single SUM expression
-	// (`SUM(<sum_arg>) AS <sum_out>`). v0 supports exactly one SUM column.
+	// (`SUM(<sum_arg>) AS <sum_out>`); sum_out can name hidden state for a cast output.
+	// v0 supports exactly one SUM expression, with shared projected aliases.
 	struct DistinctAuxMeta {
 		string aux_table;
 		vector<string> cols;
@@ -338,6 +339,8 @@ public:
 		string filter;
 		string sum_arg;
 		string sum_out;
+		// Published group-key names and their expressions over the DISTINCT tuple columns.
+		vector<DerivedAggregateOutput> group_inputs;
 	};
 
 	// Read the JSON-encoded distinct-aux metadata. Returns false if the column is NULL

@@ -2122,8 +2122,8 @@ struct OutputExpressionRenderer {
 
 } // namespace
 
-bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &plan, const CreateMVPlanFacts &facts,
-                                const vector<string> &output_names, string &sql) {
+static column_binding_map_t<string> BuildOutputBindingNames(LogicalOperator &plan, const CreateMVPlanFacts &facts,
+                                                            const vector<string> &output_names) {
 	DerivedOutputProjectionMap projections;
 	for (auto *projection : facts.projections) {
 		projections[projection->table_index] = projection;
@@ -2138,7 +2138,7 @@ bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &p
 		// including when the path ends at a computed expression.
 		if (resolved) {
 			for (auto key : path) {
-				binding_to_column[key] = output_names[i];
+				binding_to_column.emplace(key, output_names[i]);
 			}
 		}
 	}
@@ -2156,11 +2156,47 @@ bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &p
 			auto resolved = ResolveDerivedOutputPassThrough(*aggregate->groups[i], projections, &path);
 			if (resolved) {
 				for (auto input_key : path) {
-					binding_to_column[input_key] = name;
+					binding_to_column.emplace(input_key, name);
 				}
 			}
 		}
 	}
+	return binding_to_column;
+}
+
+string ResolvePlanOutputColumn(ColumnBinding binding, LogicalOperator &plan, const CreateMVPlanFacts &facts,
+                               const vector<string> &output_names) {
+	auto names = BuildOutputBindingNames(plan, facts, output_names);
+	auto entry = names.find(binding);
+	return entry == names.end() ? "" : entry->second;
+}
+
+vector<string> ResolvePlanOutputColumns(ColumnBinding binding, LogicalOperator &plan, const CreateMVPlanFacts &facts,
+                                        const vector<string> &output_names) {
+	DerivedOutputProjectionMap projections;
+	for (auto *projection : facts.projections) {
+		projections[projection->table_index] = projection;
+	}
+	vector<string> names;
+	auto bindings = plan.GetColumnBindings();
+	for (idx_t i = 0; i < bindings.size() && i < output_names.size(); i++) {
+		BoundColumnRefExpression output(LogicalType::SQLNULL, bindings[i]);
+		vector<ColumnBinding> path;
+		if (ResolveDerivedOutputPassThrough(output, projections, &path) &&
+		    std::find(path.begin(), path.end(), binding) != path.end()) {
+			names.push_back(output_names[i]);
+		}
+	}
+	return names;
+}
+
+bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &plan, const CreateMVPlanFacts &facts,
+                                const vector<string> &output_names, string &sql) {
+	DerivedOutputProjectionMap projections;
+	for (auto *projection : facts.projections) {
+		projections[projection->table_index] = projection;
+	}
+	auto binding_to_column = BuildOutputBindingNames(plan, facts, output_names);
 	return OutputExpressionRenderer(binding_to_column, projections, true).Render(expression, sql);
 }
 
@@ -2190,15 +2226,18 @@ DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator 
 		resolved_expressions.push_back(resolved);
 		if (resolved->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 			for (auto key : binding_path) {
-				binding_to_column[key] = output_names[i];
+				binding_to_column.emplace(key, output_names[i]);
 			}
 		}
 	}
 	OutputExpressionRenderer renderer(binding_to_column, projections, false);
 	for (idx_t i = 0; i < resolved_expressions.size(); i++) {
 		auto &expression = *resolved_expressions[i];
-		if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF ||
-		    IncrementalTableNames::IsInternalColumn(output_names[i])) {
+		if (IncrementalTableNames::IsInternalColumn(output_names[i])) {
+			continue;
+		}
+		if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+		    binding_to_column.at(expression.Cast<BoundColumnRefExpression>().Binding()) == output_names[i]) {
 			continue;
 		}
 		string expression_sql;

@@ -1205,10 +1205,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto source_input = ResolveTrackedSourceInput(metadata, con, view_name, aux_meta.source, delta_table_names,
 			                                              view_catalog_name, view_schema_name, attached_db_catalog_name,
 			                                              attached_db_schema_name);
-			upsert_query = CompileDistinctIncremental(
-			    view_name, aux_meta.aux_table, aux_meta.cols, aux_meta.source_exprs, source_input.delta_sql,
-			    source_input.last_update, aux_meta.filter, group_cols, aux_meta.sum_arg, aux_meta.sum_out,
-			    string(openivm::COUNT_STAR_COL), column_names, internal_catalog_prefix);
+			upsert_query =
+			    CompileDistinctIncremental(view_name, aux_meta, source_input.delta_sql, source_input.last_update,
+			                               group_cols, column_names, derived_output_info, internal_catalog_prefix);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: "
 			                    "DISTINCT_INCREMENTAL (%zu distinct cols, "
 			                    "%zu group cols, sum_arg=%s, sum_out=%s)\n",

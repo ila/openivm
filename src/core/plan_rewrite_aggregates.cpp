@@ -209,10 +209,13 @@ void InjectSumNonNullCounts(ClientContext &context, unique_ptr<LogicalOperator> 
 		idx_t aggregate_index;
 	};
 	vector<SumCountOutput> outputs;
+	column_binding_set_t exposed_sums;
 	for (idx_t projection_index = 0; projection_index < output_projection.expressions.size(); projection_index++) {
 		Expression *resolved = output_projection.expressions[projection_index].get();
+		bool has_cast = false;
 		while (resolved) {
 			while (BoundCastExpression::IsCast(*resolved)) {
+				has_cast = true;
 				resolved = BoundCastExpression::ChildMutable(resolved->Cast<BoundFunctionExpression>()).get();
 			}
 			if (resolved->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
@@ -258,6 +261,11 @@ void InjectSumNonNullCounts(ClientContext &context, unique_ptr<LogicalOperator> 
 			continue;
 		}
 
+		if (has_cast && exposed_sums.insert(ref.Binding()).second) {
+			auto alias = string(openivm::SUM_COL_PREFIX) + "state_" + to_string(projection_index);
+			PropagateHiddenBindingThroughProjectionPath(projections, ref.Binding(), sum.GetReturnType(), alias, true);
+			OPENIVM_DEBUG_PRINT("[PlanRewrite] Exposed raw SUM state for cast output %zu\n", projection_index);
+		}
 		outputs.push_back({projection_index, agg.expressions.size()});
 		agg.expressions.push_back(MakeAggregate(context, "count", sum.GetChildren()[0]->Copy(),
 		                                        string(openivm::SUM_COUNT_COL_PREFIX) + to_string(projection_index)));
