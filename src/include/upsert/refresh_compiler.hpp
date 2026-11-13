@@ -2,6 +2,7 @@
 #define REFRESH_COMPILER_HPP
 
 #include "core/openivm_constants.hpp"
+#include "core/refresh_metadata.hpp"
 #include "duckdb.hpp"
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -40,6 +41,8 @@ struct AggregateGroupsOptions {
 	string delta_ts_filter;
 	vector<string> group_column_names;
 	string catalog_prefix;
+	//! Optional relation SQL supplying the signed aggregate inputs.
+	string delta_source_sql;
 	bool insert_only = false;
 	bool use_ducklake_rowid_upsert = false;
 	vector<string> aggregate_types;
@@ -59,6 +62,9 @@ struct AggregateGroupsOutcome {
 	bool handled_cascade_delta = false;
 	bool used_group_recompute = false;
 };
+
+/// Map SQL-quoted SUM output names to their injected non-NULL count columns.
+unordered_map<string, string> DetectSumNullCountColumns(const vector<string> &columns);
 
 string CompileAggregateGroups(const string &view_name, const vector<string> &column_names,
                               const AggregateGroupsOptions &options, AggregateGroupsOutcome *outcome = nullptr);
@@ -117,19 +123,14 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 ///   4. MERGE Δinput into the aux table (count = count + dmult); DELETE rows
 ///   with count ≤ 0.
 ///
-/// `aux_table`, `distinct_cols`, `delta_source` (the `delta_<source>` table
-/// name), and `last_update` come from `openivm_views.distinct_aux_meta_json`.
-/// `filter_sql` is the WHERE predicate of the DISTINCT body (empty if none) —
-/// applied to both Δinput (filters delta rows that wouldn't have entered the
-/// DISTINCT) and the aux MERGE source. `group_columns` is the parent
-/// aggregate's GROUP BY; `sum_arg`/`sum_out` are the single-SUM argument and
-/// output column. `count_star_col` is the auto-injected `openivm_count_star`
-/// column name on the data table (almost always literal `openivm_count_star`).
-string CompileDistinctIncremental(const string &view_name, const string &aux_table, const vector<string> &distinct_cols,
-                                  const vector<string> &source_exprs, const string &delta_source,
-                                  const string &last_update, const string &filter_sql,
-                                  const vector<string> &group_columns, const string &sum_arg, const string &sum_out,
-                                  const string &count_star_col, const string &catalog_prefix = "");
+/// `meta` carries the DISTINCT source, tuple columns, filter, SUM state, and group-input lineage.
+/// Emit signed DISTINCT rows for the shared aggregate compiler, which owns NULL
+/// finalization, derived outputs, MERGE, and empty-group cleanup. `column_names`
+/// identifies the injected non-NULL count state for the SUM.
+string CompileDistinctIncremental(const string &view_name, const RefreshMetadata::DistinctAuxMeta &meta,
+                                  const string &delta_source, const string &last_update,
+                                  const vector<string> &group_columns, const vector<string> &column_names,
+                                  const DerivedAggregateOutputInfo &derived_outputs, const string &catalog_prefix = "");
 string BuildDistinctAuxStateCreateSQL(const string &target_table, const vector<string> &distinct_cols,
                                       const vector<string> &source_exprs, const string &source_relation,
                                       const string &filter_sql, bool replace);

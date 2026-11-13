@@ -80,6 +80,10 @@ void InlineMaterializedCteRefs(ClientContext &context, Binder &binder, unique_pt
 
 bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &plan, const CreateMVPlanFacts &facts,
                                 const vector<string> &output_names, string &sql);
+string ResolvePlanOutputColumn(ColumnBinding binding, LogicalOperator &plan, const CreateMVPlanFacts &facts,
+                               const vector<string> &output_names);
+vector<string> ResolvePlanOutputColumns(ColumnBinding binding, LogicalOperator &plan, const CreateMVPlanFacts &facts,
+                                        const vector<string> &output_names);
 
 void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan);
 

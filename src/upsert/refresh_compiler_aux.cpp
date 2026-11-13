@@ -848,25 +848,33 @@ string BuildDistinctAuxStateCreateSQL(const string &target_table, const vector<s
 	       ", count(*)::BIGINT AS _count FROM " + source_relation + filter + " GROUP BY " + group_list;
 }
 
-string CompileDistinctIncremental(const string &view_name, const string &aux_table, const vector<string> &distinct_cols,
-                                  const vector<string> &source_exprs, const string &delta_source,
-                                  const string &last_update, const string &filter_sql,
-                                  const vector<string> &group_columns, const string &sum_arg, const string &sum_out,
-                                  const string &count_star_col, const string &catalog_prefix) {
+string CompileDistinctIncremental(const string &view_name, const RefreshMetadata::DistinctAuxMeta &meta,
+                                  const string &delta_source, const string &last_update,
+                                  const vector<string> &group_columns, const vector<string> &column_names,
+                                  const DerivedAggregateOutputInfo &derived_outputs, const string &catalog_prefix) {
+	const auto &aux_table = meta.aux_table;
+	const auto &distinct_cols = meta.cols;
+	const auto &source_exprs = meta.source_exprs;
+	const auto &filter_sql = meta.filter;
+	const auto &sum_arg = meta.sum_arg;
+	const auto &sum_out = meta.sum_out;
 	if (distinct_cols.empty() || group_columns.empty() || sum_arg.empty() || sum_out.empty()) {
 		throw InternalException("CompileDistinctIncremental called with incomplete metadata for view '%s'", view_name);
 	}
-	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string aux_q = catalog_prefix + SqlUtils::QuoteIdentifier(aux_table);
 	string delta_q = DeltaSourceRef(delta_source, catalog_prefix);
 	string sum_arg_q = SqlUtils::QuoteIdentifier(sum_arg);
 	string sum_out_q = SqlUtils::QuoteIdentifier(sum_out);
-	string count_q = SqlUtils::QuoteIdentifier(count_star_col);
+	string count_q = SqlUtils::QuoteIdentifier(string(openivm::COUNT_STAR_COL));
+	auto sum_counts = DetectSumNullCountColumns(column_names);
+	auto sum_count = sum_counts.find(sum_out_q);
+	if (sum_count == sum_counts.end()) {
+		throw InternalException("DISTINCT SUM is missing its non-NULL count state for view '%s'", view_name);
+	}
+	const auto &nonnull_count_q = sum_count->second;
 
 	string distinct_cols_csv = SqlUtils::JoinQuotedColumns(distinct_cols);
 	string distinct_cols_csv_i = SqlUtils::JoinQualifiedQuotedColumns(distinct_cols, "i");
-	string group_cols_csv = SqlUtils::JoinQuotedColumns(group_columns);
-	string mv_match = SqlUtils::BuildNullSafeMatch(group_columns, "v", "d");
 	string source_select;
 	string source_group;
 	BuildAliasedSourceLists(distinct_cols, source_exprs, source_select, source_group);
@@ -883,25 +891,43 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	       string(openivm::MULTIPLICITY_COL) + ") <> 0;\n\n";
 
 	string aux_match_aliased = SqlUtils::BuildNullSafeMatch(distinct_cols, "_aux", "i");
-	string ddist_cte =
+	vector<string> group_inputs;
+	for (auto &column : group_columns) {
+		string expression = SqlUtils::QuoteIdentifier(column);
+		for (auto &input : meta.group_inputs) {
+			if (input.output_column == column) {
+				expression = input.expression_sql;
+				break;
+			}
+		}
+		group_inputs.push_back(std::move(expression));
+	}
+	string group_projection, group_by;
+	BuildAliasedSourceLists(group_columns, group_inputs, group_projection, group_by);
+	string distinct_projection = group_projection + ", " + sum_arg_q + " AS " + sum_out_q + ", 1::BIGINT AS " + count_q;
+	for (auto &column : column_names) {
+		if (StringUtil::StartsWith(column, openivm::SUM_COUNT_COL_PREFIX)) {
+			distinct_projection += ", CASE WHEN " + sum_arg_q + " IS NULL THEN 0 ELSE 1 END::BIGINT AS " +
+			                       SqlUtils::QuoteIdentifier(column);
+		}
+	}
+	string distinct_delta =
 	    "WITH ddist AS (\n  SELECT " + distinct_cols_csv_i +
 	    ", CASE WHEN COALESCE(_aux._count, 0) = 0 AND i.dmult > 0 THEN 1 "
 	    "WHEN COALESCE(_aux._count, 0) > 0 AND COALESCE(_aux._count, 0) + i.dmult <= 0 THEN -1 ELSE 0 END AS dd\n"
 	    "  FROM " +
 	    SqlUtils::QuoteIdentifier(dinput_table) + " i LEFT JOIN " + aux_q + " _aux ON " + aux_match_aliased +
-	    "\n),\ndagg AS (\n  SELECT " + group_cols_csv + ", SUM(" + sum_arg_q +
-	    " * dd) AS d_sum, SUM(dd)::BIGINT AS d_count\n  FROM ddist WHERE dd <> 0\n  GROUP BY " + group_cols_csv +
-	    "\n)\n";
-
-	string insert_cols = group_cols_csv + ", " + sum_out_q + ", " + count_q;
-	string insert_vals = SqlUtils::JoinQualifiedQuotedColumns(group_columns, "d") + ", d.d_sum, d.d_count";
-
-	sql += ddist_cte + "MERGE INTO " + data_table + " v USING dagg d ON " + mv_match +
-	       "\nWHEN MATCHED THEN UPDATE SET " + sum_out_q + " = COALESCE(v." + sum_out_q + ", 0) + d.d_sum, " + count_q +
-	       " = v." + count_q + " + d.d_count\nWHEN NOT MATCHED THEN INSERT (" + insert_cols + ") VALUES (" +
-	       insert_vals + ");\n\n";
-
-	sql += "DELETE FROM " + data_table + " WHERE " + count_q + " <= 0;\n\n";
+	    "\n) SELECT " + distinct_projection + ", dd AS " + string(openivm::MULTIPLICITY_COL) +
+	    " FROM ddist WHERE dd <> 0";
+	AggregateGroupsOptions options;
+	options.group_column_names = group_columns;
+	options.catalog_prefix = catalog_prefix;
+	options.delta_source_sql = "(" + distinct_delta + ") openivm_distinct_delta";
+	options.derived_output_expressions_complete = derived_outputs.complete;
+	for (auto &output : derived_outputs.outputs) {
+		options.derived_output_expressions[output.output_column] = output.expression_sql;
+	}
+	sql += CompileAggregateGroups(view_name, column_names, options) + "\n";
 
 	sql += "MERGE INTO " + aux_q + " _aux USING " + SqlUtils::QuoteIdentifier(dinput_table) + " i ON " +
 	       aux_match_aliased +
@@ -912,9 +938,10 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	sql += "DELETE FROM " + aux_q + " WHERE _count <= 0;\n\n";
 	sql += "DROP TABLE IF EXISTS " + SqlUtils::QuoteIdentifier(dinput_table) + ";\n";
 
-	OPENIVM_DEBUG_PRINT("[CompileDistinctIncremental] %zu distinct cols, %zu group cols, sum %s(%s)→%s, aux=%s\n",
-	                    distinct_cols.size(), group_columns.size(), "SUM", sum_arg.c_str(), sum_out.c_str(),
-	                    aux_table.c_str());
+	OPENIVM_DEBUG_PRINT(
+	    "[CompileDistinctIncremental] %zu distinct cols, %zu group cols, sum %s(%s)→%s, aux=%s, nonnull=%s\n",
+	    distinct_cols.size(), group_columns.size(), "SUM", sum_arg.c_str(), sum_out.c_str(), aux_table.c_str(),
+	    nonnull_count_q.c_str());
 	return sql;
 }
 

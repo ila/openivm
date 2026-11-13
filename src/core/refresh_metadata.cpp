@@ -2271,11 +2271,25 @@ string RefreshMetadata::DerivedAggregateOutputsToJson(const DerivedAggregateOutp
 }
 
 bool RefreshMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out) {
-	return MetadataJson::Read(ReadViewString(view_name, "distinct_aux_meta_json"), out);
+	auto json = ReadViewString(view_name, "distinct_aux_meta_json");
+	if (!MetadataJson::Read(json, out)) {
+		return false;
+	}
+	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "group_inputs")) {
+		DerivedAggregateOutput input;
+		if (!MetadataJson::Read(object, input)) {
+			return false;
+		}
+		out.group_inputs.push_back(std::move(input));
+	}
+	return true;
 }
 
 string RefreshMetadata::DistinctAuxMetaToJson(const DistinctAuxMeta &meta) {
-	return MetadataJson::Write(meta);
+	MetadataJson::Writer writer;
+	Fields(writer, meta);
+	writer.Objects("group_inputs", WriteEach(meta.group_inputs));
+	return writer.Finish();
 }
 
 bool RefreshMetadata::GetCountDistinctAuxMeta(const string &view_name, CountDistinctAuxMeta &out) {

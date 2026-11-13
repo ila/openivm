@@ -105,6 +105,11 @@ CREATE MATERIALIZED VIEW distinct_pairs AS
 
 A `DISTINCT` below another operator is not maintained with the MERGE above:
 
-- **Inner DISTINCT under an aggregate** (e.g., `SELECT g, COUNT(*) FROM (SELECT DISTINCT g, x FROM t) GROUP BY g`) uses affected-group recompute (`GROUP_RECOMPUTE`). With `SET openivm_distinct_aux_state = true` (default `false`), single-source views instead keep a per-tuple count aux table and propagate ±1 only when a tuple's count crosses zero (`DISTINCT_INCREMENTAL`); multi-source views still use group recompute.
+- **Inner DISTINCT under an aggregate** (e.g., `SELECT g, COUNT(*) FROM (SELECT DISTINCT g, x FROM t) GROUP BY g`) uses affected-group recompute (`GROUP_RECOMPUTE`). With `SET openivm_distinct_aux_state = true` (default `false`), supported single-source views with one `SUM(x)` keep a per-tuple count aux table and propagate ±1 only when a tuple's count crosses zero (`DISTINCT_INCREMENTAL`). The SUM state also tracks non-NULL inputs: a surviving group containing only NULL inputs returns NULL, while a nonempty collection of values that sums to zero returns zero. Other aggregate shapes and multi-source views still use group recompute.
 - **Inner DISTINCT below an outer projection** (no aggregate) uses affected-group recompute over the visible output columns.
 - For `UNION` without `ALL`, see [union](union-all.md#union-distinct).
+
+The auxiliary SUM path preserves renamed and computed group keys, repeated SUM
+outputs, and constant output columns. It feeds signed DISTINCT membership changes
+to the shared aggregate compiler. Casts are evaluated after the raw SUM state is
+updated, so fractional contributions are retained until the final cast.

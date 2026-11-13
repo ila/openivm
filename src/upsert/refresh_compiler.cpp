@@ -324,7 +324,7 @@ static DerivedAggDecomposition DetectDerivedAggColumns(const vector<string> &col
 	return result;
 }
 
-static unordered_map<string, string> DetectSumNullCountColumns(const vector<string> &columns) {
+unordered_map<string, string> DetectSumNullCountColumns(const vector<string> &columns) {
 	unordered_map<string, string> result;
 	const string prefix = openivm::SUM_COUNT_COL_PREFIX;
 	for (auto &column : columns) {
@@ -362,7 +362,9 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 	};
 	string data_table =
 	    options.catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
-	string delta_view = options.catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
+	string delta_view = options.delta_source_sql.empty()
+	                        ? options.catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name))
+	                        : options.delta_source_sql;
 
 	// Extract GROUP BY keys: from index (standard path) or from metadata (DuckLake fallback)
 	vector<string> keys;
@@ -379,13 +381,13 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 	vector<string> aggregates;
 	unordered_map<string, string> aggregate_raw_names;
 	unordered_map<string, string> quoted_derived_output_expressions;
-	const bool use_derived_output_merge = insert_only && has_minmax && options.derived_output_expressions_complete &&
-	                                      !options.derived_output_expressions.empty();
+	const bool use_derived_output_merge = options.derived_output_expressions_complete &&
+	                                      !options.derived_output_expressions.empty() && (!has_minmax || insert_only);
 	if (use_derived_output_merge) {
 		for (auto &entry : options.derived_output_expressions) {
 			quoted_derived_output_expressions[SqlUtils::QuoteIdentifier(entry.first)] = entry.second;
 		}
-		OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] insert-only derived-output "
+		OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] derived-output "
 		                    "MERGE for '%s' (%zu outputs)\n",
 		                    view_name.c_str(), quoted_derived_output_expressions.size());
 	}
