@@ -22,11 +22,37 @@ CREATE MATERIALIZED VIEW sph_empty_mv AS
 query I
 SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%::%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%current_timestamp()%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%epoch_us(%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%<=>%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST(%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'sph_empty_mv',
+    '{"target_dialect":"spark","compile_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# Spark rewrites must leave SQL string contents alone, including text that looks like a function call.
+statement ok
+INSERT INTO sph_empty_src VALUES (2, DATE '2024-01-02', TIMESTAMP '2024-01-02 01:02:03', 'now()');
+
+statement ok
+INSERT INTO sph_empty_src VALUES (3, DATE '2024-01-03', TIMESTAMP '2024-01-03 01:02:03',
+                                  'make_timestamp(epoch_us(now()))');
+
+statement ok
+CREATE MATERIALIZED VIEW sph_literal_mv AS
+    SELECT id FROM sph_empty_src WHERE txt IN ('now()', 'make_timestamp(epoch_us(now()))');
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%''now()''%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%''make_timestamp(epoch_us(now()))''%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%''current_timestamp()''%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'sph_literal_mv',
     '{"target_dialect":"spark","compile_only":true}'
 )
 WHERE stmt_kind = 'data';
