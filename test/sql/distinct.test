@@ -7,6 +7,181 @@ require openivm
 statement ok
 SET openivm_cascade_refresh = 'off';
 
+# Issue #154: an outer projection must not publish the inner DISTINCT's hidden
+# count as one of its own output columns.
+statement ok
+CREATE TABLE projected_distinct_source(id INT, k INT, v INT);
+
+statement ok
+INSERT INTO projected_distinct_source VALUES
+    (1, 1, 10), (2, 1, 10), (3, 1, 20), (4, 2, 30),
+    (5, NULL, 40), (6, NULL, 40), (7, NULL, NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_mv AS
+SELECT k, v FROM (SELECT DISTINCT k, v FROM projected_distinct_source) q;
+
+statement ok
+CREATE VIEW projected_distinct_expected AS
+SELECT k, v FROM (SELECT DISTINCT k, v FROM projected_distinct_source) q;
+
+# Dropping a DISTINCT key and transforming another can produce duplicate output
+# rows. The outer SELECT must preserve that bag, including duplicate NULLs.
+statement ok
+CREATE MATERIALIZED VIEW projected_distinct_computed AS
+SELECT k % 2 AS parity FROM (SELECT DISTINCT k, v FROM projected_distinct_source) q;
+
+statement ok
+CREATE VIEW projected_distinct_computed_expected AS
+SELECT k % 2 AS parity FROM (SELECT DISTINCT k, v FROM projected_distinct_source) q;
+
+# Both retain the existing affected-group incremental strategy.
+query I
+SELECT type FROM openivm_views ORDER BY view_name;
+----
+6
+6
+
+query II
+SELECT * FROM projected_distinct_mv EXCEPT ALL SELECT * FROM projected_distinct_expected;
+----
+
+query II
+SELECT * FROM projected_distinct_expected EXCEPT ALL SELECT * FROM projected_distinct_mv;
+----
+
+query I
+SELECT * FROM projected_distinct_computed ORDER BY parity NULLS FIRST;
+----
+NULL
+NULL
+0
+1
+1
+
+query I
+SELECT * FROM projected_distinct_computed EXCEPT ALL SELECT * FROM projected_distinct_computed_expected;
+----
+
+query I
+SELECT * FROM projected_distinct_computed_expected EXCEPT ALL SELECT * FROM projected_distinct_computed;
+----
+
+# Consolidate duplicate removals, key moves, and conflicting changes on new rows
+# before refreshing either view.
+statement ok
+INSERT INTO projected_distinct_source VALUES (8, 1, 10), (9, 3, 50), (10, 4, 60), (11, NULL, 70);
+
+statement ok
+UPDATE projected_distinct_source SET v = 11 WHERE id = 1;
+
+statement ok
+DELETE FROM projected_distinct_source WHERE id IN (2, 3);
+
+statement ok
+UPDATE projected_distinct_source SET k = 5, v = 61 WHERE id = 10;
+
+statement ok
+DELETE FROM projected_distinct_source WHERE id = 10;
+
+statement ok
+UPDATE projected_distinct_source SET k = 1, v = 10 WHERE id = 9;
+
+statement ok
+UPDATE projected_distinct_source SET v = NULL WHERE id = 11;
+
+statement ok
+PRAGMA refresh('projected_distinct_mv');
+
+query II
+SELECT * FROM projected_distinct_mv EXCEPT ALL SELECT * FROM projected_distinct_expected;
+----
+
+query II
+SELECT * FROM projected_distinct_expected EXCEPT ALL SELECT * FROM projected_distinct_mv;
+----
+
+statement ok
+PRAGMA refresh('projected_distinct_computed');
+
+query I
+SELECT * FROM projected_distinct_computed EXCEPT ALL SELECT * FROM projected_distinct_computed_expected;
+----
+
+query I
+SELECT * FROM projected_distinct_computed_expected EXCEPT ALL SELECT * FROM projected_distinct_computed;
+----
+
+# Remove the last occurrences of existing DISTINCT tuples and merge another
+# tuple into an existing one. The computed output still has bag semantics.
+statement ok
+DELETE FROM projected_distinct_source WHERE id IN (5, 8, 9);
+
+statement ok
+UPDATE projected_distinct_source SET k = 2, v = 30 WHERE id = 1;
+
+statement ok
+INSERT INTO projected_distinct_source VALUES (12, NULL, 40), (13, 3, 50);
+
+statement ok
+UPDATE projected_distinct_source SET v = NULL WHERE id = 12;
+
+statement ok
+DELETE FROM projected_distinct_source WHERE id = 6;
+
+statement ok
+UPDATE projected_distinct_source SET v = 51 WHERE id = 13;
+
+statement ok
+DELETE FROM projected_distinct_source WHERE id = 13;
+
+statement ok
+PRAGMA refresh('projected_distinct_mv');
+
+query II
+SELECT * FROM projected_distinct_mv EXCEPT ALL SELECT * FROM projected_distinct_expected;
+----
+
+query II
+SELECT * FROM projected_distinct_expected EXCEPT ALL SELECT * FROM projected_distinct_mv;
+----
+
+statement ok
+PRAGMA refresh('projected_distinct_computed');
+
+query I
+SELECT * FROM projected_distinct_computed EXCEPT ALL SELECT * FROM projected_distinct_computed_expected;
+----
+
+query I
+SELECT * FROM projected_distinct_computed_expected EXCEPT ALL SELECT * FROM projected_distinct_computed;
+----
+
+statement ok
+DELETE FROM projected_distinct_source;
+
+statement ok
+PRAGMA refresh('projected_distinct_mv');
+
+query II
+SELECT * FROM projected_distinct_mv EXCEPT ALL SELECT * FROM projected_distinct_expected;
+----
+
+query II
+SELECT * FROM projected_distinct_expected EXCEPT ALL SELECT * FROM projected_distinct_mv;
+----
+
+statement ok
+PRAGMA refresh('projected_distinct_computed');
+
+query I
+SELECT * FROM projected_distinct_computed EXCEPT ALL SELECT * FROM projected_distinct_computed_expected;
+----
+
+query I
+SELECT * FROM projected_distinct_computed_expected EXCEPT ALL SELECT * FROM projected_distinct_computed;
+----
+
 # ============================================================
 # Basic DISTINCT
 # ============================================================

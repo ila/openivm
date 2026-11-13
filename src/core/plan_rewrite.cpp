@@ -54,14 +54,12 @@ namespace duckdb {
 static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &node,
                             bool is_top_level) {
 	if (node->type != LogicalOperatorType::LOGICAL_DISTINCT) {
-		bool added_top_level_state = false;
-		for (idx_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
-			bool child_is_top_level =
-			    is_top_level && node->type == LogicalOperatorType::LOGICAL_PROJECTION && child_idx == 0;
-			added_top_level_state = RewriteDistinct(context, binder, node->children[child_idx], child_is_top_level) ||
-			                        added_top_level_state;
+		// A projection can drop DISTINCT keys or map them to duplicate output rows.
+		// Its child's count is internal state, not an output of the outer query.
+		for (auto &child : node->children) {
+			RewriteDistinct(context, binder, child, false);
 		}
-		return added_top_level_state;
+		return false;
 	}
 
 	auto &distinct = node->Cast<LogicalDistinct>();
@@ -1736,12 +1734,6 @@ struct PlanRewritePassEntry {
 	bool PlanRewriteNeeds::*required;
 };
 
-static bool HasTopLevelDistinct(const unique_ptr<LogicalOperator> &plan) {
-	return plan->type == LogicalOperatorType::LOGICAL_DISTINCT ||
-	       (plan->type == LogicalOperatorType::LOGICAL_PROJECTION && !plan->children.empty() &&
-	        plan->children[0]->type == LogicalOperatorType::LOGICAL_DISTINCT);
-}
-
 bool IsRunningWindowCandidate(const BoundWindowExpression &window) {
 	if (!window.AggregateFunction() || window.Partitions().size() != 1 || window.OrderBy().size() != 1 ||
 	    window.OrderBy()[0].type != OrderType::ASCENDING || window.Filter() || window.Distinct() ||
@@ -1855,7 +1847,7 @@ static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
 	     &PlanRewriteNeeds::aggregate_filters},
 	    {"distinct",
 	     [](PlanRewriteContext &c) {
-		     if (RewriteDistinct(c.context, c.binder, c.plan, HasTopLevelDistinct(c.plan))) {
+		     if (RewriteDistinct(c.context, c.binder, c.plan, true)) {
 			     c.planner_names.push_back(openivm::DISTINCT_COUNT_COL);
 		     }
 	     },
