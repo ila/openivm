@@ -1087,84 +1087,8 @@ SELECT count(*) FROM (
 statement ok
 COMMIT;
 
-# A refresh keeps its OpenIVM locks until the surrounding transaction ends.
-# The second connection starts while the first transaction is sleeping after
-# refresh and must wait for rollback before it can consume the restored delta.
-statement ok
-CREATE TABLE lifecycle_lock_src (id INTEGER, v INTEGER);
-
-statement ok
-INSERT INTO lifecycle_lock_src VALUES (1, 10);
-
-statement ok
-CREATE MATERIALIZED VIEW lifecycle_lock_mv AS
-SELECT id, v FROM lifecycle_lock_src;
-
-statement ok
-INSERT INTO lifecycle_lock_src VALUES (2, 20);
-
-statement ok
-CREATE TABLE lifecycle_lock_timing (phase VARCHAR, observed_at TIMESTAMP);
-
-concurrentloop threadid 0 2
-
-onlyif threadid=0
-statement ok
-BEGIN TRANSACTION;
-
-onlyif threadid=0
-statement ok
-PRAGMA refresh('lifecycle_lock_mv');
-
-onlyif threadid=0
-statement ok
-SELECT sleep_ms(1200);
-
-onlyif threadid=0
-statement ok
-ROLLBACK;
-
-onlyif threadid=1
-statement ok
-SELECT sleep_ms(200);
-
-onlyif threadid=1
-statement ok
-INSERT INTO lifecycle_lock_timing VALUES ('before', now()::TIMESTAMP);
-
-onlyif threadid=1
-statement ok
-PRAGMA refresh('lifecycle_lock_mv');
-
-onlyif threadid=1
-statement ok
-INSERT INTO lifecycle_lock_timing VALUES ('after', now()::TIMESTAMP);
-
-endloop
-
-query I
-SELECT epoch_ms(max(observed_at)) - epoch_ms(min(observed_at)) >= 700
-FROM lifecycle_lock_timing;
-----
-true
-
-query I
-SELECT count(*) FROM (
-    SELECT * FROM lifecycle_lock_mv
-    EXCEPT ALL
-    SELECT * FROM lifecycle_lock_src
-);
-----
-0
-
-query I
-SELECT count(*) FROM (
-    SELECT * FROM lifecycle_lock_src
-    EXCEPT ALL
-    SELECT * FROM lifecycle_lock_mv
-);
-----
-0
+# The retained-refresh-lock rollback interleaving runs with lock-wait synchronization
+# in test/integration/concurrency_test.cpp, including bidirectional bag checks.
 
 # DROP TABLE CASCADE companion cleanup must roll back with the base-table drop
 # and must remove the complete downstream MV closure when committed.

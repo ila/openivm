@@ -47,3 +47,11 @@ test_release_internal: test_source_delta_publication
 test_source_delta_publication:
 	cmake --build build/release --target source_delta_publication_test
 	python3 test/integration/test_source_delta_publication.py ./build/release/extension/openivm/source_delta_publication_test
+
+.PHONY: test_concurrency
+
+test_release_internal: test_concurrency
+
+test_concurrency:
+	cmake --build build/release --target concurrency_test
+	python3 test/integration/test_concurrency.py ./build/release/extension/openivm/concurrency_test

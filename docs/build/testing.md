@@ -6,9 +6,9 @@
 make test
 ```
 
-This runs every `test/sql/*.test` file with `build/release/test/unittest`, then the
-compiled N-term SQL integration check
-(`python3 test/integration/test_regular_nterm_compiled.py ./build/release/duckdb`).
+This runs the SQLLogicTest suites and the integration targets attached to
+`test_release_internal` in the Makefile, including compiled N-term SQL, metadata,
+source publication, and deterministic concurrency checks.
 Use `make test_debug` after a debug build. The DuckLake tests run `INSTALL ducklake`,
 so they need network access unless the extension is already installed.
 
@@ -20,7 +20,8 @@ build/release/test/unittest "test/sql/inner_join.test"
 
 ## Test Files
 
-All tests live in `test/sql/*.test` using DuckDB's SQLLogicTest format.
+SQLLogicTest suites live in `test/sql/*.test`. Standalone integration programs
+and their Python runners live in `test/integration/`.
 
 | Test file | Coverage |
 |---|---|
@@ -55,6 +56,22 @@ All tests live in `test/sql/*.test` using DuckDB's SQLLogicTest format.
 | `metadata_location.test` | Shared native/DuckLake placement: markers, profiling, DAG/joins, crash recovery, transactions, reopen, read-only/missing controllers, native source cleanup and DROP |
 | `ducklake_chained_recovery.test` | Chained DuckLake views with default metadata: an interrupted upstream refresh neither loses nor doubles downstream changes |
 | `ducklake_concurrent_source_commit.test` | DuckLake source changes committed by another connection during a refresh: pinned watermark, retry, no lost or doubled changes |
+
+## Deterministic concurrency checks
+
+```sh
+make test_concurrency
+```
+
+The C++ harness covers writer/refresh ordering, transaction rollback, expanding
+write sets, and parent/child publication. It releases the owning transaction only
+after the competing connection is observed waiting on the mutation gate. The
+shared test helper also serves the source-publication integration tests.
+
+The scheduled-hook test polls committed hook completion with a bounded deadline;
+it does not assume the daemon finishes within a fixed sleep. Every refreshed MV
+is checked against its base query with `EXCEPT ALL` in both directions. The Python
+runner imposes a process timeout so a deadlock fails the test instead of hanging CI.
 
 ## Remote metadata integration test
 
