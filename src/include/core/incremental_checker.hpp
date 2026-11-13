@@ -16,6 +16,7 @@ struct PlanAnalysis {
 	bool found_projection = false;
 	bool found_having = false;
 	bool found_distinct = false;
+	bool found_distinct_on = false;
 	bool found_union_distinct = false;
 	bool found_minmax = false;
 	bool found_list = false;

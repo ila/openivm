@@ -44,6 +44,9 @@ struct PlanRewriteNeeds {
 	bool running_window_state = false;
 };
 
+/// Turn a copy of the stored DISTINCT ON plan into candidate-key discovery input.
+bool RemoveDistinctOnWinnerFilters(unique_ptr<LogicalOperator> &plan);
+
 /// Strip AGG(...) FILTER (WHERE p) by converting to AGG(CASE WHEN p THEN arg
 /// END). Must be called on both the SELECT plan (for LPTS serialization) and
 /// the full CREATE plan (for AnalyzePlan / find_group_cols) so the checker sees

@@ -280,13 +280,25 @@ static bool PlanAnalysis::*const NON_LOCAL_FACTS[] = {
     &PlanAnalysis::found_positional_join,       &PlanAnalysis::found_sample};
 
 // Query-shape facts a pass-through CTE consumer inherits from the body.
-static bool PlanAnalysis::*const SHAPE_FACTS[] = {
-    &PlanAnalysis::found_aggregation,    &PlanAnalysis::found_projection,     &PlanAnalysis::found_having,
-    &PlanAnalysis::found_distinct,       &PlanAnalysis::found_union_distinct, &PlanAnalysis::found_minmax,
-    &PlanAnalysis::found_list,           &PlanAnalysis::found_filtered_list,  &PlanAnalysis::found_left_join,
-    &PlanAnalysis::found_full_outer,     &PlanAnalysis::found_semi_anti_join, &PlanAnalysis::found_join,
-    &PlanAnalysis::found_delim_join,     &PlanAnalysis::found_single_join,    &PlanAnalysis::found_window,
-    &PlanAnalysis::found_count_distinct, &PlanAnalysis::found_grouping_sets,  &PlanAnalysis::found_nested_aggregate};
+static bool PlanAnalysis::*const SHAPE_FACTS[] = {&PlanAnalysis::found_aggregation,
+                                                  &PlanAnalysis::found_projection,
+                                                  &PlanAnalysis::found_having,
+                                                  &PlanAnalysis::found_distinct_on,
+                                                  &PlanAnalysis::found_distinct,
+                                                  &PlanAnalysis::found_union_distinct,
+                                                  &PlanAnalysis::found_minmax,
+                                                  &PlanAnalysis::found_list,
+                                                  &PlanAnalysis::found_filtered_list,
+                                                  &PlanAnalysis::found_left_join,
+                                                  &PlanAnalysis::found_full_outer,
+                                                  &PlanAnalysis::found_semi_anti_join,
+                                                  &PlanAnalysis::found_join,
+                                                  &PlanAnalysis::found_delim_join,
+                                                  &PlanAnalysis::found_single_join,
+                                                  &PlanAnalysis::found_window,
+                                                  &PlanAnalysis::found_count_distinct,
+                                                  &PlanAnalysis::found_grouping_sets,
+                                                  &PlanAnalysis::found_nested_aggregate};
 
 void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 	auto *node = &op;
@@ -353,6 +365,7 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 		}
 		// DISTINCT columns become group-by keys after IVM rewrite
 		auto &distinct_node = node->Cast<LogicalDistinct>();
+		result.found_distinct_on |= distinct_node.distinct_type == DistinctType::DISTINCT_ON;
 		if (!distinct_node.distinct_targets.empty()) {
 			for (auto &target : distinct_node.distinct_targets) {
 				result.aggregate_columns.emplace_back(target->GetName());

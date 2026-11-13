@@ -113,6 +113,7 @@ static const vector<std::pair<string, vector<MetadataColumn>>> &MetadataTableDef
 	      {"derived_aggregate_outputs_json varchar default null", ADDED},
 	      "having_predicate varchar default null",
 	      {"group_recompute_affected_mode varchar default null", ADDED},
+	      {"group_recompute_affected_query varchar default null", ADDED},
 	      {"group_recompute_source_occurrences_json varchar default null", ADDED},
 	      "has_full_outer boolean default false, full_outer_join_cols varchar default null",
 	      {"signature_hash ubigint default null", ADDED, MetadataStore::LOCAL},

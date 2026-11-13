@@ -467,6 +467,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 	vector<string> output_names;
 	idx_t visible_output_count = DConstants::INVALID_INDEX;
+	string group_recompute_affected_query;
 	string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
 	bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
 	bool stored_query_has_aggregate_filter = false;
@@ -540,6 +541,15 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			auto cte_list = AstToCteList(*ast, dialect);
 			return cte_list->ToQuery(true, output_names);
 		};
+		if (post_rewrite_facts.analysis.found_distinct_on && !has_query_dependent_binding) {
+			auto affected_plan = select_plan->Copy(context);
+			if (RemoveDistinctOnWinnerFilters(affected_plan)) {
+				group_recompute_affected_query = serialize_plan(affected_plan);
+				if (!group_recompute_affected_query.empty() && group_recompute_affected_query.back() == ';') {
+					group_recompute_affected_query.pop_back();
+				}
+			}
+		}
 		auto serialize_original = [&]() {
 			try {
 				view_query = serialize_plan(select_plan);
@@ -1270,6 +1280,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		metadata_ddl.push_back(statement);
 	}
 
+	if (!group_recompute_affected_query.empty()) {
+		aux_metadata_ddl.push_back(
+		    BuildUpdateViewJsonSQL("group_recompute_affected_query", group_recompute_affected_query, view_name));
+	}
 	if (!lineage_json.empty()) {
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("lineage_json", lineage_json, view_name));
 	}

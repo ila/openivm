@@ -1725,6 +1725,10 @@ string RefreshMetadata::GetHavingPredicate(const string &view_name) {
 	return ReadViewString(view_name, "having_predicate");
 }
 
+string RefreshMetadata::GetGroupRecomputeAffectedQuery(const string &view_name) {
+	return ReadViewString(view_name, "group_recompute_affected_query");
+}
+
 GroupRecomputeAffectedMode RefreshMetadata::GetGroupRecomputeAffectedMode(const string &view_name) {
 	auto value = ReadViewValue(view_name, "group_recompute_affected_mode");
 	if (value.IsNull()) {

@@ -1,4 +1,3 @@
-#include "duckdb/function/window/rows_functions.hpp"
 #include "core/plan_rewrite.hpp"
 
 #include "core/openivm_constants.hpp"
@@ -11,6 +10,7 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/window/rows_functions.hpp"
 #include "duckdb/optimizer/deliminator.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/filter_pushdown.hpp"
@@ -63,6 +63,13 @@ static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 	}
 
 	auto &distinct = node->Cast<LogicalDistinct>();
+	if (distinct.distinct_type == DistinctType::DISTINCT_ON) {
+		// Winner selection depends on ORDER BY, not full-row multiplicity.
+		for (auto &child : node->children) {
+			RewriteDistinct(context, binder, child, false);
+		}
+		return false;
+	}
 	if (node->children.empty()) {
 		OPENIVM_DEBUG_PRINT("[PlanRewrite] DISTINCT has no children — skipping\n");
 		return false;
@@ -1035,8 +1042,25 @@ void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan) {
 		       op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
 		       op.type == LogicalOperatorType::LOGICAL_TOP_N;
 	});
-	if (!spine.bottom || spine.bottom->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY ||
-	    spine.projections.empty()) {
+	if (!spine.bottom || spine.projections.empty()) {
+		return;
+	}
+	if (spine.bottom->type == LogicalOperatorType::LOGICAL_DISTINCT) {
+		auto &distinct = spine.bottom->Cast<LogicalDistinct>();
+		if (distinct.distinct_type != DistinctType::DISTINCT_ON) {
+			return;
+		}
+		for (idx_t i = 0; i < distinct.distinct_targets.size(); i++) {
+			auto &target = *distinct.distinct_targets[i];
+			PropagateHiddenBindingThroughProjectionPath(
+			    spine.projections, target.Cast<BoundColumnRefExpression>().Binding(), target.GetReturnType(),
+			    "openivm_group_key_" + to_string(i), true);
+		}
+		plan->ResolveOperatorTypes();
+		OPENIVM_DEBUG_PRINT("[PlanRewrite] Exposed DISTINCT ON maintenance keys\n");
+		return;
+	}
+	if (spine.bottom->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		return;
 	}
 	auto &aggregate = spine.bottom->Cast<LogicalAggregate>();
@@ -1046,6 +1070,30 @@ void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan) {
 		    aggregate.groups[i]->GetReturnType(), "openivm_group_key_" + to_string(i), true);
 	}
 	plan->ResolveOperatorTypes();
+}
+
+bool RemoveDistinctOnWinnerFilters(unique_ptr<LogicalOperator> &plan) {
+	auto spine = FindOutputSpine(plan.get(), [](const LogicalOperator &op) {
+		return op.type == LogicalOperatorType::LOGICAL_FILTER || op.type == LogicalOperatorType::LOGICAL_ORDER_BY;
+	});
+	if (!spine.bottom || spine.bottom->type != LogicalOperatorType::LOGICAL_DISTINCT ||
+	    spine.bottom->Cast<LogicalDistinct>().distinct_type != DistinctType::DISTINCT_ON) {
+		return false;
+	}
+	// Discovery needs every candidate key, including keys whose new winner is
+	// rejected by an outer predicate. Filters below DISTINCT ON still apply.
+	auto *node = &plan;
+	while (node->get() != spine.bottom) {
+		if ((*node)->type == LogicalOperatorType::LOGICAL_FILTER) {
+			*node = std::move((*node)->children[0]);
+		} else {
+			node = &(*node)->children[0];
+		}
+	}
+	*node = std::move((*node)->children[0]);
+	plan->ResolveOperatorTypes();
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Built DISTINCT ON candidate-key query\n");
+	return true;
 }
 
 /// Inject a hidden COUNT(*) (alias `openivm_count_star`) into AGGREGATE_GROUP
@@ -1850,6 +1898,7 @@ static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
 		     if (RewriteDistinct(c.context, c.binder, c.plan, true)) {
 			     c.planner_names.push_back(openivm::DISTINCT_COUNT_COL);
 		     }
+		     InjectHiddenGroupKeys(c.plan);
 	     },
 	     &PlanRewriteNeeds::distinct},
 	    {"derived_aggregates",

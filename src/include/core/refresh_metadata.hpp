@@ -266,6 +266,7 @@ public:
 	};
 
 	GroupRecomputeAffectedMode GetGroupRecomputeAffectedMode(const string &view_name);
+	string GetGroupRecomputeAffectedQuery(const string &view_name);
 	vector<GroupRecomputeSourceOccurrence> GetGroupRecomputeSourceOccurrences(const string &view_name);
 	static string GroupRecomputeSourceOccurrencesToJson(const vector<GroupRecomputeSourceOccurrence> &occurrences);
 
