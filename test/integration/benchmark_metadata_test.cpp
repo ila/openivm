@@ -53,7 +53,7 @@ int main(int argc, char **argv) {
 		Execute(con, "LOAD openivm; LOAD ducklake; SET openivm_files_path='" + dir + "'");
 		auto native = con.Query("SELECT current_database()");
 		Check(!native->HasError(), native->GetError());
-		string native_catalog = native->GetValue(0, 0).ToString();
+		string native_catalog = native->Collection().GetValue(0, 0).ToString();
 		Check(native_catalog != "memory", "expected a file-backed native catalog");
 
 		// File-backed native catalog; mv_q1 is a simple projection (type 2), mv_q2 an aggregate (type 0).

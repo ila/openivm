@@ -10,7 +10,7 @@ SET openivm_archive_compiled_sql = true;
 require parquet
 
 statement ok
-INSTALL ducklake;
+INSTALL ducklake FROM '{BUILD_DIRECTORY}/repository';
 
 statement ok
 LOAD ducklake;
@@ -108,6 +108,25 @@ INSERT INTO dl.employees VALUES (1, 'Alice', 'eng'), (2, 'Bob', 'sales'), (3, 'C
 
 statement ok
 CREATE MATERIALIZED VIEW dl.mv_emp AS SELECT id, name FROM dl.employees;
+
+# DuckLake scans require statement rebind, but that alone must not force full refresh.
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'mv_emp';
+----
+2
+
+# A query-dependent macro still forces full refresh when the source itself also requires rebind.
+statement ok
+CREATE MACRO ducklake_nested_now() AS CURRENT_TIMESTAMP;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_emp_dynamic AS
+    SELECT id, ducklake_nested_now() AS observed_at FROM dl.employees;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'mv_emp_dynamic';
+----
+3
 
 statement ok
 SET openivm_profile_refresh = true;
@@ -963,7 +982,7 @@ WITH s AS (
 )
 SELECT count(*) FILTER (WHERE is_publish),
        count(*) FILTER (WHERE starts_with(sql, 'create table if not exists ') AND contains(sql, 'openivm_delta_')
-           AND ends_with(sql, 'openivm_multiplicity INTEGER DEFAULT 1, openivm_timestamp TIMESTAMP DEFAULT now())')),
+           AND ends_with(sql, 'openivm_multiplicity INTEGER DEFAULT 1, openivm_timestamp TIMESTAMP DEFAULT make_timestamp(epoch_us(now())))')),
        count(*) FILTER (WHERE starts_with(sql, '--') OR starts_with(sql, 'openivm_')),
        min(stmt_order) FILTER (WHERE is_publish)
            < min(stmt_order) FILTER (WHERE starts_with(sql, 'create table if not exists ') AND contains(sql, 'openivm_delta_openivm_visible_'))

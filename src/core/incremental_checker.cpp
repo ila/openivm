@@ -1,10 +1,20 @@
 #include "core/incremental_checker.hpp"
 
+#include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/common/enums/on_entry_not_found.hpp"
+#include "duckdb/function/scalar_macro_function.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -30,12 +40,147 @@ static const unordered_set<string> &GetSupportedAggregates() {
 	return kSet;
 }
 
+static const unordered_set<string> &GetSqlValueFunctionNames() {
+	static const unordered_set<string> kNames = {
+	    "current_catalog", "current_date", "current_role",   "current_schema", "current_time", "current_timestamp",
+	    "current_user",    "localtime",    "localtimestamp", "session_user",   "user"};
+	return kNames;
+}
+
+static bool IsQueryDependentFunction(const FunctionExpression &function) {
+	static const unordered_set<string> kNames = {
+	    "current_localtime",    "current_localtimestamp", "get_current_time", "get_current_timestamp", "now",
+	    "transaction_timestamp"};
+	return kNames.find(StringUtil::Lower(function.FunctionName().GetIdentifierName())) != kNames.end();
+}
+
+class QueryDependentBindingDetector {
+public:
+	QueryDependentBindingDetector(LogicalOperator &plan_p, Binder &binder_p) : plan(plan_p), binder(binder_p) {
+	}
+
+	bool HasQueryDependentValue(QueryNode &query) {
+		identifier_set_t parameters;
+		return HasQueryDependentValue(query, parameters, false);
+	}
+
+private:
+	bool IsBoundColumn(QueryLocation location) {
+		if (!location.IsValid()) {
+			return false;
+		}
+		if (!bound_column_locations) {
+			bound_column_locations = make_uniq<unordered_set<uint32_t>>();
+			CollectBoundColumnLocations(plan);
+		}
+		return bound_column_locations->find(location.Start()) != bound_column_locations->end();
+	}
+
+	void CollectBoundColumnLocations(LogicalOperator &op) {
+		LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression> *expression) {
+			if (!expression || !*expression) {
+				return;
+			}
+			ExpressionIterator::EnumerateExpression(*expression, [&](Expression &child) {
+				if (child.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF && child.HasQueryLocation()) {
+					bound_column_locations->insert(child.GetQueryLocation().Start());
+				}
+			});
+		});
+		for (auto &child : op.children) {
+			CollectBoundColumnLocations(*child);
+		}
+	}
+
+	bool HasQueryDependentValue(QueryNode &query, const identifier_set_t &macro_parameters, bool macro_body) {
+		bool found = false;
+		ParsedExpressionIterator::EnumerateQueryNodeChildren(query, [&](unique_ptr<ParsedExpression> &expression) {
+			if (!found && expression && HasQueryDependentValue(*expression, macro_parameters, macro_body)) {
+				found = true;
+			}
+		});
+		return found;
+	}
+
+	bool MacroHasQueryDependentValue(FunctionExpression &function) {
+		auto macro_name = function.GetQualifiedName().ToString();
+		if (!visited_macros.insert(macro_name).second) {
+			return false;
+		}
+		auto entry = binder.GetCatalogEntry(EntryLookupInfo(CatalogType::MACRO_ENTRY, function.GetQualifiedName()),
+		                                    OnEntryNotFound::RETURN_NULL);
+		if (!entry || entry->type != CatalogType::MACRO_ENTRY) {
+			return false;
+		}
+		for (auto &macro : entry->Cast<ScalarMacroCatalogEntry>().macros) {
+			if (macro->type != MacroType::SCALAR_MACRO) {
+				continue;
+			}
+			identifier_set_t parameters;
+			for (auto &parameter : macro->parameters) {
+				auto &name = parameter->Cast<ColumnRefExpression>().GetColumnName();
+				parameters.insert(name);
+			}
+			if (HasQueryDependentValue(*macro->Cast<ScalarMacroFunction>().expression, parameters, true)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool HasQueryDependentValue(ParsedExpression &expression, const identifier_set_t &macro_parameters,
+	                            bool macro_body) {
+		if (expression.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &column = expression.Cast<ColumnRefExpression>();
+			if (!column.IsQualified() && macro_parameters.find(column.GetColumnName()) == macro_parameters.end() &&
+			    GetSqlValueFunctionNames().find(StringUtil::Lower(column.GetColumnName().GetIdentifierName())) !=
+			        GetSqlValueFunctionNames().end() &&
+			    (macro_body || !IsBoundColumn(column.GetQueryLocation()))) {
+				return true;
+			}
+		}
+		if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
+			auto &function = expression.Cast<FunctionExpression>();
+			if (IsQueryDependentFunction(function) || MacroHasQueryDependentValue(function)) {
+				return true;
+			}
+		}
+		if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			auto &subquery = expression.Cast<SubqueryExpression>().Subquery();
+			if (subquery && HasQueryDependentValue(*subquery->node, macro_parameters, macro_body)) {
+				return true;
+			}
+		}
+		bool found = false;
+		ParsedExpressionIterator::EnumerateChildren(expression, [&](ParsedExpression &child) {
+			if (!found && HasQueryDependentValue(child, macro_parameters, macro_body)) {
+				found = true;
+			}
+		});
+		return found;
+	}
+
+private:
+	LogicalOperator &plan;
+	Binder &binder;
+	unique_ptr<unordered_set<uint32_t>> bound_column_locations;
+	unordered_set<string> visited_macros;
+};
+
+bool HasQueryDependentBinding(QueryNode &query, LogicalOperator &plan, Binder &binder, bool always_require_rebind) {
+	if (!always_require_rebind) {
+		return false;
+	}
+	return QueryDependentBindingDetector(plan, binder).HasQueryDependentValue(query);
+}
+
 static bool WindowColumn(const Expression &expr, string &name) {
-	if (expr.type != ExpressionType::BOUND_COLUMN_REF) {
+	if (expr.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		return false;
 	}
 	auto &column = expr.Cast<BoundColumnRefExpression>();
-	name = column.alias.empty() ? column.GetName() : column.alias;
+	name = column.GetAlias().GetIdentifierName().empty() ? column.GetName().GetIdentifierName()
+	                                                     : column.GetAlias().GetIdentifierName();
 	return !name.empty();
 }
 
@@ -51,13 +196,26 @@ static bool SameWindowColumns(const vector<string> &left, const vector<string> &
 	return true;
 }
 
+static vector<string> IntersectWindowColumns(const vector<string> &left, const vector<string> &right) {
+	vector<string> intersection;
+	for (auto &left_column : left) {
+		for (auto &right_column : right) {
+			if (StringUtil::CIEquals(left_column, right_column)) {
+				intersection.push_back(left_column);
+				break;
+			}
+		}
+	}
+	return intersection;
+}
+
 static bool HasSimpleOrderBy(const vector<BoundOrderByNode> &orders) {
 	for (auto &order : orders) {
-		if (order.expression->type != ExpressionType::BOUND_COLUMN_REF) {
+		if (order.expression->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 			return false;
 		}
 		auto &column = order.expression->Cast<BoundColumnRefExpression>();
-		if (column.alias.empty() && column.GetName().empty()) {
+		if (column.GetAlias().GetIdentifierName().empty() && column.GetName().empty()) {
 			return false;
 		}
 	}
@@ -77,23 +235,23 @@ static bool AnyExpression(vector<unique_ptr<Expression>> &expressions,
 }
 
 static bool IsVolatileExpression(const Expression &expr) {
-	if (expr.expression_class != ExpressionClass::BOUND_FUNCTION) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
 		return false;
 	}
-	auto &name = expr.Cast<BoundFunctionExpression>().function.name;
+	auto &name = expr.Cast<BoundFunctionExpression>().Function().GetName().GetIdentifierName();
 	if (StringUtil::StartsWith(name, "__internal_compress") || StringUtil::StartsWith(name, "__internal_decompress") ||
 	    name == "error") {
 		return false;
 	}
-	return expr.Cast<BoundFunctionExpression>().function.GetStability() != FunctionStability::CONSISTENT;
+	return expr.Cast<BoundFunctionExpression>().Function().GetStability() != FunctionStability::CONSISTENT;
 }
 
 static bool IsNonFoldableUnnestExpression(const Expression &expr) {
-	if (expr.expression_class != ExpressionClass::BOUND_UNNEST) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_UNNEST) {
 		return false;
 	}
 	auto &unnest = expr.Cast<BoundUnnestExpression>();
-	return !unnest.child || !unnest.child->IsFoldable();
+	return !unnest.Child() || !unnest.Child()->IsFoldable();
 }
 
 /// Expressions whose non-deterministic functions make the operator incompatible with IVM.
@@ -142,6 +300,7 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_CREATE_TABLE:
 	case LogicalOperatorType::LOGICAL_INSERT:
 	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
+	case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
 	case LogicalOperatorType::LOGICAL_GET:
 	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
@@ -188,6 +347,10 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 
 	case LogicalOperatorType::LOGICAL_DISTINCT: {
 		result.found_distinct = true;
+		// DuckDB 2 represents UNION DISTINCT as DISTINCT over UNION ALL.
+		if (!node->children.empty() && node->children[0]->type == LogicalOperatorType::LOGICAL_UNION) {
+			result.found_union_distinct = true;
+		}
 		// DISTINCT columns become group-by keys after IVM rewrite
 		auto &distinct_node = node->Cast<LogicalDistinct>();
 		if (!distinct_node.distinct_targets.empty()) {
@@ -259,12 +422,13 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 			result.found_grouping_sets = true;
 		}
 		for (auto &expr : agg.expressions) {
-			if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
+			if (expr->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE) {
 				auto &bound_agg = expr->Cast<BoundAggregateExpression>();
 				const auto &supported = GetSupportedAggregates();
 				const bool scalar_subquery_first =
-				    bound_agg.function.name == "first" && result.group_index != DConstants::INVALID_INDEX;
-				if (supported.find(bound_agg.function.name) == supported.end() && !scalar_subquery_first) {
+				    bound_agg.Function().GetName().GetIdentifierName() == "first" && result.group_index.IsValid();
+				if (supported.find(bound_agg.Function().GetName().GetIdentifierName()) == supported.end() &&
+				    !scalar_subquery_first) {
 					result.incremental_compatible = false;
 					result.found_unsupported_aggregate = true;
 				}
@@ -273,11 +437,11 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 				if (bound_agg.IsDistinct()) {
 					result.found_count_distinct = true;
 				}
-				if (bound_agg.filter) {
+				if (bound_agg.GetFilter()) {
 					// LIST keeps NULL elements, so LIST(CASE WHEN p THEN x ELSE NULL END)
 					// is not equivalent to LIST(x) FILTER (WHERE p). Keep the raw FILTER
 					// and route the view to affected-group recompute using the original SQL.
-					if (bound_agg.function.name == "list") {
+					if (bound_agg.Function().GetName().GetIdentifierName() == "list") {
 						result.found_filtered_list = true;
 					} else {
 						// Other FILTER aggregates should have been normalized before the
@@ -286,8 +450,10 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 						result.found_unsupported_filtered_aggregate = true;
 					}
 				}
-				if (bound_agg.function.name == "min" || bound_agg.function.name == "max" ||
-				    bound_agg.function.name == "arg_min" || bound_agg.function.name == "arg_max") {
+				if (bound_agg.Function().GetName().GetIdentifierName() == "min" ||
+				    bound_agg.Function().GetName().GetIdentifierName() == "max" ||
+				    bound_agg.Function().GetName().GetIdentifierName() == "arg_min" ||
+				    bound_agg.Function().GetName().GetIdentifierName() == "arg_max") {
 					result.found_minmax = true;
 				}
 				// LIST aggregates aren't element-wise summable — different deltas
@@ -295,7 +461,7 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 				// upsert compiler uses group-recompute (delete affected groups,
 				// re-insert from the original query) rather than the failing
 				// list_reduce/lambda path.
-				if (bound_agg.function.name == "list") {
+				if (bound_agg.Function().GetName().GetIdentifierName() == "list") {
 					result.found_list = true;
 				}
 				// Record aggregate function types only for the outermost aggregate in the plan.
@@ -303,15 +469,15 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 				// aggregate_types with the output column count and confuse CompileAggregateGroups.
 				// Compatibility flags (found_minmax, found_list, found_count_distinct) are
 				// recorded for all aggregates above so unsafe inner aggs still gate classification.
-				if (result.group_index == DConstants::INVALID_INDEX) {
-					result.aggregate_types.push_back(bound_agg.function.name);
+				if (!result.group_index.IsValid()) {
+					result.aggregate_types.push_back(bound_agg.Function().GetName().GetIdentifierName());
 				}
 			}
 		}
 		// Record group count and group_index for the outermost (first-found) aggregate only.
 		// In plans with nested aggregates the DFS visits the outer aggregate first; overwriting
 		// with an inner aggregate's binding causes find_group_cols to miss the top projection.
-		if (result.group_index == DConstants::INVALID_INDEX) {
+		if (!result.group_index.IsValid()) {
 			result.group_count = agg.groups.size();
 			result.group_index = agg.group_index;
 		} else {
@@ -324,56 +490,55 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 	}
 
 	case LogicalOperatorType::LOGICAL_WINDOW: {
+		bool first_window_expression = !result.found_window;
 		result.found_window = true;
 		auto &window = node->Cast<LogicalWindow>();
-		// Extract PARTITION BY column names from ALL window expressions. Also retain
+		// Extract the common PARTITION BY columns from all window expressions. A
+		// changed row can affect its entire partition in every window, so the safe
+		// partial-recompute scope is the intersection of their partition keys. A
+		// union would select too narrow a scope when windows partition differently.
+		// Also retain
 		// a common simple PARTITION BY + ORDER BY key when every window agrees. The
 		// latter lets DuckLake pair old/new row occurrences without assuming that the
 		// key is unique; differing or computed window keys keep the existing
 		// partition-recompute path.
 		for (auto &expr : window.expressions) {
-			if (expr->expression_class == ExpressionClass::BOUND_WINDOW) {
+			if (expr->GetExpressionClass() == ExpressionClass::BOUND_WINDOW) {
 				auto &win_expr = expr->Cast<BoundWindowExpression>();
 				vector<string> current_partitions;
 				vector<string> current_orders;
-				for (auto &part : win_expr.partitions) {
+				bool current_row_key_compatible = true;
+				for (auto &part : win_expr.Partitions()) {
 					string col_name;
 					if (!WindowColumn(*part, col_name)) {
-						result.window_row_key_compatible = false;
-						col_name = part->GetName();
+						current_row_key_compatible = false;
+						col_name = part->GetName().GetIdentifierName();
 					}
 					current_partitions.push_back(col_name);
-					// Avoid duplicates
-					bool found = false;
-					for (auto &existing : result.window_partition_columns) {
-						if (existing == col_name) {
-							found = true;
-							break;
-						}
-					}
-					if (!found) {
-						result.window_partition_columns.push_back(col_name);
-					}
 				}
-				for (auto &order : win_expr.orders) {
+				for (auto &order : win_expr.OrderBy()) {
 					string col_name;
 					if (!WindowColumn(*order.expression, col_name)) {
-						result.window_row_key_compatible = false;
+						current_row_key_compatible = false;
 						break;
 					}
 					current_orders.push_back(col_name);
 				}
 				if (current_partitions.empty() || current_orders.empty()) {
-					result.window_row_key_compatible = false;
+					current_row_key_compatible = false;
 				}
-				if (result.window_row_key_compatible) {
-					if (result.window_order_columns.empty()) {
-						result.window_order_columns = current_orders;
-					} else if (!SameWindowColumns(result.window_order_columns, current_orders) ||
-					           !SameWindowColumns(result.window_partition_columns, current_partitions)) {
-						result.window_row_key_compatible = false;
-						result.window_order_columns.clear();
-					}
+				if (first_window_expression) {
+					result.window_partition_columns = current_partitions;
+					result.window_order_columns = current_orders;
+					result.window_row_key_compatible = current_row_key_compatible;
+					first_window_expression = false;
+				} else {
+					result.window_row_key_compatible =
+					    result.window_row_key_compatible && current_row_key_compatible &&
+					    SameWindowColumns(result.window_partition_columns, current_partitions) &&
+					    SameWindowColumns(result.window_order_columns, current_orders);
+					result.window_partition_columns =
+					    IntersectWindowColumns(result.window_partition_columns, current_partitions);
 				}
 				if (!result.window_row_key_compatible) {
 					result.window_order_columns.clear();
@@ -427,12 +592,8 @@ static void MergeWindowAnalysis(PlanAnalysis &result, PlanAnalysis &body) {
 	bool compatible = result.window_row_key_compatible && body.window_row_key_compatible &&
 	                  SameWindowColumns(result.window_partition_columns, body.window_partition_columns) &&
 	                  SameWindowColumns(result.window_order_columns, body.window_order_columns);
-	for (auto &column : body.window_partition_columns) {
-		if (std::find(result.window_partition_columns.begin(), result.window_partition_columns.end(), column) ==
-		    result.window_partition_columns.end()) {
-			result.window_partition_columns.push_back(std::move(column));
-		}
-	}
+	result.window_partition_columns =
+	    IntersectWindowColumns(result.window_partition_columns, body.window_partition_columns);
 	result.window_row_key_compatible = compatible;
 	if (!compatible) {
 		result.window_order_columns.clear();

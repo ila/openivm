@@ -180,7 +180,7 @@ SELECT CASE WHEN (SELECT sql FROM program) LIKE '%openivm_run_fast___openivm_mv_
          AND (SELECT sql FROM program) LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_%'
          AND (SELECT sql FROM program) LIKE '%CAST(-1 AS INTEGER)%'
          AND (SELECT sql FROM program) LIKE '%CAST(1 AS INTEGER)%'
-         AND (SELECT sql FROM fast_delta) LIKE '%CAST(1 AS INTEGER), CURRENT_TIMESTAMP%'
+         AND (SELECT sql FROM fast_delta) LIKE '%CAST(1 AS INTEGER), make_timestamp(epoch_us(now()))%'
     THEN 1 ELSE 0 END;
 ----
 1

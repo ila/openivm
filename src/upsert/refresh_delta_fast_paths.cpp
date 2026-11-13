@@ -60,9 +60,12 @@ DuckLakeTableActivity ProbeDuckLakeSnapshotActivity(RefreshMetadata &metadata, C
 		return activity;
 	}
 
-	auto has_inserts = !result->GetValue(0, 0).IsNull() && result->GetValue(0, 0).GetValue<bool>();
-	auto has_deletes = !result->GetValue(1, 0).IsNull() && result->GetValue(1, 0).GetValue<bool>();
-	auto has_structural = !result->GetValue(2, 0).IsNull() && result->GetValue(2, 0).GetValue<bool>();
+	auto has_inserts =
+	    !result->Collection().GetValue(0, 0).IsNull() && result->Collection().GetValue(0, 0).GetValue<bool>();
+	auto has_deletes =
+	    !result->Collection().GetValue(1, 0).IsNull() && result->Collection().GetValue(1, 0).GetValue<bool>();
+	auto has_structural =
+	    !result->Collection().GetValue(2, 0).IsNull() && result->Collection().GetValue(2, 0).GetValue<bool>();
 	activity.ok = true;
 	activity.has_changes = has_inserts || has_deletes || has_structural;
 	activity.has_deletes = has_deletes || has_structural;
@@ -87,7 +90,7 @@ DuckLakeTableActivity ProbeDuckLakeTableChanges(Connection &con, const DuckLakeS
 		if (!result->HasError() && result->RowCount() == 1) {
 			activity.ok = true;
 			for (idx_t col = 0; col < 3; col++) {
-				auto changed = result->GetValue(col, 0);
+				auto changed = result->Collection().GetValue(col, 0);
 				activity.has_changes = activity.has_changes || (!changed.IsNull() && changed.GetValue<bool>());
 			}
 			return activity;

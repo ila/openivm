@@ -36,7 +36,7 @@ inline ViewTypeLookup LookupViewType(duckdb::DuckDB &db, duckdb::Connection &con
 		}
 		duckdb::RefreshMetadata::UseCatalog(*meta_con.context, meta_con, native_catalog);
 		duckdb::RefreshMetadata metadata(meta_con);
-		out.key = metadata.FindViewKey(loc->GetValue(0, 0).ToString(), loc->GetValue(1, 0).ToString(), sql_name);
+		out.key = metadata.FindViewKey(loc->Collection().GetValue(0, 0).ToString(), loc->Collection().GetValue(1, 0).ToString(), sql_name);
 	} catch (std::exception &e) {
 		out.error = e.what();
 		return out;
@@ -51,7 +51,7 @@ inline ViewTypeLookup LookupViewType(duckdb::DuckDB &db, duckdb::Connection &con
 		return out;
 	}
 	if (result->RowCount() > 0) {
-		out.type = result->GetValue(0, 0).GetValue<int64_t>();
+		out.type = result->Collection().GetValue(0, 0).GetValue<int64_t>();
 		out.found = true;
 	}
 	return out;
@@ -74,9 +74,9 @@ inline std::vector<LeftoverView> ListLeftoverViews(duckdb::Connection &con, cons
 	                      duckdb::Value(sql_like).ToSQLString());
 	if (meta && !meta->HasError()) {
 		for (duckdb::idx_t r = 0; r < meta->RowCount(); r++) {
-			auto cat = meta->GetValue(1, r);
-			auto sch = meta->GetValue(2, r);
-			out.push_back({meta->GetValue(0, r).ToString(), cat.IsNull() ? native_catalog : cat.ToString(),
+			auto cat = meta->Collection().GetValue(1, r);
+			auto sch = meta->Collection().GetValue(2, r);
+			out.push_back({meta->Collection().GetValue(0, r).ToString(), cat.IsNull() ? native_catalog : cat.ToString(),
 			               sch.IsNull() ? "main" : sch.ToString()});
 		}
 	}

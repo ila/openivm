@@ -21,7 +21,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/prepared_statement.hpp"
-#include "duckdb/main/materialized_query_result.hpp"
+#include "duckdb/main/query_result.hpp"
 #include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
@@ -91,8 +91,8 @@ static DuckLakeSourcePins PinDuckLakeSources(Connection &con, RefreshMetadata &m
 		throw Exception(ExceptionType::EXECUTOR, "OpenIVM could not list DuckLake catalogs: " + catalogs->GetError());
 	}
 	for (idx_t row = 0; row < catalogs->RowCount(); row++) {
-		if (!catalogs->GetValue(0, row).IsNull()) {
-			auto catalog = catalogs->GetValue(0, row).ToString();
+		if (!catalogs->Collection().GetValue(0, row).IsNull()) {
+			auto catalog = catalogs->Collection().GetValue(0, row).ToString();
 			pins.snapshots[catalog] = metadata.GetCurrentDuckLakeSnapshot(catalog);
 		}
 	}
@@ -152,7 +152,7 @@ static void InjectConcurrentCommit(ClientContext &context, const string &point, 
 		return;
 	}
 	Value sql;
-	if (!context.TryGetCurrentSetting(openivm::TEST_CONCURRENT_SQL_SETTING, sql) || sql.IsNull() ||
+	if (!context.TryGetCurrentSetting(Identifier(openivm::TEST_CONCURRENT_SQL_SETTING), sql) || sql.IsNull() ||
 	    sql.ToString().empty()) {
 		throw InvalidInputException("openivm_test_fail_point '%s' requires openivm_test_concurrent_sql", point);
 	}
@@ -215,9 +215,10 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			throw CatalogException("Could not read refresh state of '%s': %s", display_name,
 			                       state->HasError() ? state->GetError() : string("view is not registered"));
 		}
-		was_interrupted = !state->GetValue(0, 0).IsNull() && state->GetValue(0, 0).GetValue<bool>();
+		was_interrupted =
+		    !state->Collection().GetValue(0, 0).IsNull() && state->Collection().GetValue(0, 0).GetValue<bool>();
 		if (lease.Active()) {
-			refresh_epoch = state->GetValue(1, 0).GetValue<int64_t>();
+			refresh_epoch = state->Collection().GetValue(1, 0).GetValue<int64_t>();
 		}
 		OPENIVM_DEBUG_PRINT("[REFRESH] Split metadata protocol for %s (native data=%d, interrupted=%d)\n", vn.c_str(),
 		                    split_native, was_interrupted);
@@ -264,6 +265,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	// failure modes (e.g. rebinding errors thrown by Query itself, not reported as
 	// HasError()). Rollback-then-throw keeps the WAL clean and leaves the DB valid.
 	Connection exec_con(*context.db.get());
+	SqlUtils::CopySessionSetting(context, *exec_con.context, "TimeZone");
 	TransactionalMVLockState::Get(*exec_con.context)
 	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 	RefreshMetadata::UseCatalog(context, exec_con, view_catalog_name);
@@ -313,8 +315,14 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		// committing a partly refreshed backing table that downstream DuckLake views would read.
 		// Downstream views that read delta_<mv> need it as well: rows committed for a change
 		// that never reached the backing table would be emitted again by the cascading recovery.
+		// Grouped DuckLake views may stage rowids, then UPDATE and INSERT; those writes
+		// must commit together even when the view has no downstream dependents.
+		bool has_downstream = cross_system && !split_native && !split_protocol && probe_meta.HasDownstreamViews(vn);
+		bool standalone_ducklake_group = cross_system && !split_native && !split_protocol && !has_downstream &&
+		                                 probe_meta.IsDuckLakeCatalog(view_catalog_name) &&
+		                                 probe_meta.GetViewType(vn) == RefreshType::AGGREGATE_GROUP;
 		bool atomic_ducklake_data =
-		    cross_system && !split_native && (split_protocol || probe_meta.HasDownstreamViews(vn));
+		    cross_system && !split_native && (split_protocol || has_downstream || standalone_ducklake_group);
 		// Source-delta cleanup outside the database the data transaction writes (or, for native
 		// data, outside the metadata catalog) is collected instead of inlined: one transaction
 		// cannot write two databases. Every data step that runs in a transaction collects it.
@@ -435,7 +443,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			}
 		}
 		auto start = std::chrono::steady_clock::now();
-		unique_ptr<MaterializedQueryResult> result;
+		unique_ptr<QueryResult> result;
 		idx_t executed_statement_count = 0;
 		bool retry_required = false;
 		int64_t expected_delete_count = -1;
@@ -464,7 +472,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 
 			auto statements = SqlUtils::SplitSQLStatements(program);
 			executed_statement_count += statements.size();
-			unique_ptr<MaterializedQueryResult> program_result;
+			unique_ptr<QueryResult> program_result;
 			for (idx_t stmt_idx = 0; stmt_idx < statements.size(); stmt_idx++) {
 				if (lease.Active()) {
 					if (stmt_idx == 1 && MetadataLocator::TestPoint(context, "lease_lost_mid_data")) {
@@ -496,16 +504,16 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 				}
 				if (statements[stmt_idx] == retry_plan->expected_count_statement) {
 					if (program_result->RowCount() != 1 || program_result->ColumnCount() != 1 ||
-					    program_result->GetValue(0, 0).IsNull()) {
+					    program_result->Collection().GetValue(0, 0).IsNull()) {
 						throw InternalException("IVM exhaustive-delete count query returned an invalid result");
 					}
-					expected_delete_count = program_result->GetValue(0, 0).GetValue<int64_t>();
+					expected_delete_count = program_result->Collection().GetValue(0, 0).GetValue<int64_t>();
 				} else if (statements[stmt_idx] == retry_plan->delete_statement) {
 					if (expected_delete_count < 0 || program_result->RowCount() != 1 ||
-					    program_result->ColumnCount() != 1 || program_result->GetValue(0, 0).IsNull()) {
+					    program_result->ColumnCount() != 1 || program_result->Collection().GetValue(0, 0).IsNull()) {
 						throw InternalException("IVM exhaustive-delete statement returned an invalid result");
 					}
-					actual_delete_count = program_result->GetValue(0, 0).GetValue<int64_t>();
+					actual_delete_count = program_result->Collection().GetValue(0, 0).GetValue<int64_t>();
 					if (actual_delete_count != expected_delete_count) {
 						retry_required = true;
 						break;
@@ -553,8 +561,16 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			// parallel refreshes). InternalException causes DuckDB to flag the whole
 			// database as invalidated, forcing a restart. We've already rolled back, so
 			// the DB is in a clean state; the next refresh attempt should succeed.
+			// Native query excerpts describe the generated program, not the user's SQL,
+			// and can truncate storage keys before SQL-name substitution is possible.
+			auto error = result->GetError();
+			auto excerpt = error.find("\n\nLINE ");
+			if (excerpt != string::npos) {
+				error.resize(excerpt);
+			}
 			throw Exception(ExceptionType::EXECUTOR,
-			                "IVM refresh of '" + display_name + "' failed: " + result->GetError());
+			                "IVM refresh of '" + display_name + "' failed: " +
+			                    SqlUtils::ReplaceAllOccurrences(error, vn, probe_meta.GetViewSQLName(vn)));
 		}
 		if (!after_hook.empty()) {
 			auto hook_result = exec_con.Query(after_hook);
@@ -608,6 +624,13 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			MetadataLocator::FailPoint(context, "after_data_commit");
 		}
 		InjectConcurrentCommit(context, "concurrent_commit_after_data", attempt);
+		if (standalone_ducklake_group && !source_pins.sources.empty()) {
+			// The transaction may have committed an MV snapshot after the pre-commit source
+			// check. Verify sources again before advancing their watermarks past that snapshot.
+			auto verify_start = std::chrono::steady_clock::now();
+			advance_watermarks(RequireUnchangedSources(context, source_pins, display_name));
+			profiler.AddStep("verify_post_commit_sources", verify_start);
+		}
 		if (!sources_verified && !source_pins.sources.empty()) {
 			// DuckLake data statements committed one by one. Any source change since the pin
 			// may have been read by some of them, so the watermarks stay unwritten and the
@@ -622,14 +645,15 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			auto publication_start = std::chrono::steady_clock::now();
 			auto publication = probe_con.Query("SELECT published_query FROM openivm_views WHERE view_name='" +
 			                                   SqlUtils::EscapeValue(vn) + "'");
-			if (publication->HasError() || publication->RowCount() != 1 || publication->GetValue(0, 0).IsNull()) {
+			if (publication->HasError() || publication->RowCount() != 1 ||
+			    publication->Collection().GetValue(0, 0).IsNull()) {
 				throw CatalogException("Could not read snapshot publication query for '%s'", vn);
 			}
 			auto prefix = SqlUtils::QualifiedPrefix(view_catalog_name, internal_schema_name);
 			publish_sql = BuildSnapshotPublicationSQL(
 			    exec_con, view_catalog_name, prefix + SqlUtils::QuoteIdentifier(PublishedViewName(vn)),
 			    prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(vn)),
-			    publication->GetValue(0, 0).ToString());
+			    publication->Collection().GetValue(0, 0).ToString());
 			set_archived_program();
 			data_may_be_committed = true;
 			auto published = exec_con.Query(publish_sql);
@@ -739,7 +763,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 				method = "full";
 			}
 			Value mode_val;
-			if (context.TryGetCurrentSetting("openivm_refresh_mode", mode_val) && !mode_val.IsNull()) {
+			if (context.TryGetCurrentSetting(Identifier("openivm_refresh_mode"), mode_val) && !mode_val.IsNull()) {
 				auto mode = StringUtil::Lower(mode_val.ToString());
 				if (mode == "full") {
 					method = "full";
@@ -958,7 +982,7 @@ static bool AfterHookNeedsStaging(Connection &con, const string &hook_sql, const
 		if (result->HasError()) {
 			throw CatalogException("Cannot resolve after-hook catalog: %s", result->GetError());
 		}
-		catalog = result->GetValue(0, 0).ToString();
+		catalog = result->Collection().GetValue(0, 0).ToString();
 	}
 	for (auto &statement : con.ExtractStatements(hook_sql)) {
 		auto prepared = con.Prepare(std::move(statement));
@@ -969,7 +993,7 @@ static bool AfterHookNeedsStaging(Connection &con, const string &hook_sql, const
 			return true;
 		}
 		for (const auto &modified : prepared->GetStatementProperties().modified_databases) {
-			if (!StringUtil::CIEquals(modified.first, catalog)) {
+			if (!StringUtil::CIEquals(modified.first.GetIdentifierName(), catalog)) {
 				return true;
 			}
 		}
@@ -993,8 +1017,8 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 		auto hook_r = con.Query("SELECT hook_sql, mode FROM openivm_refresh_hooks WHERE view_name = '" +
 		                        SqlUtils::EscapeValue(view_name) + "'");
 		if (!hook_r->HasError() && hook_r->RowCount() > 0) {
-			hook_sql = hook_r->GetValue(0, 0).ToString();
-			hook_mode = StringUtil::Lower(hook_r->GetValue(1, 0).ToString());
+			hook_sql = hook_r->Collection().GetValue(0, 0).ToString();
+			hook_mode = StringUtil::Lower(hook_r->Collection().GetValue(1, 0).ToString());
 		}
 	}
 	bool has_refresh_hook = !hook_sql.empty();
@@ -1014,8 +1038,8 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 		if (pending->HasError()) {
 			throw CatalogException("Cannot read pending after-hook for '%s': %s", display_name, pending->GetError());
 		}
-		pending_after_hook =
-		    pending->RowCount() && !pending->GetValue(0, 0).IsNull() && pending->GetValue(0, 0).GetValue<bool>();
+		pending_after_hook = pending->RowCount() && !pending->Collection().GetValue(0, 0).IsNull() &&
+		                     pending->Collection().GetValue(0, 0).GetValue<bool>();
 		// A repaired hook can change its target catalog while a committed
 		// refresh still needs delivery. Preserve that already-staged boundary.
 		staged_after_hook = staged_after_hook || pending_after_hook;
@@ -1093,6 +1117,7 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 	bool cross_system = false;
 
 	Connection con(*context.db.get());
+	SqlUtils::CopySessionSetting(context, *con.context, "TimeZone");
 	// Hooks run through this helper connection while the caller owns the
 	// database-wide mutation gate. Give tracked DML in the hook the same logical
 	// owner so delta capture re-enters the gate instead of waiting on its caller.
@@ -1128,12 +1153,13 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 	if (metadata_catalog->HasError()) {
 		throw CatalogException("OpenIVM could not resolve metadata catalog: %s", metadata_catalog->GetError());
 	}
-	cross_system = !view_catalog_name.empty() && metadata_catalog->GetValue(0, 0).ToString() != view_catalog_name;
+	cross_system =
+	    !view_catalog_name.empty() && metadata_catalog->Collection().GetValue(0, 0).ToString() != view_catalog_name;
 
 	// Check cascade mode
 	string cascade_mode = "downstream";
 	Value cascade_val;
-	if (context.TryGetCurrentSetting("openivm_cascade_refresh", cascade_val) && !cascade_val.IsNull()) {
+	if (context.TryGetCurrentSetting(Identifier("openivm_cascade_refresh"), cascade_val) && !cascade_val.IsNull()) {
 		cascade_mode = StringUtil::Lower(cascade_val.ToString());
 	}
 
@@ -1231,7 +1257,7 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	// explicitly, and use the same boundary for its metadata, so subsequent refreshes
 	// can distinguish them from deltas retained for other consumers.
 	auto timestamp = Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()).ToSQLString() + "::TIMESTAMP";
-	ParserOptions options = context.GetParserOptions();
+	ParserOptions options = ParserOptions::Builtin();
 	options.extensions = nullptr;
 	Parser parser(options);
 	parser.ParseQuery(program);
@@ -1240,15 +1266,27 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	const bool archive_enabled = CompiledSQLArchiveEnabled(context);
 	for (auto &statement : parser.statements) {
 		if (statement->type == StatementType::INSERT_STATEMENT) {
-			auto &insert = statement->Cast<InsertStatement>();
-			if (StringUtil::CIEquals(insert.table, SqlUtils::DeltaName(view_name)) &&
+			auto &insert = *statement->Cast<InsertStatement>().node;
+			if (StringUtil::CIEquals(insert.qualified_name.Name().GetIdentifierName(),
+			                         SqlUtils::DeltaName(view_name)) &&
 			    std::find(insert.columns.begin(), insert.columns.end(), openivm::TIMESTAMP_COL) ==
 			        insert.columns.end()) {
-				D_ASSERT(!insert.columns.empty());
-				insert.columns.push_back(openivm::TIMESTAMP_COL);
+				string projection = "openivm_rows.*";
+				string aliases;
+				if (insert.columns.empty()) {
+					// Signed snapshot deltas already include a positional timestamp. Replace
+					// that value rather than adding a seventh value to a six-column target.
+					auto &delta = Catalog::GetEntry<TableCatalogEntry>(context, insert.qualified_name);
+					auto columns = delta.GetColumns().GetColumnNames();
+					insert.columns = StringsToIdentifiers(columns);
+					aliases = "(" + SqlUtils::JoinQuotedColumns(columns) + ")";
+					projection += " EXCLUDE (" + string(openivm::TIMESTAMP_COL) + ")";
+				} else {
+					insert.columns.push_back(openivm::TIMESTAMP_COL);
+				}
 				Parser select_parser(options);
-				select_parser.ParseQuery("SELECT openivm_rows.*, " + timestamp + " FROM (" +
-				                         insert.select_statement->ToString() + ") openivm_rows");
+				select_parser.ParseQuery("SELECT " + projection + ", " + timestamp + " FROM (" +
+				                         insert.select_statement->ToString() + ") openivm_rows" + aliases);
 				insert.select_statement =
 				    unique_ptr_cast<SQLStatement, SelectStatement>(std::move(select_parser.statements[0]));
 			}
@@ -1256,7 +1294,7 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 		auto sql = statement->ToString();
 		if (statement->type == StatementType::UPDATE_STATEMENT ||
 		    (statement->type == StatementType::INSERT_STATEMENT &&
-		     StringUtil::CIEquals(statement->Cast<InsertStatement>().table,
+		     StringUtil::CIEquals(statement->Cast<InsertStatement>().node->qualified_name.Name().GetIdentifierName(),
 		                          SqlUtils::DeltaName(PublishedViewName(view_name))))) {
 			sql = SqlUtils::ReplaceAllOccurrences(sql, openivm::UTC_NOW_SQL, timestamp);
 		}
@@ -1320,8 +1358,9 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 		view_schema_name = StringValue::Get(parameters.values[1]);
 	} else {
 		auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
-		view_catalog_name = default_entry.catalog;
-		view_schema_name = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
+		view_catalog_name = default_entry.GetCatalog().GetIdentifierName();
+		view_schema_name =
+		    default_entry.GetSchema().empty() ? DEFAULT_SCHEMA : default_entry.GetSchema().GetIdentifierName();
 	}
 	Connection metadata_con(*context.db);
 	RefreshMetadata::UseCatalog(context, metadata_con, view_catalog_name);
@@ -1360,8 +1399,9 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 
 	if (!view_catalog_name.empty()) {
 		auto default_result = metadata_con.Query("SELECT current_database()");
-		if (!default_result->HasError() && default_result->RowCount() > 0 && !default_result->GetValue(0, 0).IsNull() &&
-		    default_result->GetValue(0, 0).ToString() != view_catalog_name) {
+		if (!default_result->HasError() && default_result->RowCount() > 0 &&
+		    !default_result->Collection().GetValue(0, 0).IsNull() &&
+		    default_result->Collection().GetValue(0, 0).ToString() != view_catalog_name) {
 			cross_system = true;
 		}
 	}
@@ -1388,7 +1428,7 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 	RefreshMetadata metadata(metadata_con);
 	string cascade_mode = "downstream";
 	Value cascade_value;
-	if (context.TryGetCurrentSetting("openivm_cascade_refresh", cascade_value) && !cascade_value.IsNull()) {
+	if (context.TryGetCurrentSetting(Identifier("openivm_cascade_refresh"), cascade_value) && !cascade_value.IsNull()) {
 		cascade_mode = StringUtil::Lower(cascade_value.ToString());
 	}
 
@@ -1435,8 +1475,8 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 		                                " WHERE view_name = '" +
 		                                SqlUtils::EscapeValue(node) + "'");
 		if (!hooks->HasError() && hooks->RowCount() > 0) {
-			hook_sql = hooks->GetValue(0, 0).ToString();
-			hook_mode = StringUtil::Lower(hooks->GetValue(1, 0).ToString());
+			hook_sql = hooks->Collection().GetValue(0, 0).ToString();
+			hook_mode = StringUtil::Lower(hooks->Collection().GetValue(1, 0).ToString());
 		}
 		if (!hook_sql.empty() && hook_mode == "before") {
 			program += hook_sql + ";\n";

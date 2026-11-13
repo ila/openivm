@@ -41,6 +41,7 @@ struct AggregateGroupsOptions {
 	vector<string> group_column_names;
 	string catalog_prefix;
 	bool insert_only = false;
+	bool use_ducklake_rowid_upsert = false;
 	vector<string> aggregate_types;
 	vector<LogicalType> column_types;
 	bool use_current_diff_affected_keys = false;
@@ -78,7 +79,7 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs = {},
                               bool emit_cascade_delta = false, const string &affected_keys_sql = "",
                               const vector<string> &column_names = {}, bool running_window_incremental = false,
-                              bool *uses_running_suffix = nullptr);
+                              bool *uses_running_suffix = nullptr, bool use_data_modifying_ctes = true);
 /// Full recompute, optionally emitting new_bag - old_bag into the view's delta table.
 /// Unscopable group/window refreshes must preserve the requested cascade delta for downstream MVs.
 /// Supply the data table's unique keys to avoid deleting and reinserting surviving indexed keys.

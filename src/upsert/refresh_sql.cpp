@@ -27,16 +27,11 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/planner.hpp"
 
-#include <regex>
+#include <cctype>
 
 namespace duckdb {
 
 string SparkPortableRefreshSQL(string sql) {
-	static const std::regex quoted_cast_regex(R"(('[^']*(?:''[^']*)*')::(TIMESTAMP|DATE))",
-	                                          std::regex_constants::icase);
-	static const std::regex bigint_cast_regex(R"(([A-Za-z_][A-Za-z0-9_\.]*)::BIGINT)", std::regex_constants::icase);
-	static const std::regex now_regex(R"(\bnow\(\))", std::regex_constants::icase);
-	static const std::regex null_safe_regex(R"(\s+IS\s+NOT\s+DISTINCT\s+FROM\s+)", std::regex_constants::icase);
 	// Use lexer tokens so helper syntax is translated without changing
 	// identifiers, literals or comments.
 	auto tokens = Parser::Tokenize(sql);
@@ -102,38 +97,99 @@ string SparkPortableRefreshSQL(string sql) {
 			sql.replace(token.start, 7, "EXCEPT");
 		}
 	}
-	sql = std::regex_replace(sql, quoted_cast_regex, "CAST($1 AS $2)");
-	sql = std::regex_replace(sql, bigint_cast_regex, "CAST($1 AS BIGINT)");
-	sql = std::regex_replace(sql, now_regex, "current_timestamp()");
-	sql = std::regex_replace(sql, null_safe_regex, " <=> ");
-	return sql;
-}
-
-static void CopyOpenIvmSetting(ClientContext &from, ClientContext &to, const string &name) {
-	auto &db_config = DBConfig::GetConfig(to);
-	ExtensionOption option;
-	if (!db_config.TryGetExtensionOption(name, option) || !option.setting_index.IsValid()) {
-		return;
+	// std::regex_replace over an entire refresh program can exhaust the MinGW stack.
+	// The lexer already identifies literals and operators; apply the remaining edits in one pass.
+	tokens = Parser::Tokenize(sql);
+	struct Edit {
+		idx_t start;
+		idx_t end;
+		string replacement;
+	};
+	vector<Edit> edits;
+	const string utc_now_sql = openivm::UTC_NOW_SQL;
+	auto token_text = [&](idx_t index) {
+		auto end = index + 1 < tokens.size() ? tokens[index + 1].start : sql.size();
+		return SqlUtils::TrimSQLFragment(sql.substr(tokens[index].start, end - tokens[index].start));
+	};
+	for (idx_t i = 0; i < tokens.size(); i++) {
+		auto word = token_text(i);
+		if (word == "make_timestamp" && sql.compare(tokens[i].start, utc_now_sql.size(), utc_now_sql) == 0) {
+			auto end = tokens[i].start + utc_now_sql.size();
+			edits.push_back({tokens[i].start, end, "current_timestamp()"});
+			while (i + 1 < tokens.size() && tokens[i + 1].start < end) {
+				i++;
+			}
+			continue;
+		}
+		if (tokens[i].type == SimplifiedTokenType::SIMPLIFIED_TOKEN_STRING_CONSTANT && i + 2 < tokens.size() &&
+		    token_text(i + 1) == "::") {
+			auto target = token_text(i + 2);
+			if (!word.empty() && word.front() == '\'' && word.back() == '\'' &&
+			    (StringUtil::CIEquals(target, "DATE") || StringUtil::CIEquals(target, "TIMESTAMP"))) {
+				edits.push_back(
+				    {tokens[i].start, tokens[i + 2].start + target.size(), "CAST(" + word + " AS " + target + ")"});
+				i += 2;
+				continue;
+			}
+		}
+		if (word == "::" && i > 0 && i + 1 < tokens.size() && StringUtil::CIEquals(token_text(i + 1), "BIGINT")) {
+			auto start = tokens[i].start;
+			while (start > 0) {
+				unsigned char c = sql[start - 1];
+				if (!std::isalnum(c) && c != '_' && c != '.') {
+					break;
+				}
+				start--;
+			}
+			if (start < tokens[i].start &&
+			    (std::isalpha(static_cast<unsigned char>(sql[start])) || sql[start] == '_')) {
+				// A chained cast can start inside the previous edit's type name.
+				if (!edits.empty() && start < edits.back().end) {
+					continue;
+				}
+				auto target = token_text(i + 1);
+				edits.push_back({start, tokens[i + 1].start + target.size(),
+				                 "CAST(" + sql.substr(start, tokens[i].start - start) + " AS BIGINT)"});
+				i++;
+				continue;
+			}
+		}
+		if (StringUtil::CIEquals(word, "now") && i + 2 < tokens.size() && token_text(i + 1) == "(" &&
+		    token_text(i + 2) == ")") {
+			edits.push_back({tokens[i].start, tokens[i + 2].start + 1, "current_timestamp()"});
+			i += 2;
+			continue;
+		}
+		if (StringUtil::CIEquals(word, "IS") && i + 3 < tokens.size() &&
+		    StringUtil::CIEquals(token_text(i + 1), "NOT") && StringUtil::CIEquals(token_text(i + 2), "DISTINCT") &&
+		    StringUtil::CIEquals(token_text(i + 3), "FROM")) {
+			edits.push_back({tokens[i].start, tokens[i + 3].start + 4, " <=> "});
+			i += 3;
+		}
 	}
-	Value value;
-	if (from.TryGetCurrentSetting(name, value) && !value.IsNull()) {
-		to.config.user_settings.SetUserSetting(option.setting_index.GetIndex(), value);
-	} else {
-		to.config.user_settings.ClearSetting(option.setting_index.GetIndex());
+	string result;
+	result.reserve(sql.size());
+	idx_t cursor = 0;
+	for (auto &edit : edits) {
+		result.append(sql, cursor, edit.start - cursor);
+		result += edit.replacement;
+		cursor = edit.end;
 	}
+	result.append(sql, cursor, sql.size() - cursor);
+	return result;
 }
 
 void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext &to) {
 	// Per-call compile context (target dialect, compile_only, cascade hints) is
 	// carried by CompileFacts — see compile_facts.hpp. Only the remaining
-	// session-scoped planning settings still need to be mirrored onto the fresh
-	// planning connection.
+	// session-scoped planning settings and TimeZone (which can be folded into
+	// the plan) still need to be mirrored onto the fresh planning connection.
 	static const char *PLANNING_SETTINGS[] = {
 	    "openivm_adaptive_refresh", "openivm_cost_decay",    "openivm_skip_empty_deltas",  "openivm_fk_pruning",
-	    "openivm_ducklake_nterm",   "openivm_regular_nterm", "openivm_regular_nterm_left",
+	    "openivm_ducklake_nterm",   "openivm_regular_nterm", "openivm_regular_nterm_left", "TimeZone",
 	};
 	for (auto setting_name : PLANNING_SETTINGS) {
-		CopyOpenIvmSetting(from, to, setting_name);
+		SqlUtils::CopySessionSetting(from, to, setting_name);
 	}
 }
 
@@ -145,7 +201,7 @@ static string RenderStoredViewQueryForDialect(Connection &con, const string &vie
 	string rendered;
 	con.context->RunFunctionInTransaction([&]() {
 		auto &context = *con.context;
-		Parser parser(context.GetParserOptions());
+		Parser parser(context);
 		parser.ParseQuery(view_query_sql);
 		if (parser.statements.size() != 1) {
 			throw ParserException("Expected one stored view query, found %llu",
@@ -156,7 +212,8 @@ static string RenderStoredViewQueryForDialect(Connection &con, const string &vie
 		planner.CreatePlan(std::move(parser.statements[0]));
 		auto plan = std::move(planner.plan);
 		auto ast = LogicalPlanToAst(context, plan, dialect,
-		                            dialect == SqlDialect::DUCKDB ? SnapshotResolver() : time_travel_pins.Resolver());
+		                            dialect == SqlDialect::DUCKDB ? SnapshotResolver() : time_travel_pins.Resolver(),
+		                            CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
 		auto cte_list = AstToCteList(*ast, dialect);
 		rendered = cte_list->ToQuery(true, output_names);
 	});
@@ -323,7 +380,7 @@ template <class BuildSQL>
 static void EnsureAuxState(RefreshMetadata &metadata, Connection &con, const string &view_name, const string &aux_table,
                            const vector<string> &expected_columns, const string &internal_catalog_name,
                            const string &internal_schema_name, const vector<string> &pending_delta_tables,
-                           const string &view_catalog_name, const string &view_schema_name, BuildSQL build_sql) {
+                           const string &view_catalog_name, const string &view_schema_name, const BuildSQL &build_sql) {
 	if (metadata.TableColumnsMatch(internal_catalog_name, internal_schema_name, aux_table, expected_columns)) {
 		return;
 	}
@@ -441,7 +498,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// or a source stored in the metadata catalog) is collected and runs after the watermarks.
 	const string cleanup_data_catalog = cross_system ? internal_catalog_name : string();
 	string data_table_bare = IncrementalTableNames::DataTableName(view_name);
-	string data_table = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table_bare);
+	string data_table = internal_catalog_prefix + SqlUtils::QuoteIdentifier(data_table_bare);
 	OPENIVM_DEBUG_PRINT("[UPSERT] Looking up delta view '%s' in catalog '%s.%s'\n",
 	                    SqlUtils::DeltaName(view_name).c_str(), view_catalog_name.c_str(), view_schema_name.c_str());
 	optional_ptr<TableCatalogEntry> delta_view_catalog_entry;
@@ -449,11 +506,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	if (internal_catalog_prefix.empty() || internal_catalog_name == default_db || split_native_metadata) {
 		con.BeginTransaction();
 		delta_view_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
-		    planning_context, internal_catalog_name, internal_schema_name, SqlUtils::DeltaName(view_name),
+		    planning_context,
+		    QualifiedName(Identifier(internal_catalog_name), Identifier(internal_schema_name),
+		                  Identifier(SqlUtils::DeltaName(view_name))),
 		    OnEntryNotFound::THROW_EXCEPTION, error_context);
 		index_delta_view_catalog_entry = Catalog::GetEntry(
-		    planning_context, internal_catalog_name, internal_schema_name,
-		    EntryLookupInfo(CatalogType::INDEX_ENTRY, data_table_bare + openivm::INDEX_SUFFIX, error_context),
+		    planning_context,
+		    SqlUtils::QualifyLookup(EntryLookupInfo(CatalogType::INDEX_ENTRY,
+		                                            QualifiedName(Identifier(data_table_bare + openivm::INDEX_SUFFIX)),
+		                                            error_context),
+		                            Identifier(internal_catalog_name), Identifier(internal_schema_name)),
 		    OnEntryNotFound::RETURN_NULL);
 		con.Rollback();
 	}
@@ -496,27 +558,28 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                              "the native DuckLake executor");
 	}
 	if (!snapshot_publication && !publication->HasError() && publication->RowCount() &&
-	    !publication->GetValue(0, 0).IsNull()) {
+	    !publication->Collection().GetValue(0, 0).IsNull()) {
 		if (target_is_ducklake) {
 			publication_columns =
 			    metadata.GetTableColumns(internal_catalog_name, internal_schema_name, PublishedViewName(view_name));
 		} else {
 			auto &published_entry = Catalog::GetEntry<TableCatalogEntry>(
-			    context, internal_catalog_name, internal_schema_name, PublishedViewName(view_name));
+			    context, QualifiedName(Identifier(internal_catalog_name), Identifier(internal_schema_name),
+			                           Identifier(PublishedViewName(view_name))));
 			for (auto &column : published_entry.GetColumns().Logical()) {
-				publication_columns.push_back(column.Name());
+				publication_columns.push_back(column.Name().GetIdentifierName());
 			}
 		}
-		publication_query = publication->GetValue(0, 0).ToString();
+		publication_query = publication->Collection().GetValue(0, 0).ToString();
 		publication_source_query = publication_query;
-		Parser publication_parser;
+		auto publication_parser = Parser::GetBuiltinParser();
 		publication_parser.ParseQuery(publication_query);
 		auto &node = publication_parser.statements[0]->Cast<SelectStatement>().node;
 		publication_has_filter =
 		    node->type != QueryNodeType::SELECT_NODE || bool(node->Cast<SelectNode>().where_clause);
 		for (auto &modifier : node->modifiers) {
 			global_publication |= modifier->type == ResultModifierType::LIMIT_MODIFIER ||
-			                      modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER ||
+
 			                      modifier->type == ResultModifierType::ORDER_MODIFIER;
 		}
 
@@ -614,7 +677,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		auto flag_result = con.Query("SELECT refresh_in_progress FROM " + string(openivm::VIEWS_TABLE) +
 		                             " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
 		bool interrupted = !flag_result->HasError() && flag_result->RowCount() > 0 &&
-		                   !flag_result->GetValue(0, 0).IsNull() && flag_result->GetValue(0, 0).GetValue<bool>();
+		                   !flag_result->Collection().GetValue(0, 0).IsNull() &&
+		                   flag_result->Collection().GetValue(0, 0).GetValue<bool>();
 		if (interrupted) {
 			Printer::Print("Warning: recovering '" + view_name + "' from interrupted refresh via full recompute.");
 		}
@@ -641,7 +705,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                  (source_has_full_outer && !full_outer_merge);
 	Value refresh_mode_val;
 	bool force_full_refresh = false;
-	if (context.TryGetCurrentSetting("openivm_refresh_mode", refresh_mode_val) && !refresh_mode_val.IsNull()) {
+	if (context.TryGetCurrentSetting(Identifier("openivm_refresh_mode"), refresh_mode_val) &&
+	    !refresh_mode_val.IsNull()) {
 		auto mode = StringUtil::Lower(refresh_mode_val.ToString());
 		if (mode == "full") {
 			force_full_refresh = true;
@@ -769,8 +834,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		// Global column enumeration binds every snapshot publication view. Read only
 		// this delta table and copy its schema while the catalog transaction is live.
 		con.context->RunFunctionInTransaction([&]() {
-			auto &entry = Catalog::GetEntry<TableCatalogEntry>(*con.context, internal_catalog_name,
-			                                                   internal_schema_name, SqlUtils::DeltaName(view_name));
+			auto &entry = Catalog::GetEntry<TableCatalogEntry>(
+			    *con.context, QualifiedName(Identifier(internal_catalog_name), Identifier(internal_schema_name),
+			                                Identifier(SqlUtils::DeltaName(view_name))));
 			read_delta_columns(entry);
 		});
 	}
@@ -880,6 +946,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		options.group_column_names = group_cols;
 		options.catalog_prefix = internal_catalog_prefix;
 		options.insert_only = aggregate_insert_only_flag;
+		options.use_ducklake_rowid_upsert = target_is_ducklake && insert_only && !source_has_full_outer &&
+		                                    dispatch_refresh_type == RefreshType::AGGREGATE_GROUP &&
+		                                    active_facts.target_dialect == SqlDialect::DUCKDB;
 		options.aggregate_types = agg_types;
 		options.column_types = column_types;
 		return options;
@@ -1284,7 +1353,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	    dispatch_refresh_type == RefreshType::FULL_REFRESH && active_facts.target_dialect == SqlDialect::SPARK;
 	auto build_snapshot_companion = [&]() {
 		auto rows = BuildSignedRowLists(column_names);
-		string snapshot = KeywordHelper::WriteOptionallyQuoted(string(openivm::TEMP_TABLE_PREFIX) + view_name);
+		string snapshot = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
 		string user_cols = SqlUtils::JoinQuotedColumns(SqlUtils::WithoutMultiplicity(column_names));
 		pre_companion = "CREATE OR REPLACE TEMP TABLE " + snapshot + " AS SELECT * FROM " + data_table + ";\n";
 		post_companion = BuildDeltaResetSQL(delta_view_name, delta_ts_filter) + "INSERT INTO " + delta_view_name +
@@ -1332,7 +1401,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                       "');";
 		OPENIVM_DEBUG_PRINT("[UPSERT] Planning ComputeDelta query: %s\n", compute_delta.c_str());
 		auto compute_delta_plan_start = profile_now();
-		Parser p;
+		auto p = Parser::GetBuiltinParser();
 		p.ParseQuery(compute_delta);
 
 		con.BeginTransaction();
@@ -1366,7 +1435,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				SqlDialect dialect = active_facts.target_dialect;
 				auto ast = LogicalPlanToAst(con_ctx, plan, dialect,
 				                            dialect == SqlDialect::DUCKDB ? SnapshotResolver()
-				                                                          : view_time_travel_pins.Resolver());
+				                                                          : view_time_travel_pins.Resolver(),
+				                            CommonSubplanReusePolicy::PRESERVE_SOURCE_OCCURRENCES);
 				if (ast->NodeType() == "Insert") {
 					auto &insert = static_cast<AstInsertNode &>(*ast);
 					if (StringUtil::CIEquals(insert.target_table, delta_view_name_bare)) {
@@ -1452,7 +1522,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	string transient_delta_name;
 	bool inline_mv_delta = false;
 	if (use_transient_mv_delta) {
-		string inline_relation = "(SELECT openivm_inline_delta.*, CAST(current_timestamp AS TIMESTAMP) AS " +
+		string inline_relation = "(SELECT openivm_inline_delta.*, " + string(openivm::UTC_NOW_SQL) + " AS " +
 		                         SqlUtils::QuoteIdentifier(string(openivm::TIMESTAMP_COL)) + " FROM (" +
 		                         inline_delta_select_query + ") openivm_inline_delta)";
 		auto inline_variants = SqlUtils::ReplaceEachPlainOccurrence(upsert_query, delta_view_name, inline_relation);
@@ -1482,8 +1552,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			if (!column_names.empty()) {
 				transient_delta_preamble += ", ";
 			}
-			transient_delta_preamble +=
-			    SqlUtils::QuoteIdentifier(string(openivm::TIMESTAMP_COL)) + " TIMESTAMP DEFAULT current_timestamp);\n";
+			transient_delta_preamble += SqlUtils::QuoteIdentifier(string(openivm::TIMESTAMP_COL)) +
+			                            " TIMESTAMP DEFAULT " + string(openivm::UTC_NOW_SQL) + ");\n";
 			for (auto sql : {&delta_query, &companion_query, &upsert_query, &fallback_upsert_query, &post_companion}) {
 				*sql = StringUtil::Replace(*sql, delta_view_name, transient_delta_name);
 			}
@@ -1661,7 +1731,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		delete_retry_plan->fallback_program = build_program(fallback_upsert_query);
 	}
 	Value files_path_val;
-	if (write_query_file && context.TryGetCurrentSetting("openivm_files_path", files_path_val) &&
+	if (write_query_file && context.TryGetCurrentSetting(Identifier("openivm_files_path"), files_path_val) &&
 	    !files_path_val.IsNull()) {
 		string refresh_file_path = files_path_val.ToString() + "/openivm_upsert_queries_" + view_name + ".sql";
 		duckdb::SqlUtils::WriteFile(refresh_file_path, false, clean_query);

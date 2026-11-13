@@ -102,7 +102,11 @@ constexpr const char *DISABLED_OPTIMIZERS = TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;
 // recurses through OpenIVM's chained CTE/subquery expansions (N-term telescoping over many tables)
 // and overflows the optimizer; the generated plan is already explicitly decorrelated so it has no
 // DELIM joins to eliminate. Pure robustness guard — not flag-gated.
-constexpr const char *REFRESH_DISABLED_OPTIMIZERS = "deliminator";
+// DuckDB 2.0's join-filter pushdown can install a Bloom filter whose selected
+// row indexes exceed the compact hash-vector capacity during generated
+// maintenance joins (notably Top-K publication diffs). Keep it out of refresh
+// execution until the native selection/capacity mismatch is fixed upstream.
+constexpr const char *REFRESH_DISABLED_OPTIMIZERS = "deliminator,join_filter_pushdown";
 
 // Timestamp::GetCurrentTimestamp() (used by transactional delta capture) is UTC. Casting now()
 // from TIMESTAMPTZ to TIMESTAMP applies the session time zone, so use an epoch round-trip for all

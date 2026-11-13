@@ -90,15 +90,17 @@ LIMIT 1;
 query I
 SELECT CASE WHEN
        string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_affected___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_ AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_ AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_old___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_ AS MATERIALIZED (SELECT%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_new___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_ AS MATERIALIZED (SELECT%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%UNION ALL%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%AS MATERIALIZED (DELETE FROM%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%AS MATERIALIZED (INSERT INTO%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_affected___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_old___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_new___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%DROP TABLE IF EXISTS openivm_old___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%DROP TABLE IF EXISTS openivm_new___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'cwj_mv',
@@ -113,7 +115,7 @@ WHERE stmt_kind = 'data';
 # off), but still applies the in-place WINDOW_PARTITION program to
 # openivm_data_cwj_mv so the view stays consistent with the base
 # LEFT JOIN + ROW_NUMBER query. End-to-end signed cascade emission is
-# covered by spark-ext integration tests.
+# covered by the chained window regression in window.test.
 # ==========================================
 
 statement ok

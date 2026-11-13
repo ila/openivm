@@ -660,7 +660,7 @@ static int64_t CountRows(duckdb::Connection &con, const string &table) {
 	if (!result || result->HasError() || result->RowCount() == 0) {
 		return 0;
 	}
-	return result->GetValue(0, 0).GetValue<int64_t>();
+	return result->Collection().GetValue(0, 0).GetValue<int64_t>();
 }
 
 static vector<int> AllocateDeltas(duckdb::Connection &con, const vector<string> &tables, double pct) {
@@ -755,10 +755,10 @@ static void WarmScenario(duckdb::Connection &con, const QueryDef &q) {
 
 static int64_t ReadCount(duckdb::Connection &con, const string &sql) {
 	auto result = con.Query(sql);
-	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	if (!result || result->HasError() || result->RowCount() == 0 || result->Collection().GetValue(0, 0).IsNull()) {
 		return 0;
 	}
-	return result->GetValue(0, 0).GetValue<int64_t>();
+	return result->Collection().GetValue(0, 0).GetValue<int64_t>();
 }
 
 static int64_t ReadBaseRows(duckdb::Connection &con, const QueryDef &q) {
@@ -776,12 +776,12 @@ static CostEstimate ReadCost(duckdb::Connection &con, const string &view_name) {
 		cost.error = result ? result->GetError() : "null result";
 		return cost;
 	}
-	cost.decision = result->GetValue(0, 0).ToString();
-	cost.incremental_cost = result->GetValue(1, 0).GetValue<double>();
-	cost.recompute_cost = result->GetValue(2, 0).GetValue<double>();
-	cost.incremental_predicted_ms = result->GetValue(3, 0).GetValue<double>();
-	cost.recompute_predicted_ms = result->GetValue(4, 0).GetValue<double>();
-	cost.calibrated = result->GetValue(5, 0).GetValue<bool>();
+	cost.decision = result->Collection().GetValue(0, 0).ToString();
+	cost.incremental_cost = result->Collection().GetValue(1, 0).GetValue<double>();
+	cost.recompute_cost = result->Collection().GetValue(2, 0).GetValue<double>();
+	cost.incremental_predicted_ms = result->Collection().GetValue(3, 0).GetValue<double>();
+	cost.recompute_predicted_ms = result->Collection().GetValue(4, 0).GetValue<double>();
+	cost.calibrated = result->Collection().GetValue(5, 0).GetValue<bool>();
 	cost.ok = true;
 	return cost;
 }
@@ -834,8 +834,8 @@ static bool ValidateMV(duckdb::Connection &con, const string &mv_name, const str
 		error = r ? r->GetError() : "right validation returned null";
 		return false;
 	}
-	auto missing = l->GetValue(0, 0).GetValue<int64_t>();
-	auto extra = r->GetValue(0, 0).GetValue<int64_t>();
+	auto missing = l->Collection().GetValue(0, 0).GetValue<int64_t>();
+	auto extra = r->Collection().GetValue(0, 0).GetValue<int64_t>();
 	if (missing != 0 || extra != 0) {
 		error = "validation mismatch: mv_minus_base=" + to_string(missing) + ", base_minus_mv=" + to_string(extra);
 		return false;
@@ -851,7 +851,7 @@ static string LastHistoryMethod(duckdb::Connection &con, const string &view_name
 	if (result->RowCount() == 0) {
 		return "skipped_or_unrecorded";
 	}
-	return result->GetValue(2, 0).ToString();
+	return result->Collection().GetValue(2, 0).ToString();
 }
 
 static void ConfigureMode(duckdb::Connection &con, RefreshMode mode) {
