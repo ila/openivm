@@ -739,7 +739,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		filtered_group_count_aux_candidate = {
 		    {aux_table, qualify_source(filtered_group_count_extract.source), filtered_group_count_extract.group_col,
 		     filtered_group_count_extract.sum_col, group_q, sum_q, filtered_group_count_extract.output_col,
-		     filtered_group_count_extract.comparison_op, filtered_group_count_extract.threshold_sql},
+		     filtered_group_count_extract.comparison_op, filtered_group_count_extract.threshold_sql,
+		     filtered_group_count_extract.filter},
 		    filtered_group_count_extract.source};
 		model_input.filtered_group_count_aux_candidate = &filtered_group_count_aux_candidate;
 	}
@@ -1339,7 +1340,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		         RefreshMetadata::FilteredGroupCountAuxMetaToJson(meta), [&](const string &aux_target) {
 			         return BuildFilteredGroupCountAuxStateCreateSQL(
 			             aux_target, qualify_source(req.create_source), meta.group_col, meta.sum_col,
-			             meta.source_group_expr, meta.source_sum_expr, replace_aux);
+			             meta.source_group_expr, meta.source_sum_expr, meta.filter, replace_aux);
 		         });
 	}
 	if (view_model.HasSemiAntiAux()) {

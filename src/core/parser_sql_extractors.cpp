@@ -138,7 +138,9 @@ static string RenameQualifier(ParsedExpression &expression, const string &table,
 		    (StringUtil::CIEquals(column.ColumnNames()[column.ColumnNames().size() - 2].GetIdentifierName(), alias) ||
 		     StringUtil::CIEquals(column.ColumnNames()[column.ColumnNames().size() - 2].GetIdentifierName(),
 		                          SqlUtils::LastIdentifierPart(table)))) {
-			column.ColumnNamesMutable() = {Identifier(replacement), column.GetColumnName()};
+			column.ColumnNamesMutable() = replacement.empty()
+			                                  ? vector<Identifier> {column.GetColumnName()}
+			                                  : vector<Identifier> {Identifier(replacement), column.GetColumnName()};
 		}
 	});
 	return copy->ToString();
@@ -272,6 +274,7 @@ bool ExtractFilteredGroupCount(const string &sql, const vector<string> &output_n
 				out.comparison_op = ExpressionTypeToOperator(comparison.GetExpressionType());
 				out.threshold_sql = comparison.Right().ToString();
 				out.output_col = output_names[0];
+				out.filter = select->where_clause ? RenameQualifier(*select->where_clause, out.source, alias, "") : "";
 				return true;
 			}
 		}

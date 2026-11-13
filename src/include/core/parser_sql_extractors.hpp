@@ -28,6 +28,7 @@ struct FilteredGroupCountExtract {
 	string output_col;
 	string comparison_op;
 	string threshold_sql;
+	string filter;
 };
 
 struct CountDistinctExtract {
