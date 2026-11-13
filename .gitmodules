@@ -5,7 +5,7 @@
 [submodule "extension-ci-tools"]
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
-	branch = main
+	branch = v2.0-cyanoptera
 [submodule "third_party/lpts"]
 	path = third_party/lpts
 	url = https://github.com/cwida/lpts.git
