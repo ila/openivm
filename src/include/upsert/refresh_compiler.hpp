@@ -40,6 +40,8 @@ struct AggregateGroupsOptions {
 	string delta_ts_filter;
 	vector<string> group_column_names;
 	string catalog_prefix;
+	//! Optional relation SQL supplying the signed aggregate inputs.
+	string delta_source_sql;
 	bool insert_only = false;
 	bool use_ducklake_rowid_upsert = false;
 	vector<string> aggregate_types;

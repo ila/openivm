@@ -857,7 +857,6 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	if (distinct_cols.empty() || group_columns.empty() || sum_arg.empty() || sum_out.empty()) {
 		throw InternalException("CompileDistinctIncremental called with incomplete metadata for view '%s'", view_name);
 	}
-	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string aux_q = catalog_prefix + SqlUtils::QuoteIdentifier(aux_table);
 	string delta_q = DeltaSourceRef(delta_source, catalog_prefix);
 	string sum_arg_q = SqlUtils::QuoteIdentifier(sum_arg);
@@ -873,7 +872,6 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	string distinct_cols_csv = SqlUtils::JoinQuotedColumns(distinct_cols);
 	string distinct_cols_csv_i = SqlUtils::JoinQualifiedQuotedColumns(distinct_cols, "i");
 	string group_cols_csv = SqlUtils::JoinQuotedColumns(group_columns);
-	string mv_match = SqlUtils::BuildNullSafeMatch(group_columns, "v", "d");
 	string source_select;
 	string source_group;
 	BuildAliasedSourceLists(distinct_cols, source_exprs, source_select, source_group);
@@ -890,29 +888,20 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	       string(openivm::MULTIPLICITY_COL) + ") <> 0;\n\n";
 
 	string aux_match_aliased = SqlUtils::BuildNullSafeMatch(distinct_cols, "_aux", "i");
-	string ddist_cte =
+	string distinct_delta =
 	    "WITH ddist AS (\n  SELECT " + distinct_cols_csv_i +
 	    ", CASE WHEN COALESCE(_aux._count, 0) = 0 AND i.dmult > 0 THEN 1 "
 	    "WHEN COALESCE(_aux._count, 0) > 0 AND COALESCE(_aux._count, 0) + i.dmult <= 0 THEN -1 ELSE 0 END AS dd\n"
 	    "  FROM " +
 	    SqlUtils::QuoteIdentifier(dinput_table) + " i LEFT JOIN " + aux_q + " _aux ON " + aux_match_aliased +
-	    "\n),\ndagg AS (\n  SELECT " + group_cols_csv + ", SUM(" + sum_arg_q +
-	    " * dd) AS d_sum, SUM(dd)::BIGINT AS d_count, SUM(CASE WHEN " + sum_arg_q +
-	    " IS NOT NULL THEN dd ELSE 0 END)::BIGINT AS d_nonnull_count\n  FROM ddist WHERE dd <> 0\n  GROUP BY " +
-	    group_cols_csv + "\n)\n";
-
-	string insert_cols = group_cols_csv + ", " + sum_out_q + ", " + count_q + ", " + nonnull_count_q;
-	string insert_vals =
-	    SqlUtils::JoinQualifiedQuotedColumns(group_columns, "d") + ", d.d_sum, d.d_count, d.d_nonnull_count";
-	string new_nonnull_count = "v." + nonnull_count_q + " + d.d_nonnull_count";
-
-	sql += ddist_cte + "MERGE INTO " + data_table + " v USING dagg d ON " + mv_match +
-	       "\nWHEN MATCHED THEN UPDATE SET " + sum_out_q + " = CASE WHEN " + new_nonnull_count +
-	       " = 0 THEN NULL ELSE COALESCE(v." + sum_out_q + ", 0) + COALESCE(d.d_sum, 0) END, " + nonnull_count_q +
-	       " = " + new_nonnull_count + ", " + count_q + " = v." + count_q +
-	       " + d.d_count\nWHEN NOT MATCHED THEN INSERT (" + insert_cols + ") VALUES (" + insert_vals + ");\n\n";
-
-	sql += "DELETE FROM " + data_table + " WHERE " + count_q + " <= 0;\n\n";
+	    "\n) SELECT " + group_cols_csv + ", " + sum_arg_q + " AS " + sum_out_q + ", 1::BIGINT AS " + count_q +
+	    ", CASE WHEN " + sum_arg_q + " IS NULL THEN 0 ELSE 1 END::BIGINT AS " + nonnull_count_q + ", dd AS " +
+	    string(openivm::MULTIPLICITY_COL) + " FROM ddist WHERE dd <> 0";
+	AggregateGroupsOptions options;
+	options.group_column_names = group_columns;
+	options.catalog_prefix = catalog_prefix;
+	options.delta_source_sql = "(" + distinct_delta + ") openivm_distinct_delta";
+	sql += CompileAggregateGroups(view_name, column_names, options) + "\n";
 
 	sql += "MERGE INTO " + aux_q + " _aux USING " + SqlUtils::QuoteIdentifier(dinput_table) + " i ON " +
 	       aux_match_aliased +

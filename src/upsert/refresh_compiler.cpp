@@ -362,7 +362,9 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 	};
 	string data_table =
 	    options.catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
-	string delta_view = options.catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
+	string delta_view = options.delta_source_sql.empty()
+	                        ? options.catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name))
+	                        : options.delta_source_sql;
 
 	// Extract GROUP BY keys: from index (standard path) or from metadata (DuckLake fallback)
 	vector<string> keys;
