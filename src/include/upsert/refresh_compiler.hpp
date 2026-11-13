@@ -60,6 +60,9 @@ struct AggregateGroupsOutcome {
 	bool used_group_recompute = false;
 };
 
+/// Map SQL-quoted SUM output names to their injected non-NULL count columns.
+unordered_map<string, string> DetectSumNullCountColumns(const vector<string> &columns);
+
 string CompileAggregateGroups(const string &view_name, const vector<string> &column_names,
                               const AggregateGroupsOptions &options, AggregateGroupsOutcome *outcome = nullptr);
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
@@ -125,11 +128,13 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 /// aggregate's GROUP BY; `sum_arg`/`sum_out` are the single-SUM argument and
 /// output column. `count_star_col` is the auto-injected `openivm_count_star`
 /// column name on the data table (almost always literal `openivm_count_star`).
+/// `column_names` identifies the injected non-NULL count state for that SUM.
 string CompileDistinctIncremental(const string &view_name, const string &aux_table, const vector<string> &distinct_cols,
                                   const vector<string> &source_exprs, const string &delta_source,
                                   const string &last_update, const string &filter_sql,
                                   const vector<string> &group_columns, const string &sum_arg, const string &sum_out,
-                                  const string &count_star_col, const string &catalog_prefix = "");
+                                  const string &count_star_col, const vector<string> &column_names,
+                                  const string &catalog_prefix = "");
 string BuildDistinctAuxStateCreateSQL(const string &target_table, const vector<string> &distinct_cols,
                                       const vector<string> &source_exprs, const string &source_relation,
                                       const string &filter_sql, bool replace);

@@ -324,7 +324,7 @@ static DerivedAggDecomposition DetectDerivedAggColumns(const vector<string> &col
 	return result;
 }
 
-static unordered_map<string, string> DetectSumNullCountColumns(const vector<string> &columns) {
+unordered_map<string, string> DetectSumNullCountColumns(const vector<string> &columns) {
 	unordered_map<string, string> result;
 	const string prefix = openivm::SUM_COUNT_COL_PREFIX;
 	for (auto &column : columns) {

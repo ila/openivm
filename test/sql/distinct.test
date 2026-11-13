@@ -827,11 +827,8 @@ SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61
 6
 
 # Flag `openivm_distinct_aux_state` routes single-source inner-DISTINCT-under-AGG
-# views to RefreshType::DISTINCT_INCREMENTAL (8) at CREATE time. The actual
-# aux-state SQL pipeline isn't wired yet — it falls through to the
-# GROUP_RECOMPUTE compile path as a stub — but the classification surface
-# is stable so the eventual implementation can replace just the upsert SQL
-# without touching parser/dispatch.
+# views with one SUM to RefreshType::DISTINCT_INCREMENTAL (8). Per-tuple aux
+# counts emit a signed change only when a tuple enters or leaves the DISTINCT set.
 statement ok
 SET openivm_distinct_aux_state = true;
 
@@ -906,7 +903,7 @@ SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61
 ----
 8
 
-# Refresh still produces correct results (via the GROUP_RECOMPUTE fallback for now).
+# Refresh propagates the DISTINCT membership changes through the outer SUM.
 statement ok
 INSERT INTO idist_u2 VALUES (2, 'm3', 4), (1, 'm5', 32);
 
@@ -1155,6 +1152,249 @@ PRAGMA refresh('distinct_switch_child');
 
 query I
 SELECT COUNT(*) FROM ((SELECT * FROM distinct_switch_child EXCEPT ALL SELECT grp,SUM(cores) AS total_cores FROM (SELECT DISTINCT grp,machine,cores FROM distinct_switch_src WHERE machine IS NOT NULL)d GROUP BY grp) UNION ALL (SELECT grp,SUM(cores) AS total_cores FROM (SELECT DISTINCT grp,machine,cores FROM distinct_switch_src WHERE machine IS NOT NULL)d GROUP BY grp EXCEPT ALL SELECT * FROM distinct_switch_child));
+----
+0
+
+statement ok
+SET openivm_distinct_aux_state=false;
+
+# Issue #151: SUM needs a non-NULL input count separate from tuple existence.
+statement ok
+SET openivm_distinct_aux_state=true;
+
+statement ok
+CREATE TABLE null_aux_source(k INT, region VARCHAR, tag VARCHAR, v INT, active BOOLEAN);
+
+statement ok
+INSERT INTO null_aux_source VALUES
+    (1,'a','old',10,true),(1,'a','null',NULL,true),
+    (2,'b','old',5,true),(2,'b','old',5,true),
+    (3,'c','x',3,true),(3,'c','y',-3,true),(3,'c','null',NULL,true),
+    (NULL,NULL,'null',NULL,true),(4,'excluded','x',100,false);
+
+statement ok
+CREATE MATERIALIZED VIEW null_aux_mv AS
+SELECT k,region,SUM(v) total FROM
+    (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d
+GROUP BY k,region;
+
+statement ok
+CREATE VIEW null_aux_expected AS
+SELECT k,region,SUM(v) total FROM
+    (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d
+GROUP BY k,region;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='null_aux_mv';
+----
+8
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM null_aux_mv EXCEPT ALL SELECT * FROM null_aux_expected)
+    UNION ALL
+    (SELECT * FROM null_aux_expected EXCEPT ALL SELECT * FROM null_aux_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_
+     EXCEPT ALL SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region)
+    UNION ALL
+    (SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region
+     EXCEPT ALL SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_)
+);
+----
+0
+
+# Remove the last non-NULL input; NULL-only deltas must not poison a non-NULL sum.
+statement ok
+DELETE FROM null_aux_source WHERE k=1 AND v=10;
+
+statement ok
+INSERT INTO null_aux_source VALUES (2,'b','null',NULL,true),(5,'e','null',NULL,true);
+
+statement ok
+UPDATE null_aux_source SET v=4 WHERE k IS NULL;
+
+statement ok
+PRAGMA refresh('null_aux_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM null_aux_mv EXCEPT ALL SELECT * FROM null_aux_expected)
+    UNION ALL
+    (SELECT * FROM null_aux_expected EXCEPT ALL SELECT * FROM null_aux_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_
+     EXCEPT ALL SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region)
+    UNION ALL
+    (SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region
+     EXCEPT ALL SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_)
+);
+----
+0
+
+# Batched duplicate, predicate, NULL, zero-sum, and group-existence transitions.
+statement ok
+INSERT INTO null_aux_source VALUES (1,'a','fresh',7,true),(1,'a','fresh',7,true),(1,'a','transient',99,true),(6,'f','zero',0,true);
+
+statement ok
+UPDATE null_aux_source SET v=8 WHERE k=1 AND tag='fresh';
+
+statement ok
+DELETE FROM null_aux_source WHERE k=1 AND tag='transient';
+
+statement ok
+DELETE FROM null_aux_source WHERE k=2 AND tag='old';
+
+statement ok
+UPDATE null_aux_source SET v=NULL WHERE k IS NULL;
+
+statement ok
+UPDATE null_aux_source SET active=true WHERE k=4;
+
+statement ok
+DELETE FROM null_aux_source WHERE k=5;
+
+statement ok
+PRAGMA refresh('null_aux_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM null_aux_mv EXCEPT ALL SELECT * FROM null_aux_expected)
+    UNION ALL
+    (SELECT * FROM null_aux_expected EXCEPT ALL SELECT * FROM null_aux_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_
+     EXCEPT ALL SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region)
+    UNION ALL
+    (SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region
+     EXCEPT ALL SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_)
+);
+----
+0
+
+# Leave only qualifying NULL inputs, without removing their groups.
+statement ok
+DELETE FROM null_aux_source WHERE active AND v IS NOT NULL;
+
+statement ok
+PRAGMA refresh('null_aux_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM null_aux_mv EXCEPT ALL SELECT * FROM null_aux_expected)
+    UNION ALL
+    (SELECT * FROM null_aux_expected EXCEPT ALL SELECT * FROM null_aux_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_
+     EXCEPT ALL SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region)
+    UNION ALL
+    (SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region
+     EXCEPT ALL SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_)
+);
+----
+0
+
+# Repopulate NULL-only groups and create another group with a genuine zero sum.
+statement ok
+INSERT INTO null_aux_source VALUES (1,'a','back',11,true),(1,'a','back',11,true),(2,'b','back',0,true),(7,'g','pos',4,true),(7,'g','neg',-4,true);
+
+statement ok
+UPDATE null_aux_source SET v=12 WHERE k=1 AND tag='back';
+
+statement ok
+DELETE FROM null_aux_source WHERE rowid IN (SELECT rowid FROM null_aux_source WHERE k=1 AND tag='back' LIMIT 1);
+
+statement ok
+PRAGMA refresh('null_aux_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM null_aux_mv EXCEPT ALL SELECT * FROM null_aux_expected)
+    UNION ALL
+    (SELECT * FROM null_aux_expected EXCEPT ALL SELECT * FROM null_aux_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_
+     EXCEPT ALL SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region)
+    UNION ALL
+    (SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region
+     EXCEPT ALL SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_)
+);
+----
+0
+
+# Delete every group.
+statement ok
+DELETE FROM null_aux_source;
+
+statement ok
+PRAGMA refresh('null_aux_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM null_aux_mv EXCEPT ALL SELECT * FROM null_aux_expected)
+    UNION ALL
+    (SELECT * FROM null_aux_expected EXCEPT ALL SELECT * FROM null_aux_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_
+     EXCEPT ALL SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region)
+    UNION ALL
+    (SELECT k,region,SUM(v),COUNT(*),COUNT(v)
+     FROM (SELECT DISTINCT k,region,tag,v FROM null_aux_source WHERE active) d GROUP BY k,region
+     EXCEPT ALL SELECT k,region,total,openivm_count_star,openivm_nonnull_sum_count_2
+     FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6e756c6c5f6175785f6d76_)
+);
 ----
 0
 
