@@ -1,0 +1,183 @@
+# name: test/sql/avg_stddev_distinct.test
+# description: AVG/STDDEV/VARIANCE(DISTINCT) must not be decomposed into non-distinct SUM/COUNT (issue #140)
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+CREATE TABLE s(k INT, v INT);
+
+statement ok
+INSERT INTO s VALUES (1,10),(1,10),(1,20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv AS SELECT k, AVG(DISTINCT v) AS a, STDDEV_SAMP(DISTINCT v) AS sd, VAR_POP(DISTINCT v) AS vp, AVG(v) AS a_all FROM s GROUP BY k;
+
+# correct already at creation
+query IRRRR
+SELECT k, a, round(sd, 3), vp, round(a_all, 3) FROM mv;
+----
+1	15.0	7.071	25.0	13.333
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv EXCEPT ALL SELECT k, AVG(DISTINCT v), STDDEV_SAMP(DISTINCT v), VAR_POP(DISTINCT v), AVG(v) FROM s GROUP BY k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT k, AVG(DISTINCT v), STDDEV_SAMP(DISTINCT v), VAR_POP(DISTINCT v), AVG(v) FROM s GROUP BY k EXCEPT ALL SELECT * FROM mv);
+----
+0
+
+statement ok
+INSERT INTO s VALUES (1,10),(1,20),(1,30),(2,5),(2,5);
+
+statement ok
+DELETE FROM s WHERE rowid = (SELECT min(rowid) FROM s WHERE v = 20);
+
+statement ok
+PRAGMA refresh('mv');
+
+query IRRRR
+SELECT k, a, round(sd, 3), round(vp, 3), round(a_all, 3) FROM mv ORDER BY k;
+----
+1	20.0	10.0	66.667	16.0
+2	5.0	NULL	0.0	5.0
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv EXCEPT ALL SELECT k, AVG(DISTINCT v), STDDEV_SAMP(DISTINCT v), VAR_POP(DISTINCT v), AVG(v) FROM s GROUP BY k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT k, AVG(DISTINCT v), STDDEV_SAMP(DISTINCT v), VAR_POP(DISTINCT v), AVG(v) FROM s GROUP BY k EXCEPT ALL SELECT * FROM mv);
+----
+0
+
+# Exercise the early return when there are no ordinary derived aggregates to
+# decompose, and cover every supported STDDEV/VARIANCE spelling.
+statement ok
+CREATE MATERIALIZED VIEW mv_distinct_only AS
+SELECT k, AVG(DISTINCT v) AS a,
+       STDDEV(DISTINCT v) AS sd, STDDEV_SAMP(DISTINCT v) AS sd_samp, STDDEV_POP(DISTINCT v) AS sd_pop,
+       VARIANCE(DISTINCT v) AS variance, VAR_SAMP(DISTINCT v) AS var_samp, VAR_POP(DISTINCT v) AS var_pop
+FROM s GROUP BY k;
+
+statement ok
+CREATE VIEW expected_distinct_only AS
+SELECT k, AVG(DISTINCT v) AS a,
+       STDDEV(DISTINCT v) AS sd, STDDEV_SAMP(DISTINCT v) AS sd_samp, STDDEV_POP(DISTINCT v) AS sd_pop,
+       VARIANCE(DISTINCT v) AS variance, VAR_SAMP(DISTINCT v) AS var_samp, VAR_POP(DISTINCT v) AS var_pop
+FROM s GROUP BY k;
+
+query I
+SELECT type FROM openivm_views ORDER BY view_name;
+----
+6
+6
+
+query IRRRRRRR
+SELECT * FROM mv_distinct_only EXCEPT ALL SELECT * FROM expected_distinct_only;
+----
+
+query IRRRRRRR
+SELECT * FROM expected_distinct_only EXCEPT ALL SELECT * FROM mv_distinct_only;
+----
+
+# Consolidate INSERT + UPDATE + DELETE conflicts before one refresh. Losing the
+# last non-NULL value must retain NULL-only groups and return NULL aggregates.
+statement ok
+INSERT INTO s VALUES (1,NULL),(1,20),(2,NULL),(3,NULL),(3,40),(3,40),(4,10),(4,20);
+
+statement ok
+UPDATE s SET v = 30 WHERE k = 4 AND v = 20;
+
+statement ok
+DELETE FROM s WHERE k = 4;
+
+statement ok
+UPDATE s SET v = 10 WHERE k = 1 AND v = 30;
+
+statement ok
+DELETE FROM s WHERE k = 2 AND v = 5;
+
+statement ok
+PRAGMA refresh('mv');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv EXCEPT ALL SELECT k, AVG(DISTINCT v), STDDEV_SAMP(DISTINCT v), VAR_POP(DISTINCT v), AVG(v) FROM s GROUP BY k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT k, AVG(DISTINCT v), STDDEV_SAMP(DISTINCT v), VAR_POP(DISTINCT v), AVG(v) FROM s GROUP BY k EXCEPT ALL SELECT * FROM mv);
+----
+0
+
+statement ok
+PRAGMA refresh('mv_distinct_only');
+
+query IRRRRRRR
+SELECT * FROM mv_distinct_only EXCEPT ALL SELECT * FROM expected_distinct_only;
+----
+
+query IRRRRRRR
+SELECT * FROM expected_distinct_only EXCEPT ALL SELECT * FROM mv_distinct_only;
+----
+
+statement ok
+DELETE FROM s WHERE v IS NOT NULL;
+
+statement ok
+PRAGMA refresh('mv');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv EXCEPT ALL SELECT k, AVG(DISTINCT v), STDDEV_SAMP(DISTINCT v), VAR_POP(DISTINCT v), AVG(v) FROM s GROUP BY k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT k, AVG(DISTINCT v), STDDEV_SAMP(DISTINCT v), VAR_POP(DISTINCT v), AVG(v) FROM s GROUP BY k EXCEPT ALL SELECT * FROM mv);
+----
+0
+
+statement ok
+PRAGMA refresh('mv_distinct_only');
+
+query IRRRRRRR
+SELECT * FROM mv_distinct_only EXCEPT ALL SELECT * FROM expected_distinct_only;
+----
+
+query IRRRRRRR
+SELECT * FROM expected_distinct_only EXCEPT ALL SELECT * FROM mv_distinct_only;
+----
+
+statement ok
+DELETE FROM s;
+
+statement ok
+PRAGMA refresh('mv');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv EXCEPT ALL SELECT k, AVG(DISTINCT v), STDDEV_SAMP(DISTINCT v), VAR_POP(DISTINCT v), AVG(v) FROM s GROUP BY k);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT k, AVG(DISTINCT v), STDDEV_SAMP(DISTINCT v), VAR_POP(DISTINCT v), AVG(v) FROM s GROUP BY k EXCEPT ALL SELECT * FROM mv);
+----
+0
+
+statement ok
+PRAGMA refresh('mv_distinct_only');
+
+query IRRRRRRR
+SELECT * FROM mv_distinct_only EXCEPT ALL SELECT * FROM expected_distinct_only;
+----
+
+query IRRRRRRR
+SELECT * FROM expected_distinct_only EXCEPT ALL SELECT * FROM mv_distinct_only;
+----

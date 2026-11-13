@@ -290,8 +290,10 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 	bool has_derived = false;
 	for (auto &expr : agg.expressions) {
 		if (expr->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE) {
-			auto &name = expr->Cast<BoundAggregateExpression>().Function().GetName().GetIdentifierName();
-			if (name == "avg" || IsStddevOrVariance(name)) {
+			auto &bound_agg = expr->Cast<BoundAggregateExpression>();
+			auto &name = bound_agg.Function().GetName().GetIdentifierName();
+			// Keep DISTINCT aggregates intact for the existing affected-group recompute path.
+			if ((name == "avg" || IsStddevOrVariance(name)) && !bound_agg.IsDistinct()) {
 				has_derived = true;
 				break;
 			}
@@ -334,7 +336,7 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 
 		bool is_avg = (bound.Function().GetName().GetIdentifierName() == "avg");
 		bool is_stddev = IsStddevOrVariance(bound.Function().GetName().GetIdentifierName());
-		if (!is_avg && !is_stddev) {
+		if ((!is_avg && !is_stddev) || bound.IsDistinct()) {
 			nondecomposed_remap[i] = new_exprs.size();
 			new_exprs.push_back(std::move(expr));
 			continue;
