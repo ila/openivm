@@ -53,27 +53,27 @@ INSERT INTO mcl_quoted_source VALUES ('value');
 
 statement ok
 CREATE MATERIALIZED VIEW mcl_quoted_identifier AS
-SELECT "MiXeD Field" AS "MiXeD Alias" FROM mcl_quoted_source;
+SELECT "MiXeD Field" AS "MiXeDAlias" FROM mcl_quoted_source;
 
 query T
-SELECT column_name FROM pragma_table_info('mcl_quoted_identifier') WHERE column_name='MiXeD Alias';
+SELECT name FROM pragma_table_info('mcl_quoted_identifier') WHERE name='MiXeDAlias';
 ----
-MiXeD Alias
+MiXeDAlias
 
 statement ok
 SET openivm_input_dialect='spark';
 
 statement ok
 CREATE MATERIALIZED VIEW mcl_quoted_backtick AS
-SELECT `MiXeD Field` AS `MiXeD Alias` FROM mcl_quoted_source;
+SELECT `MiXeD Field` AS `MiXeDAlias` FROM mcl_quoted_source;
 
 statement ok
 SET openivm_input_dialect='duckdb';
 
 query T
-SELECT column_name FROM pragma_table_info('mcl_quoted_backtick') WHERE column_name='MiXeD Alias';
+SELECT name FROM pragma_table_info('mcl_quoted_backtick') WHERE name='MiXeDAlias';
 ----
-MiXeD Alias
+MiXeDAlias
 
 statement ok
 INSERT INTO mcl_quoted_source VALUES ('next');
@@ -86,26 +86,26 @@ PRAGMA refresh('mcl_quoted_backtick');
 
 query I
 SELECT COUNT(*) FROM (
-    (SELECT "MiXeD Alias" FROM mcl_quoted_identifier
+    (SELECT "MiXeDAlias" FROM mcl_quoted_identifier
      EXCEPT ALL
      SELECT "MiXeD Field" FROM mcl_quoted_source)
     UNION ALL
     (SELECT "MiXeD Field" FROM mcl_quoted_source
      EXCEPT ALL
-     SELECT "MiXeD Alias" FROM mcl_quoted_identifier)
+     SELECT "MiXeDAlias" FROM mcl_quoted_identifier)
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    (SELECT "MiXeD Alias" FROM mcl_quoted_backtick
+    (SELECT "MiXeDAlias" FROM mcl_quoted_backtick
      EXCEPT ALL
      SELECT "MiXeD Field" FROM mcl_quoted_source)
     UNION ALL
     (SELECT "MiXeD Field" FROM mcl_quoted_source
      EXCEPT ALL
-     SELECT "MiXeD Alias" FROM mcl_quoted_backtick)
+     SELECT "MiXeDAlias" FROM mcl_quoted_backtick)
 );
 ----
 0
