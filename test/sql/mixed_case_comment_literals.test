@@ -109,6 +109,7 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
 # Initial creation preserves mixed case for projection, case-sensitive comparisons, and LIKE.
 query I
 SELECT COUNT(*) FROM (
