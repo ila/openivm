@@ -1,0 +1,84 @@
+# name: test/sql/spark_expression_marker.test
+# description: Compiler-only opaque Spark expression markers
+# group: [sql]
+
+require openivm
+
+statement error
+SELECT __openivm_spark_expression('disabled', NULL::INTEGER, 1);
+----
+restricted to compiler-only use
+
+statement ok
+SET GLOBAL openivm_spark_expression_markers = true;
+
+statement error
+SELECT __openivm_spark_expression('never_execute', NULL::INTEGER, 1);
+----
+cannot be evaluated by OpenIVM
+
+query T
+SELECT typeof(__openivm_spark_expression('type', NULL::VARCHAR[], NULL));
+----
+VARCHAR[]
+
+statement ok
+CREATE TABLE marker_source (id INTEGER, txt VARCHAR);
+
+statement ok
+CREATE MATERIALIZED VIEW marker_projection AS
+SELECT id, __openivm_spark_expression('projection_marker', NULL::BOOLEAN, 'Ä', '(?i)ä') AS x
+FROM marker_source;
+
+query I
+SELECT COUNT(*) FROM openivm_compile_with_facts('marker_projection', '{"target_dialect":"spark","compile_only":true}')
+WHERE refresh_type_name = 'SIMPLE_PROJECTION' AND contains(sql, 'projection_marker');
+----
+1
+
+statement ok
+CREATE MATERIALIZED VIEW marker_filter AS
+SELECT id FROM marker_source
+WHERE __openivm_spark_expression('filter_marker', NULL::BOOLEAN, txt, 'p');
+
+query I
+SELECT COUNT(*) FROM openivm_compile_with_facts('marker_filter', '{"target_dialect":"spark","compile_only":true}')
+WHERE refresh_type_name = 'SIMPLE_PROJECTION' AND contains(sql, 'filter_marker');
+----
+1
+
+statement ok
+CREATE MATERIALIZED VIEW marker_having AS
+SELECT id, COUNT(*) n FROM marker_source GROUP BY id
+HAVING __openivm_spark_expression('having_marker', NULL::BOOLEAN, id, COUNT(*));
+
+query I
+SELECT COUNT(*) FROM openivm_compile_with_facts('marker_having', '{"target_dialect":"spark","compile_only":true}')
+WHERE refresh_type_name = 'AGGREGATE_HAVING' AND contains(sql, 'having_marker');
+----
+1
+
+statement ok
+CREATE MATERIALIZED VIEW marker_window AS
+SELECT id, ROW_NUMBER() OVER (
+  PARTITION BY __openivm_spark_expression('window_marker', NULL::VARCHAR, txt) ORDER BY id
+) rn FROM marker_source;
+
+query I
+SELECT COUNT(*) FROM openivm_compile_with_facts('marker_window', '{"target_dialect":"spark","compile_only":true}')
+WHERE refresh_type_name = 'WINDOW_PARTITION' AND contains(sql, 'window_marker');
+----
+1
+
+statement ok
+CREATE MATERIALIZED VIEW marker_volatile AS
+SELECT __openivm_spark_expression('volatile_marker', NULL::VARCHAR, random()) r FROM marker_source;
+
+query I
+SELECT COUNT(*) FROM openivm_compile_with_facts('marker_volatile', '{"target_dialect":"spark","compile_only":true}')
+WHERE refresh_type_name != 'FULL_REFRESH';
+----
+0
+
+statement ok
+SET GLOBAL openivm_spark_expression_markers = false;
