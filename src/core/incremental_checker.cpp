@@ -75,8 +75,10 @@ static bool HasVolatileExpression(vector<unique_ptr<Expression>> &expressions) {
 				    func.function.name.rfind("__internal_decompress", 0) == 0 || func.function.name == "error") {
 					return;
 				}
+				using ScalarCallback = void (*)(DataChunk &, ExpressionState &, Vector &);
+				const auto callback = func.function.GetFunctionCallback().target<ScalarCallback>();
 				if (func.function.GetStability() != FunctionStability::CONSISTENT &&
-				    func.function.GetFunctionCallback() != SparkExpressionMarker) {
+				    (!callback || *callback != SparkExpressionMarker)) {
 					found_volatile = true;
 				}
 			}
