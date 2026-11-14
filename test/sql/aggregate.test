@@ -4606,3 +4606,78 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# Preserve named and nested struct fields when HAVING is extracted.
+statement ok
+SET disabled_optimizers='expression_rewriter,common_subexpressions';
+
+statement ok
+CREATE TABLE having_struct_input (g INT, v INT);
+
+statement ok
+INSERT INTO having_struct_input VALUES (1, 1), (1, 2), (-1, 4), (NULL, 9);
+
+statement ok
+CREATE MATERIALIZED VIEW having_struct_mv AS
+SELECT g, COUNT(*) AS n FROM having_struct_input GROUP BY g
+HAVING struct_extract(struct_extract(struct_pack("Outer Name" := struct_pack("inner ""name""" := g)), 'Outer Name'), 'inner "name"') > 0;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM having_struct_mv
+    EXCEPT ALL
+    SELECT g, COUNT(*) AS n FROM having_struct_input GROUP BY g
+    HAVING struct_extract(struct_extract(struct_pack("Outer Name" := struct_pack("inner ""name""" := g)), 'Outer Name'), 'inner "name"') > 0
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT g, COUNT(*) AS n FROM having_struct_input GROUP BY g
+    HAVING struct_extract(struct_extract(struct_pack("Outer Name" := struct_pack("inner ""name""" := g)), 'Outer Name'), 'inner "name"') > 0
+    EXCEPT ALL
+    SELECT * FROM having_struct_mv
+);
+----
+0
+
+statement ok
+INSERT INTO having_struct_input VALUES (1, 3), (2, 5);
+
+statement ok
+DELETE FROM having_struct_input WHERE g = 1 AND v = 1;
+
+statement ok
+UPDATE having_struct_input SET v = 7 WHERE g = 1 AND v = 2;
+
+statement ok
+PRAGMA refresh('having_struct_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM having_struct_mv
+    EXCEPT ALL
+    SELECT g, COUNT(*) AS n FROM having_struct_input GROUP BY g
+    HAVING struct_extract(struct_extract(struct_pack("Outer Name" := struct_pack("inner ""name""" := g)), 'Outer Name'), 'inner "name"') > 0
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT g, COUNT(*) AS n FROM having_struct_input GROUP BY g
+    HAVING struct_extract(struct_extract(struct_pack("Outer Name" := struct_pack("inner ""name""" := g)), 'Outer Name'), 'inner "name"') > 0
+    EXCEPT ALL
+    SELECT * FROM having_struct_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM openivm_compile_with_facts('having_struct_mv', '{"target_dialect":"spark","compile_only":true}') WHERE refresh_type_name != 'AGGREGATE_HAVING';
+----
+0
+
+statement ok
+RESET disabled_optimizers;

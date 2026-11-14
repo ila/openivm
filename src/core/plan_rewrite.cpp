@@ -1944,6 +1944,20 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
 			children.push_back(HavingExprToSQL(*child, binding_to_alias));
 		}
 		const auto &name = function.function.name;
+		if (name == "struct_pack") {
+			const auto &fields = StructType::GetChildTypes(function.return_type);
+			if (fields.size() != children.size()) {
+				throw InternalException("HAVING struct_pack field count does not match its arguments");
+			}
+			string result = "struct_pack(";
+			for (idx_t i = 0; i < children.size(); i++) {
+				if (i > 0) {
+					result += ", ";
+				}
+				result += SqlUtils::QuoteIdentifier(fields[i].first) + " := " + children[i];
+			}
+			return result + ")";
+		}
 		if (children.size() == 2 && (name == "+" || name == "-" || name == "*" || name == "/" || name == "%")) {
 			return "(" + children[0] + " " + name + " " + children[1] + ")";
 		}
