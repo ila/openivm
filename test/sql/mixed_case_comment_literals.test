@@ -20,7 +20,8 @@ SELECT id,
        CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END AS state,
        CASE WHEN reason = 'MiXeD' THEN 'ExactMatch'
             WHEN reason LIKE 'Needs%' THEN 'PatternMatch'
-            ELSE 'NoMatch' END AS reason_match
+            ELSE 'NoMatch' END AS reason_match,
+       'yyyyMM' AS format_mask
 FROM mcl_comment_source;
 
 statement ok
@@ -111,21 +112,21 @@ SELECT COUNT(*) FROM (
 +# Initial creation preserves mixed case for projection, case-sensitive comparisons, and LIKE.
 query I
 SELECT COUNT(*) FROM (
-    (SELECT id, state, reason_match FROM mcl_comment_projection
+    (SELECT id, state, reason_match, format_mask FROM mcl_comment_projection
      EXCEPT ALL
      SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END,
             CASE WHEN reason = 'MiXeD' THEN 'ExactMatch'
                  WHEN reason LIKE 'Needs%' THEN 'PatternMatch'
-                 ELSE 'NoMatch' END
+                 ELSE 'NoMatch' END, 'yyyyMM'
      FROM mcl_comment_source)
     UNION ALL
     (SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END,
             CASE WHEN reason = 'MiXeD' THEN 'ExactMatch'
                  WHEN reason LIKE 'Needs%' THEN 'PatternMatch'
-                 ELSE 'NoMatch' END
+                 ELSE 'NoMatch' END, 'yyyyMM'
      FROM mcl_comment_source
      EXCEPT ALL
-     SELECT id, state, reason_match FROM mcl_comment_projection)
+     SELECT id, state, reason_match, format_mask FROM mcl_comment_projection)
 );
 ----
 0
@@ -225,21 +226,21 @@ PRAGMA refresh('mcl_comment_window');
 
 query I
 SELECT COUNT(*) FROM (
-    (SELECT id, state, reason_match FROM mcl_comment_projection
+    (SELECT id, state, reason_match, format_mask FROM mcl_comment_projection
      EXCEPT ALL
      SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END,
             CASE WHEN reason = 'MiXeD' THEN 'ExactMatch'
                  WHEN reason LIKE 'Needs%' THEN 'PatternMatch'
-                 ELSE 'NoMatch' END
+                 ELSE 'NoMatch' END, 'yyyyMM'
      FROM mcl_comment_source)
     UNION ALL
     (SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END,
             CASE WHEN reason = 'MiXeD' THEN 'ExactMatch'
                  WHEN reason LIKE 'Needs%' THEN 'PatternMatch'
-                 ELSE 'NoMatch' END
+                 ELSE 'NoMatch' END, 'yyyyMM'
      FROM mcl_comment_source
      EXCEPT ALL
-     SELECT id, state, reason_match FROM mcl_comment_projection)
+     SELECT id, state, reason_match, format_mask FROM mcl_comment_projection)
 );
 ----
 0
