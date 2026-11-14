@@ -10,6 +10,7 @@
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "core/time_travel_pins.hpp"
+#include "core/spark_expression_marker.hpp"
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_cost_model.hpp"
 #include "upsert/refresh.hpp"
@@ -158,6 +159,21 @@ static void ComputeDeltaFunction(ClientContext &context, TableFunctionInput &dat
 	return;
 }
 
+void SparkExpressionMarker(DataChunk &, ExpressionState &, Vector &) {
+	throw InvalidInputException("Spark expression marker cannot be evaluated by OpenIVM");
+}
+
+static unique_ptr<FunctionData> BindSparkExpressionMarker(ClientContext &context, ScalarFunction &function,
+                                                          vector<unique_ptr<Expression>> &arguments) {
+	Value enabled;
+	if (!context.TryGetCurrentSetting("openivm_spark_expression_markers", enabled) || enabled.IsNull() ||
+	    !enabled.GetValue<bool>()) {
+		throw BinderException("Spark expression markers are restricted to compiler-only use");
+	}
+	function.return_type = arguments[1]->return_type;
+	return nullptr;
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	auto &instance = loader.GetDatabaseInstance();
 	auto &db_config = duckdb::DBConfig::GetConfig(instance);
@@ -173,6 +189,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.SetOption(AllowParserOverrideExtensionSetting::SettingIndex, Value("fallback"));
 
 	RegisterSparkScalarFunctions(loader);
+
+	db_config.AddExtensionOption("openivm_spark_expression_markers",
+	                             "enable compiler-only opaque Spark expression markers",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	ScalarFunction marker("__openivm_spark_expression", {LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY,
+	                      SparkExpressionMarker, BindSparkExpressionMarker);
+	marker.SetStability(FunctionStability::VOLATILE);
+	marker.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	marker.varargs = LogicalType::ANY;
+	loader.RegisterFunction(marker);
 
 	db_config.AddExtensionOption("openivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR);
 	// 'auto' is the non-forcing mode: like 'incremental', it never forces a full recompute; adaptive
