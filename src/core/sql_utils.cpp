@@ -481,15 +481,78 @@ string SqlUtils::ExtractViewQuery(string &query) {
 string SqlUtils::SQLToLowercase(const string &sql) {
 	std::stringstream lowercase_stream;
 	bool in_string = false;
-	for (char c : sql) {
-		if (c == '\'') {
-			in_string = !in_string;
-		}
-		if (!in_string) {
-			lowercase_stream << (char)tolower(c);
-		} else {
+	char quoted_identifier = '\0';
+	for (size_t i = 0; i < sql.size(); i++) {
+		auto c = sql[i];
+		auto next = i + 1 < sql.size() ? sql[i + 1] : '\0';
+
+		if (in_string) {
 			lowercase_stream << c;
+			if (c == '\'' && next == '\'') {
+				lowercase_stream << next;
+				i++;
+			} else if (c == '\'') {
+				in_string = false;
+			}
+			continue;
 		}
+
+		if (quoted_identifier != '\0') {
+			lowercase_stream << c;
+			if (c == quoted_identifier && next == quoted_identifier) {
+				lowercase_stream << next;
+				i++;
+			} else if (c == quoted_identifier) {
+				quoted_identifier = '\0';
+			}
+			continue;
+		}
+
+		if (c == '\'') {
+			in_string = true;
+			lowercase_stream << c;
+			continue;
+		}
+		if (c == '"' || c == '`') {
+			quoted_identifier = c;
+			lowercase_stream << c;
+			continue;
+		}
+		if (c == '-' && next == '-') {
+			while (i < sql.size() && sql[i] != '\n') {
+				lowercase_stream << sql[i++];
+			}
+			if (i < sql.size()) {
+				lowercase_stream << sql[i];
+			}
+			continue;
+		}
+		if (c == '/' && next == '*') {
+			size_t comment_depth = 1;
+			lowercase_stream << "/*";
+			i += 2;
+			while (i < sql.size() && comment_depth > 0) {
+				c = sql[i];
+				next = i + 1 < sql.size() ? sql[i + 1] : '\0';
+				if (c == '/' && next == '*') {
+					lowercase_stream << "/*";
+					comment_depth++;
+					i += 2;
+				} else if (c == '*' && next == '/') {
+					lowercase_stream << "*/";
+					comment_depth--;
+					i += 2;
+				} else {
+					lowercase_stream << c;
+					i++;
+				}
+			}
+			if (i > 0) {
+				i--;
+			}
+			continue;
+		}
+		lowercase_stream << static_cast<char>(tolower(static_cast<unsigned char>(c)));
 	}
 	return lowercase_stream.str();
 }

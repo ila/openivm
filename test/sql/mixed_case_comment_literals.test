@@ -1,0 +1,294 @@
+# name: test/sql/mixed_case_comment_literals.test
+# description: SQL comments preserve string literals and quoted identifiers in incremental views.
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE TABLE mcl_comment_source (id INTEGER, flag BOOLEAN, amount INTEGER, reason VARCHAR);
+
+statement ok
+INSERT INTO mcl_comment_source VALUES (1, true, 10, 'MiXeD'), (2, false, 20, 'Needs Review');
+
+statement ok
+CREATE MATERIALIZED VIEW mcl_comment_projection AS
+-- synthetic's comment
+SELECT id,
+       CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END AS state,
+       CASE WHEN reason = 'MiXeD' THEN 'ExactMatch'
+            WHEN reason LIKE 'Needs%' THEN 'PatternMatch'
+            ELSE 'NoMatch' END AS reason_match
+FROM mcl_comment_source;
+
+statement ok
+CREATE MATERIALIZED VIEW mcl_comment_aggregate AS
+/* synthetic's comment */
+SELECT CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END AS state, COUNT(*) AS n
+FROM mcl_comment_source
+GROUP BY CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END;
+
+statement ok
+CREATE MATERIALIZED VIEW mcl_comment_row_number AS
+-- synthetic's comment
+SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END AS state,
+       ROW_NUMBER() OVER (PARTITION BY flag ORDER BY id) AS rn
+FROM mcl_comment_source;
+
+statement ok
+CREATE MATERIALIZED VIEW mcl_comment_window AS
+/* synthetic's comment */
+SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END AS state,
+       SUM(amount) OVER (PARTITION BY flag ORDER BY id) AS running_amount
+FROM mcl_comment_source;
+
+statement ok
+CREATE TABLE mcl_quoted_source ("MiXeD Field" VARCHAR);
+
+statement ok
+INSERT INTO mcl_quoted_source VALUES ('value');
+
+statement ok
+CREATE MATERIALIZED VIEW mcl_quoted_identifier AS
+SELECT "MiXeD Field" AS "MiXeD Alias" FROM mcl_quoted_source;
+
+query T
+SELECT column_name FROM pragma_table_info('mcl_quoted_identifier') WHERE column_name='MiXeD Alias';
+----
+MiXeD Alias
+
+statement ok
+SET openivm_input_dialect='spark';
+
+statement ok
+CREATE MATERIALIZED VIEW mcl_quoted_backtick AS
+SELECT `MiXeD Field` AS `MiXeD Alias` FROM mcl_quoted_source;
+
+statement ok
+SET openivm_input_dialect='duckdb';
+
+query T
+SELECT column_name FROM pragma_table_info('mcl_quoted_backtick') WHERE column_name='MiXeD Alias';
+----
+MiXeD Alias
+
+statement ok
+INSERT INTO mcl_quoted_source VALUES ('next');
+
+statement ok
+PRAGMA refresh('mcl_quoted_identifier');
+
+statement ok
+PRAGMA refresh('mcl_quoted_backtick');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT "MiXeD Alias" FROM mcl_quoted_identifier
+     EXCEPT ALL
+     SELECT "MiXeD Field" FROM mcl_quoted_source)
+    UNION ALL
+    (SELECT "MiXeD Field" FROM mcl_quoted_source
+     EXCEPT ALL
+     SELECT "MiXeD Alias" FROM mcl_quoted_identifier)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT "MiXeD Alias" FROM mcl_quoted_backtick
+     EXCEPT ALL
+     SELECT "MiXeD Field" FROM mcl_quoted_source)
+    UNION ALL
+    (SELECT "MiXeD Field" FROM mcl_quoted_source
+     EXCEPT ALL
+     SELECT "MiXeD Alias" FROM mcl_quoted_backtick)
+);
+----
+0
++# Initial creation preserves mixed case for projection, case-sensitive comparisons, and LIKE.
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id, state, reason_match FROM mcl_comment_projection
+     EXCEPT ALL
+     SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END,
+            CASE WHEN reason = 'MiXeD' THEN 'ExactMatch'
+                 WHEN reason LIKE 'Needs%' THEN 'PatternMatch'
+                 ELSE 'NoMatch' END
+     FROM mcl_comment_source)
+    UNION ALL
+    (SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END,
+            CASE WHEN reason = 'MiXeD' THEN 'ExactMatch'
+                 WHEN reason LIKE 'Needs%' THEN 'PatternMatch'
+                 ELSE 'NoMatch' END
+     FROM mcl_comment_source
+     EXCEPT ALL
+     SELECT id, state, reason_match FROM mcl_comment_projection)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT state, n FROM mcl_comment_aggregate
+     EXCEPT ALL
+     SELECT CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END, COUNT(*)
+     FROM mcl_comment_source GROUP BY CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END)
+    UNION ALL
+    (SELECT CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END, COUNT(*)
+     FROM mcl_comment_source GROUP BY CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END
+     EXCEPT ALL
+     SELECT state, n FROM mcl_comment_aggregate)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id, state, rn FROM mcl_comment_row_number
+     EXCEPT ALL
+     SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END,
+            ROW_NUMBER() OVER (PARTITION BY flag ORDER BY id)
+     FROM mcl_comment_source)
+    UNION ALL
+    (SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END,
+            ROW_NUMBER() OVER (PARTITION BY flag ORDER BY id)
+     FROM mcl_comment_source
+     EXCEPT ALL
+     SELECT id, state, rn FROM mcl_comment_row_number)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id, state, running_amount FROM mcl_comment_window
+     EXCEPT ALL
+     SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END,
+            SUM(amount) OVER (PARTITION BY flag ORDER BY id)
+     FROM mcl_comment_source)
+    UNION ALL
+    (SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END,
+            SUM(amount) OVER (PARTITION BY flag ORDER BY id)
+     FROM mcl_comment_source
+     EXCEPT ALL
+     SELECT id, state, running_amount FROM mcl_comment_window)
+);
+----
+0
+
+# Incremental refresh preserves the same results for every supported view shape.
+statement ok
+INSERT INTO mcl_comment_source VALUES (3, true, 30, 'MiXeD');
+
+query T
+SELECT refresh_type_name FROM openivm_compile_with_facts(
+    'mcl_comment_projection', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind='data' LIMIT 1;
+----
+SIMPLE_PROJECTION
+
+query T
+SELECT refresh_type_name FROM openivm_compile_with_facts(
+    'mcl_comment_aggregate', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind='data' LIMIT 1;
+----
+AGGREGATE_GROUP
+
+query T
+SELECT refresh_type_name FROM openivm_compile_with_facts(
+    'mcl_comment_row_number', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind='data' LIMIT 1;
+----
+WINDOW_PARTITION
+
+query T
+SELECT refresh_type_name FROM openivm_compile_with_facts(
+    'mcl_comment_window', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind='data' LIMIT 1;
+----
+WINDOW_PARTITION
+
+statement ok
+PRAGMA refresh('mcl_comment_projection');
+
+statement ok
+PRAGMA refresh('mcl_comment_aggregate');
+
+statement ok
+PRAGMA refresh('mcl_comment_row_number');
+
+statement ok
+PRAGMA refresh('mcl_comment_window');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id, state, reason_match FROM mcl_comment_projection
+     EXCEPT ALL
+     SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END,
+            CASE WHEN reason = 'MiXeD' THEN 'ExactMatch'
+                 WHEN reason LIKE 'Needs%' THEN 'PatternMatch'
+                 ELSE 'NoMatch' END
+     FROM mcl_comment_source)
+    UNION ALL
+    (SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END,
+            CASE WHEN reason = 'MiXeD' THEN 'ExactMatch'
+                 WHEN reason LIKE 'Needs%' THEN 'PatternMatch'
+                 ELSE 'NoMatch' END
+     FROM mcl_comment_source
+     EXCEPT ALL
+     SELECT id, state, reason_match FROM mcl_comment_projection)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT state, n FROM mcl_comment_aggregate
+     EXCEPT ALL
+     SELECT CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END, COUNT(*)
+     FROM mcl_comment_source GROUP BY CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END)
+    UNION ALL
+    (SELECT CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END, COUNT(*)
+     FROM mcl_comment_source GROUP BY CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END
+     EXCEPT ALL
+     SELECT state, n FROM mcl_comment_aggregate)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id, state, rn FROM mcl_comment_row_number
+     EXCEPT ALL
+     SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END,
+            ROW_NUMBER() OVER (PARTITION BY flag ORDER BY id)
+     FROM mcl_comment_source)
+    UNION ALL
+    (SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END,
+            ROW_NUMBER() OVER (PARTITION BY flag ORDER BY id)
+     FROM mcl_comment_source
+     EXCEPT ALL
+     SELECT id, state, rn FROM mcl_comment_row_number)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id, state, running_amount FROM mcl_comment_window
+     EXCEPT ALL
+     SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END,
+            SUM(amount) OVER (PARTITION BY flag ORDER BY id)
+     FROM mcl_comment_source)
+    UNION ALL
+    (SELECT id, CASE WHEN flag THEN 'Not Ready' ELSE 'Ready' END,
+            SUM(amount) OVER (PARTITION BY flag ORDER BY id)
+     FROM mcl_comment_source
+     EXCEPT ALL
+     SELECT id, state, running_amount FROM mcl_comment_window)
+);
+----
+0
