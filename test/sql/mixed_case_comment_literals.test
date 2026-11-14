@@ -109,7 +109,7 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
-+# Initial creation preserves mixed case for projection, case-sensitive comparisons, and LIKE.
+# Initial creation preserves mixed case for projection, case-sensitive comparisons, and LIKE.
 query I
 SELECT COUNT(*) FROM (
     (SELECT id, state, reason_match, format_mask FROM mcl_comment_projection
